@@ -1,0 +1,10 @@
+# 构建产物
+/bin/
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+
