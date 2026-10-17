@@ -19,6 +19,10 @@ var ErrNotFound = errors.New("storage: not found")
 // 违反"一个 Session 只对应一个 Task"的唯一性约束。
 var ErrSessionHasTask = errors.New("storage: session already has a task")
 
+// ErrRunTaskExists 表示 Task 已关联 RunTask，
+// 违反"一个 Task 最多对应一个 RunTask"的唯一性约束。
+var ErrRunTaskExists = errors.New("storage: run task already exists for task")
+
 // SessionStore 定义 Session 的持久化能力。
 type SessionStore interface {
 	Create(ctx context.Context, s *domain.Session) error
@@ -36,5 +40,22 @@ type TaskStore interface {
 	Create(ctx context.Context, t *domain.Task) error
 	Get(ctx context.Context, id string) (*domain.Task, error)
 	ListBySession(ctx context.Context, sessionID string) ([]*domain.Task, error)
+	Update(ctx context.Context, t *domain.Task) error
+	Delete(ctx context.Context, id string) error
+}
+
+// RunTaskStore 定义 RunTask 的持久化能力。
+//
+// Create 必须保证"一个 Task 最多对应一个 RunTask"：当目标 Task
+// 已存在 RunTask 时，返回 ErrRunTaskExists。所有实现（含未来持久化实现）
+// 都必须在同一写入路径内原子地保证该唯一性，避免并发重复创建。
+//
+// RunTask 的生命周期由 Runtime 独立维护；Task 的启用/禁用通过事件驱动
+// RunTask 的创建与状态变更，不直接由 HTTP Handler 创建。
+type RunTaskStore interface {
+	Create(ctx context.Context, rt *domain.RunTask) error
+	Get(ctx context.Context, id string) (*domain.RunTask, error)
+	GetByTask(ctx context.Context, taskID string) (*domain.RunTask, error)
+	Update(ctx context.Context, rt *domain.RunTask) error
 	Delete(ctx context.Context, id string) error
 }

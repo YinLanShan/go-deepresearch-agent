@@ -69,14 +69,27 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/tasks ` -Metho
 # 列出 Session 下的 Task
 Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/tasks
 
-# 删除 Session（会级联删除其名下的 Task）
+# 删除 Session（会级联删除其名下的 Task 与 RunTask）
 Invoke-WebRequest -Uri http://127.0.0.1:8080/api/v1/sessions/{id} -Method Delete
 
-# 删除 Session 下的 Task
-Invoke-WebRequest -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/tasks/{taskID} -Method Delete
+# 启用/禁用 Task（经事件驱动 Runtime 创建/暂停 RunTask）
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/tasks/{id} `
+  -Method Patch -ContentType "application/json" -Body '{"enabled":true}'
+
+# 查询 Task 对应的 RunTask
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/tasks/{taskID}/run
+
+# 按 RunTaskID 查询
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/run-tasks/{runTaskID}
 ```
 
-> 约束：**一个 Session 只对应一个 Task**。对已有 Task 的 Session 再次创建 Task 会返回 `409 Conflict`。
+> 约束：
+> - **一个 Session 只对应一个 Task**，重复创建返回 `409 Conflict`。
+> - **Task 只能启用/禁用，无直接删除路径**；新建的 Task 默认禁用。
+> - **RunTask 由独立实体 Runtime 经事件订阅维护**：启用/禁用/删除都先由 Runtime
+>   向依赖组件（Supervisor/Scheduler/WorkPool，当前为 Mock）发起协商，协商通过后才原子落地。
+> - **使能时若 RunTask 不存在，Runtime 先协商创建（含初始化要求）再新建 RunTask**。
+> - Session 删除会级联删除其 Task 与 RunTask（RunTask 删除同样经协商）。
 
 用 curl.exe 时，把 JSON 写入文件（无 BOM 的 UTF-8）再发送，可避免引号/编码问题：
 

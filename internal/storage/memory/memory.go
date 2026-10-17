@@ -1,8 +1,8 @@
 // Package memory 提供进程内存储实现，用于阶段 0 的本地运行与测试。
 //
-// 该实现不跨进程持久化，仅用于验证 Session/Task 的存取语义。
-// TaskStore.Create 在单把互斥锁内完成唯一性检查与写入，
-// 原子地保证"一个 Session 只对应一个 Task"。
+// 该实现不跨进程持久化，仅用于验证 Session/Task/RunTask 的存取语义。
+// 唯一性约束（一个 Session 一个 Task、一个 Task 一个 RunTask）都在
+// 单把互斥锁内完成检查与写入，原子地保证并发下不产生重复。
 package memory
 
 import (
@@ -25,8 +25,16 @@ type TaskStore struct {
 	m  map[string]*domain.Task
 }
 
+// RunTaskStore 是 RunTaskStore 接口的进程内实现。
+type RunTaskStore struct {
+	mu     sync.RWMutex
+	m      map[string]*domain.RunTask // 按 RunTask ID
+	byTask map[string]string          // TaskID -> RunTaskID，保证一对一
+}
+
 var _ storage.SessionStore = (*SessionStore)(nil)
 var _ storage.TaskStore = (*TaskStore)(nil)
+var _ storage.RunTaskStore = (*RunTaskStore)(nil)
 
 // NewSessionStore 创建一个空的 SessionStore。
 func NewSessionStore() *SessionStore {
@@ -36,6 +44,14 @@ func NewSessionStore() *SessionStore {
 // NewTaskStore 创建一个空的 TaskStore。
 func NewTaskStore() *TaskStore {
 	return &TaskStore{m: make(map[string]*domain.Task)}
+}
+
+// NewRunTaskStore 创建一个空的 RunTaskStore。
+func NewRunTaskStore() *RunTaskStore {
+	return &RunTaskStore{
+		m:      make(map[string]*domain.RunTask),
+		byTask: make(map[string]string),
+	}
 }
 
 // Create 保存一个 Session。
@@ -133,7 +149,25 @@ func (s *TaskStore) ListBySession(_ context.Context, sessionID string) ([]*domai
 	return out, nil
 }
 
+// Update 用传入的 Task 覆盖同 ID 的既有 Task，不存在时返回 storage.ErrNotFound。
+func (s *TaskStore) Update(_ context.Context, t *domain.Task) error {
+	if t == nil || t.ID == "" {
+		return storage.ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[t.ID]; !ok {
+		return storage.ErrNotFound
+	}
+	cp := *t
+	s.m[t.ID] = &cp
+	return nil
+}
+
 // Delete 删除指定 Task，不存在时返回 storage.ErrNotFound。
+//
+// 注意：本方法只删除 Task 本身，不级联删除其关联的 RunTask。
+// RunTask（及其运行时）拥有独立于 Task 增删的生命周期。
 func (s *TaskStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,5 +175,75 @@ func (s *TaskStore) Delete(_ context.Context, id string) error {
 		return storage.ErrNotFound
 	}
 	delete(s.m, id)
+	return nil
+}
+
+// Create 保存一个 RunTask，并原子地保证"一个 Task 最多对应一个 RunTask"。
+// 当该 Task 已存在其他 RunTask 时返回 storage.ErrRunTaskExists。
+func (s *RunTaskStore) Create(_ context.Context, rt *domain.RunTask) error {
+	if rt == nil || rt.ID == "" || rt.TaskID == "" {
+		return storage.ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existingID, ok := s.byTask[rt.TaskID]; ok && existingID != rt.ID {
+		return storage.ErrRunTaskExists
+	}
+	cp := *rt
+	s.m[rt.ID] = &cp
+	s.byTask[rt.TaskID] = rt.ID
+	return nil
+}
+
+// Get 按 RunTaskID 返回 RunTask，不存在时返回 storage.ErrNotFound。
+func (s *RunTaskStore) Get(_ context.Context, id string) (*domain.RunTask, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rt, ok := s.m[id]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	cp := *rt
+	return &cp, nil
+}
+
+// GetByTask 返回指定 Task 对应的 RunTask，不存在时返回 storage.ErrNotFound。
+func (s *RunTaskStore) GetByTask(_ context.Context, taskID string) (*domain.RunTask, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.byTask[taskID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	rt := s.m[id]
+	cp := *rt
+	return &cp, nil
+}
+
+// Update 用传入的 RunTask 覆盖同 ID 的既有 RunTask，不存在时返回 storage.ErrNotFound。
+func (s *RunTaskStore) Update(_ context.Context, rt *domain.RunTask) error {
+	if rt == nil || rt.ID == "" {
+		return storage.ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[rt.ID]; !ok {
+		return storage.ErrNotFound
+	}
+	cp := *rt
+	s.m[rt.ID] = &cp
+	return nil
+}
+
+// Delete 删除指定 RunTask，不存在时返回 storage.ErrNotFound。
+func (s *RunTaskStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rt, ok := s.m[id]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	delete(s.m, id)
+	delete(s.byTask, rt.TaskID)
 	return nil
 }

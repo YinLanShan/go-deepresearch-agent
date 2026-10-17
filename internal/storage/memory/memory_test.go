@@ -114,3 +114,121 @@ func TestStoreDelete(t *testing.T) {
 		t.Fatalf("want ErrNotFound on double session delete, got %v", err)
 	}
 }
+
+func TestRunTaskStoreOnePerTask(t *testing.T) {
+	ctx := context.Background()
+	s := NewRunTaskStore()
+
+	if err := s.Create(ctx, &domain.RunTask{ID: "r1", TaskID: "t1", Status: domain.RunStatusCreated}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	// 同一 Task 再创建第二个 RunTask 应被拒绝
+	if err := s.Create(ctx, &domain.RunTask{ID: "r2", TaskID: "t1", Status: domain.RunStatusCreated}); !errors.Is(err, storage.ErrRunTaskExists) {
+		t.Fatalf("want ErrRunTaskExists, got %v", err)
+	}
+	// 不同 Task 可以创建
+	if err := s.Create(ctx, &domain.RunTask{ID: "r3", TaskID: "t2", Status: domain.RunStatusCreated}); err != nil {
+		t.Fatalf("create for other task: %v", err)
+	}
+}
+
+func TestRunTaskStoreGetByTask(t *testing.T) {
+	ctx := context.Background()
+	s := NewRunTaskStore()
+
+	if err := s.Create(ctx, &domain.RunTask{ID: "r1", TaskID: "t1", Status: domain.RunStatusCreated}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	rt, err := s.GetByTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("GetByTask: %v", err)
+	}
+	if rt.ID != "r1" || rt.TaskID != "t1" {
+		t.Fatalf("unexpected run task: %+v", rt)
+	}
+
+	if _, err := s.GetByTask(ctx, "missing"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	if _, err := s.Get(ctx, "missing"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestTaskStoreUpdate(t *testing.T) {
+	ctx := context.Background()
+	s := NewTaskStore()
+
+	tk := &domain.Task{ID: "t1", SessionID: "s1", Title: "a", Enabled: true}
+	if err := s.Create(ctx, tk); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	tk.Enabled = false
+	if err := s.Update(ctx, tk); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := s.Get(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Enabled {
+		t.Fatal("want disabled, got enabled")
+	}
+
+	if err := s.Update(ctx, &domain.Task{ID: "missing"}); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestRunTaskStoreUpdate(t *testing.T) {
+	ctx := context.Background()
+	s := NewRunTaskStore()
+
+	rt := &domain.RunTask{ID: "r1", TaskID: "t1", Status: domain.RunStatusCreated}
+	if err := s.Create(ctx, rt); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	rt.Status = domain.RunStatusRunning
+	if err := s.Update(ctx, rt); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := s.Get(ctx, "r1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != domain.RunStatusRunning {
+		t.Fatalf("want running, got %s", got.Status)
+	}
+
+	if err := s.Update(ctx, &domain.RunTask{ID: "missing"}); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestRunTaskStoreDelete(t *testing.T) {
+	ctx := context.Background()
+	s := NewRunTaskStore()
+
+	if err := s.Create(ctx, &domain.RunTask{ID: "r1", TaskID: "t1", Status: domain.RunStatusRunning}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := s.Delete(ctx, "r1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s.Get(ctx, "r1"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("want ErrNotFound after delete, got %v", err)
+	}
+	// 删除后 byTask 索引也应清除
+	if _, err := s.GetByTask(ctx, "t1"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for byTask after delete, got %v", err)
+	}
+	if err := s.Delete(ctx, "r1"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("want ErrNotFound on double delete, got %v", err)
+	}
+}

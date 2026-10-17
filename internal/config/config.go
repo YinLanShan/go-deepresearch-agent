@@ -15,8 +15,8 @@ type Config struct {
 	// LogLevel 是日志级别，支持 debug/info/warn/error。
 	LogLevel string
 
-	// SupervisorModel 是Supervisor内模型调用相关配置。
-	SupervisorModel ModelConfig
+	// Model 是模型调用相关配置。
+	Model ModelConfig
 }
 
 // ModelConfig 描述模型提供方及其连接参数。
@@ -36,7 +36,7 @@ func Load() Config {
 	return Config{
 		HTTPAddr: getenv("DRA_HTTP_ADDR", ":8080"),
 		LogLevel: getenv("DRA_LOG_LEVEL", "info"),
-		SupervisorModel: ModelConfig{
+		Model: ModelConfig{
 			Provider:  getenv("DRA_MODEL_PROVIDER", "mock"),
 			BaseURL:   getenv("DRA_OPENAI_BASE_URL", ""),
 			APIKey:    getenv("DRA_OPENAI_API_KEY", ""),
