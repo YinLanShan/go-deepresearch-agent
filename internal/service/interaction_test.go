@@ -8,6 +8,8 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	mockModel "github.com/YinLanShan/go-deepresearch-agent.git/internal/llm/mock"
+	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage/memory"
@@ -19,11 +21,12 @@ import (
 func newInteraction() (*RunService, *memory.TaskStore, *memory.RunTaskStore, *runtime.Runtime) {
 	tasks := memory.NewTaskStore()
 	runs := memory.NewRunTaskStore()
+	states := stateMemory.NewStore()
 	bus := event.NewBus()
 	runtime.RegisterMockCoordinators(bus, "supervisor", "scheduler", "workpool")
-	rt := runtime.New(runs, bus)
+	rt := runtime.New(runs, tasks, states, mockModel.New(), bus)
 	rt.Start()
-	return NewRunService(tasks, runs, bus), tasks, runs, rt
+	return NewRunService(tasks, runs, states, bus), tasks, runs, rt
 }
 
 func shutdownRuntime(t *testing.T, rt *runtime.Runtime) {
@@ -130,13 +133,14 @@ func TestRequestDeleteRunTaskRejected(t *testing.T) {
 	ctx := context.Background()
 	tasks := memory.NewTaskStore()
 	runs := memory.NewRunTaskStore()
+	states := stateMemory.NewStore()
 	bus := event.NewBus()
 	coords := runtime.RegisterMockCoordinators(bus, "supervisor")
 	coords[0].WithReject(errors.New("supervisor: not ready to terminate"))
-	rt := runtime.New(runs, bus)
+	rt := runtime.New(runs, tasks, states, mockModel.New(), bus)
 	rt.Start()
 	defer shutdownRuntime(t, rt)
-	svc := NewRunService(tasks, runs, bus)
+	svc := NewRunService(tasks, runs, states, bus)
 
 	if err := tasks.Create(ctx, &domain.Task{ID: "t1", SessionID: "s1", Enabled: false}); err != nil {
 		t.Fatalf("create task: %v", err)

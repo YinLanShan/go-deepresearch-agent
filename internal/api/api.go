@@ -25,6 +25,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -32,7 +33,9 @@ import (
 	"github.com/cloudwego/hertz/pkg/route"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 )
@@ -63,6 +66,11 @@ func (a *API) Register(r route.IRouter) {
 	v1.PATCH("/tasks/:id", a.handleUpdateTask)
 	v1.GET("/tasks/:taskID/run", a.handleGetRunByTask)
 	v1.GET("/run-tasks/:runTaskID", a.handleGetRunTask)
+	v1.POST("/sessions/:id/messages", a.handleSendMessage)
+	v1.GET("/sessions/:id/research-state", a.handleGetResearchState)
+	v1.POST("/sessions/:id/stop", a.handleStop)
+	v1.POST("/sessions/:id/research", a.handleResearchStream)
+	v1.POST("/sessions/:id/conversations", a.handleStartConversation)
 }
 
 type chatRequest struct {
@@ -171,7 +179,7 @@ func (a *API) handleListTasks(_ context.Context, c *app.RequestContext) {
 	c.JSON(http.StatusOK, map[string]any{"tasks": tasks})
 }
 
-// handleDeleteSession 删除 Session，并级联删除其名下的 Task 与 RunTask。
+// handleDeleteSession 删除 Session，并级联删除其名下的 Task、RunTask 与 ResearchState。
 func (a *API) handleDeleteSession(ctx context.Context, c *app.RequestContext) {
 	id := c.Param("id")
 	if id == "" {
@@ -202,6 +210,12 @@ func (a *API) handleDeleteSession(ctx context.Context, c *app.RequestContext) {
 			c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
+	}
+
+	// 级联删除该 Session 的 ResearchState（研究发现资产随 Session 删除）。
+	if err := a.runs.DeleteResearchState(ctx, id); err != nil && !errors.Is(err, researchstate.ErrNotFound) {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 
 	if err := a.sessions.Delete(ctx, id); err != nil {
@@ -296,4 +310,169 @@ func (a *API) handleGetRunTask(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	c.JSON(http.StatusOK, rt)
+}
+
+type messageRequest struct {
+	Message string `json:"message"`
+}
+
+// handleSendMessage 向指定 Session 的研究提交一条用户消息（异步，由 Supervisor 处理）。
+func (a *API) handleSendMessage(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	if _, err := a.sessions.Get(ctx, sessionID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	var req messageRequest
+	if err := c.BindAndValidate(&req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "message is required"})
+		return
+	}
+
+	if err := a.runs.SendUserMessage(ctx, sessionID, req.Message); err != nil {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+// handleGetResearchState 查询指定 Session 的研究状态。
+func (a *API) handleGetResearchState(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	st, err := a.runs.GetResearchState(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, researchstate.ErrNotFound) {
+			c.JSON(http.StatusNotFound, map[string]string{"error": "research state not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, st)
+}
+
+// handleStop 处理用户主动中止。
+func (a *API) handleStop(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	if err := a.runs.RequestStop(ctx, sessionID); err != nil {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, map[string]string{"status": "stopped"})
+}
+
+type conversationRequest struct {
+	Requirement string `json:"requirement"`
+}
+
+// handleStartConversation 开启一个新对话：建立新 ResearchState，携带上一对话结论。
+func (a *API) handleStartConversation(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	var req conversationRequest
+	if err := c.BindAndValidate(&req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Requirement) == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "requirement is required"})
+		return
+	}
+	st, err := a.runs.StartNewConversation(ctx, sessionID, req.Requirement)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, st)
+}
+
+// handleResearchStream 以 SSE 流式返回 Supervisor 的研究输出。
+// 借鉴 eino-examples a2ui 的事件消费方式：订阅流式输出事件，逐块写入 SSE。
+func (a *API) handleResearchStream(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	if _, err := a.sessions.Get(ctx, sessionID); err != nil {
+		c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	var req messageRequest
+	if err := c.BindAndValidate(&req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "message is required"})
+		return
+	}
+
+	w := sse.NewWriter(c)
+	sub := &streamSubscriber{sessionID: sessionID, w: w, done: make(chan struct{})}
+	bus := a.runs.Bus()
+	bus.Subscribe(event.EventModelOutput, sub)
+	bus.Subscribe(event.EventModelOutputDone, sub)
+
+	if err := a.runs.SendUserMessage(ctx, sessionID, req.Message); err != nil {
+		_ = w.WriteEvent("", "error", []byte(err.Error()))
+		_ = w.Close()
+		return
+	}
+
+	select {
+	case <-sub.done:
+	case <-ctx.Done():
+	case <-time.After(60 * time.Second):
+	}
+	_ = w.Close()
+}
+
+// streamSubscriber 订阅流式输出事件并写入 SSE。
+type streamSubscriber struct {
+	sessionID string
+	w         *sse.Writer
+	done      chan struct{}
+	once      sync.Once
+}
+
+var _ event.EventSender = (*streamSubscriber)(nil)
+
+// Send 实现 event.EventSender：过滤本 Session 的流式输出事件。
+func (s *streamSubscriber) Send(_ context.Context, e event.EventEnvelope) error {
+	switch ev := e.Data.(type) {
+	case event.ModelOutputEvent:
+		if ev.SessionID == s.sessionID {
+			_ = s.w.WriteEvent("", "message", []byte(ev.Chunk))
+		}
+	case event.ModelOutputDoneEvent:
+		if ev.SessionID == s.sessionID {
+			s.once.Do(func() { close(s.done) })
+		}
+	}
+	return nil
 }

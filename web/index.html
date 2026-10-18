@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepResearch Agent 控制台</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px; line-height: 1.5; }
+    h1 { font-size: 20px; margin: 0 0 16px; }
+    section { margin-bottom: 20px; padding: 16px; border: 1px solid #8884; border-radius: 8px; }
+    section h2 { font-size: 14px; margin: 0 0 10px; color: #888; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+    input, textarea { padding: 6px 8px; border-radius: 6px; border: 1px solid #8888; font-size: 13px; }
+    input[type=text] { flex: 1; min-width: 160px; }
+    button { padding: 6px 12px; border-radius: 6px; border: 1px solid #8888; background: #2a7fff; color: #fff; cursor: pointer; font-size: 13px; }
+    button.secondary { background: #666; }
+    button.danger { background: #c0392b; }
+    pre { background: #0001; padding: 12px; border-radius: 6px; overflow: auto; max-height: 320px; font-size: 12px; white-space: pre-wrap; }
+    #output { min-height: 60px; }
+    .muted { color: #888; font-size: 12px; }
+    code { background: #0001; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>DeepResearch Agent 控制台</h1>
+
+  <section>
+    <h2>服务地址</h2>
+    <div class="row">
+      <input id="base" type="text" value="http://127.0.0.1:8080" />
+    </div>
+  </section>
+
+  <section>
+    <h2>1. 创建会话与任务</h2>
+    <div class="row">
+      <input id="title" type="text" placeholder="研究主题" value="研究某框架的架构" />
+      <button id="btn-session">创建 Session</button>
+    </div>
+    <div class="row">
+      <input id="requirement" type="text" placeholder="研究需求（Task description）" value="研究某Agent框架的架构与性能" />
+      <button id="btn-task" class="secondary" disabled>在 Session 下创建 Task</button>
+      <button id="btn-enable" class="secondary" disabled>启用 Task（开始研究）</button>
+    </div>
+    <div class="muted">Session: <span id="session-id">-</span> · Task: <span id="task-id">-</span></div>
+  </section>
+
+  <section>
+    <h2>2. 发送研究消息（SSE 流式）</h2>
+    <div class="row">
+      <input id="message" type="text" placeholder="输入研究指令" value="请分析该框架的执行模型" />
+      <button id="btn-research">研究（流式）</button>
+      <button id="btn-stop" class="danger">中止研究</button>
+      <button id="btn-conversation" class="secondary">开启新对话</button>
+    </div>
+    <pre id="output">（流式输出将显示在这里）</pre>
+  </section>
+
+  <section>
+    <h2>3. 研究状态</h2>
+    <div class="row">
+      <button id="btn-state" class="secondary">查询 ResearchState</button>
+    </div>
+    <pre id="state">-</pre>
+  </section>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const base = () => $('base').value.replace(/\/$/, '');
+    const state = { sessionID: '', taskID: '' };
+
+    function setStatus(text) { $('session-id').textContent = state.sessionID || '-'; $('task-id').textContent = state.taskID || '-'; }
+
+    async function post(url, body) {
+      const resp = await fetch(base() + url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body ?? {}),
+      });
+      if (!resp.ok) {
+        const t = await resp.text();
+        throw new Error(`${resp.status} ${t}`);
+      }
+      return resp;
+    }
+
+    $('btn-session').onclick = async () => {
+      try {
+        const resp = await post('/api/v1/sessions', { title: $('title').value });
+        const s = await resp.json();
+        state.sessionID = s.id;
+        setStatus();
+        $('btn-task').disabled = false;
+        log(`Session 已创建：${s.id}`);
+      } catch (e) { log('错误：' + e.message); }
+    };
+
+    $('btn-task').onclick = async () => {
+      try {
+        const resp = await post(`/api/v1/sessions/${state.sessionID}/tasks`, { title: '研究任务', description: $('requirement').value });
+        const t = await resp.json();
+        state.taskID = t.id;
+        setStatus();
+        $('btn-enable').disabled = false;
+        log(`Task 已创建：${t.id}`);
+      } catch (e) { log('错误：' + e.message); }
+    };
+
+    $('btn-enable').onclick = async () => {
+      try {
+        await fetch(base() + `/api/v1/tasks/${state.taskID}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true }),
+        });
+        log('Task 已启用，RunTask 与 ResearchState 已初始化');
+      } catch (e) { log('错误：' + e.message); }
+    };
+
+    // SSE 流式研究：用 fetch + ReadableStream 消费 text/event-stream
+    $('btn-research').onclick = async () => {
+      const out = $('output');
+      out.textContent = '';
+      try {
+        const resp = await fetch(base() + `/api/v1/sessions/${state.sessionID}/research`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: $('message').value }),
+        });
+        if (!resp.ok) { out.textContent = `HTTP ${resp.status}`; return; }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          // 解析 SSE：按空行分事件，取 data: 行
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) >= 0) {
+            const ev = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            for (const line of ev.split('\n')) {
+              if (line.startsWith('data:')) {
+                out.textContent += line.slice(5).trimStart();
+              }
+            }
+          }
+        }
+      } catch (e) { out.textContent += '\n[错误] ' + e.message; }
+    };
+
+    $('btn-stop').onclick = async () => {
+      try {
+        await post(`/api/v1/sessions/${state.sessionID}/stop`, {});
+        log('已发起中止');
+      } catch (e) { log('错误：' + e.message); }
+    };
+
+    $('btn-conversation').onclick = async () => {
+      try {
+        const resp = await post(`/api/v1/sessions/${state.sessionID}/conversations`, { requirement: $('requirement').value });
+        const st = await resp.json();
+        log('已开启新对话，ResearchState 已重建（含 RelatedFinding）');
+        $('state').textContent = JSON.stringify(st, null, 2);
+      } catch (e) { log('错误：' + e.message); }
+    };
+
+    $('btn-state').onclick = async () => {
+      try {
+        const resp = await fetch(base() + `/api/v1/sessions/${state.sessionID}/research-state`);
+        const st = await resp.json();
+        $('state').textContent = JSON.stringify(st, null, 2);
+      } catch (e) { $('state').textContent = '错误：' + e.message; }
+    };
+
+    function log(msg) { $('output').textContent += '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n'; }
+  </script>
+</body>
+</html>

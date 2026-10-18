@@ -81,6 +81,25 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/tasks/{taskID}/run
 
 # 按 RunTaskID 查询
 Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/run-tasks/{runTaskID}
+
+# 向 Session 的研究提交一条用户消息（异步，由 Supervisor 处理）
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/messages `
+  -Method Post -ContentType "application/json" -Body '{"message":"请分析架构"}'
+
+# 查询 Session 的研究状态（研究需求 + 各轮研究结论）
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/research-state
+
+# 流式研究：提交消息并以 SSE 流式返回 Supervisor 的研究输出
+curl.exe -s -N -X POST http://127.0.0.1:8080/api/v1/sessions/{id}/research `
+  -H "Content-Type: application/json" --data-binary "@$env:TEMP\msg.json"
+
+# 用户主动中止（协作式/全局；中止后 RunTask 置 stopped，ResearchState 停止接收 Commit）
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/stop `
+  -Method Post -ContentType "application/json" -Body '{}'
+
+# 开启新对话：建立新 ResearchState，并把上一对话结论写入 RelatedFinding
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/conversations `
+  -Method Post -ContentType "application/json" -Body '{"requirement":"新研究需求"}'
 ```
 
 > 约束：
@@ -88,8 +107,24 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/run-tasks/{runTaskID}
 > - **Task 只能启用/禁用，无直接删除路径**；新建的 Task 默认禁用。
 > - **RunTask 由独立实体 Runtime 经事件订阅维护**：启用/禁用/删除都先由 Runtime
 >   向依赖组件（Supervisor/Scheduler/WorkPool，当前为 Mock）发起协商，协商通过后才原子落地。
-> - **使能时若 RunTask 不存在，Runtime 先协商创建（含初始化要求）再新建 RunTask**。
-> - Session 删除会级联删除其 Task 与 RunTask（RunTask 删除同样经协商）。
+> - **使能时若 RunTask 不存在，Runtime 先协商创建（含初始化要求）再新建 RunTask**，
+>   同时初始化该 Session 的 ResearchState（首轮仅含研究需求）并启动 SupervisorLoop。
+> - **SupervisorLoop** 外层订阅用户消息事件，内层用 Eino 的 TurnLoop 驱动模型产出研究结论，
+>   写回 ResearchState；流式输出经 ModelOutput 事件发布为 SSE。
+> - **ResearchState Commit 门控**：中止时停止接收新 Commit（返回 ErrNotAccepting），
+>   正在进行的 Commit 继续完成；恢复后重新接受。
+> - **用户主动中止（stop）为协作式/全局**：Runtime 与依赖组件协商后停止 SupervisorLoop、
+>   置 RunTask 为 `stopped`、关闭提交门控；之后用户再次输入会自动恢复研究并重建上下文。
+> - ResearchState 生命周期与 Session 绑定；Session 级联删除时一并删除 ResearchState。
+
+## 前端模板
+
+`web/index.html` 是一个零依赖的单文件控制台，用于检验 SSE 流式输出效果：
+
+1. 启动服务（默认监听 `127.0.0.1:8080`，已开启 CORS）。
+2. 用浏览器直接打开 `web/index.html`（`file://` 方式即可，服务端已允许跨源）。
+3. 依次：创建 Session → 创建 Task → 启用 → 「研究（流式）」→ 观察 SSE 逐块输出；
+   可再测试「中止研究」与「开启新对话」。
 
 用 curl.exe 时，把 JSON 写入文件（无 BOM 的 UTF-8）再发送，可避免引号/编码问题：
 

@@ -4,6 +4,7 @@ package mock
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -18,32 +19,67 @@ type Model struct{}
 // New 构造一个 mock Model。
 func New() *Model { return &Model{} }
 
+// SlowModel 是慢速模型，用于测试中断/抢占场景。
+// Generate 阻塞 Delay 后返回；Stream 逐块输出，块间有 Delay，且响应 ctx 取消。
+type SlowModel struct {
+	Delay     time.Duration
+	ChunkSize int
+}
+
+// NewSlowModel 构造一个慢速模型。
+func NewSlowModel(delay time.Duration) *SlowModel {
+	return &SlowModel{Delay: delay, ChunkSize: chunkSize}
+}
+
 // 编译期断言实现 eino 的完整基础模型接口。
-var _ model.BaseChatModel = (*Model)(nil)
+var (
+	_ model.BaseChatModel = (*Model)(nil)
+	_ model.BaseChatModel = (*SlowModel)(nil)
+)
 
 // Generate 返回一条完整回复。
 func (m *Model) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
-	return schema.AssistantMessage(m.reply(input), nil), nil
+	return schema.AssistantMessage(reply(input), nil), nil
 }
 
 // Stream 返回由多块构成的确定性回复流。
 func (m *Model) Stream(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	reply := m.reply(input)
-	var chunks []*schema.Message
-	for i := 0; i < len(reply); i += chunkSize {
-		end := i + chunkSize
-		if end > len(reply) {
-			end = len(reply)
-		}
-		chunks = append(chunks, schema.AssistantMessage(reply[i:end], nil))
-	}
-	if len(chunks) == 0 {
-		chunks = append(chunks, schema.AssistantMessage("", nil))
-	}
-	return schema.StreamReaderFromArray(chunks), nil
+	chunks := splitChunks(reply(input), chunkSize)
+	return schema.StreamReaderFromArray(toMessages(chunks)), nil
 }
 
-func (m *Model) reply(input []*schema.Message) string {
+// Generate 阻塞 Delay 后返回完整回复，响应 ctx 取消。
+func (m *SlowModel) Generate(ctx context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	if err := sleep(ctx, m.Delay); err != nil {
+		return nil, err
+	}
+	return schema.AssistantMessage(reply(input), nil), nil
+}
+
+// Stream 逐块输出回复，块间有 Delay，响应 ctx 取消（用于测试中断抢占）。
+func (m *SlowModel) Stream(ctx context.Context, input []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	chunks := splitChunks(reply(input), m.ChunkSize)
+	if len(chunks) == 0 {
+		chunks = []string{""}
+	}
+	sr, sw := schema.Pipe[*schema.Message](len(chunks))
+	go func() {
+		defer sw.Close()
+		for _, c := range chunks {
+			if err := sleep(ctx, m.Delay); err != nil {
+				sw.Send(nil, err)
+				return
+			}
+			if sw.Send(schema.AssistantMessage(c, nil), nil) {
+				return // 流已关闭
+			}
+		}
+	}()
+	return sr, nil
+}
+
+// reply 回显最后一条用户消息。
+func reply(input []*schema.Message) string {
 	var last string
 	for _, msg := range input {
 		if msg != nil && msg.Role == schema.User {
@@ -54,4 +90,44 @@ func (m *Model) reply(input []*schema.Message) string {
 		return "mock reply (no user message)"
 	}
 	return fmt.Sprintf("mock reply to: %s", last)
+}
+
+func splitChunks(s string, size int) []string {
+	if size <= 0 {
+		size = chunkSize
+	}
+	runes := []rune(s)
+	var out []string
+	for i := 0; i < len(runes); i += size {
+		end := i + size
+		if end > len(runes) {
+			end = len(runes)
+		}
+		out = append(out, string(runes[i:end]))
+	}
+	return out
+}
+
+func toMessages(chunks []string) []*schema.Message {
+	msgs := make([]*schema.Message, 0, len(chunks))
+	for _, c := range chunks {
+		msgs = append(msgs, schema.AssistantMessage(c, nil))
+	}
+	if len(msgs) == 0 {
+		msgs = append(msgs, schema.AssistantMessage("", nil))
+	}
+	return msgs
+}
+
+// sleep 阻塞 d，响应 ctx 取消。
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

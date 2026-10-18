@@ -10,15 +10,16 @@ import (
 	"fmt"
 
 	"github.com/cloudwego/eino/components/model"
-	"github.com/cloudwego/eino/schema"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm/mock"
 )
 
-// ChatModel 是阶段 0 所需的最小模型能力：流式对话补全。
+// ChatModel 是项目统一的模型能力抽象，嵌入 eino 的 model.BaseChatModel，
+// 同时具备 Generate（非流式）与 Stream（流式）两种能力，
+// 供 ChatService（流式输出）与 SupervisorLoop（ADK，需 Generate）复用。
 type ChatModel interface {
-	Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error)
+	model.BaseChatModel
 }
 
 // Config 描述模型提供方及其连接参数。

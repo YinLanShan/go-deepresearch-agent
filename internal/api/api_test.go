@@ -20,6 +20,7 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm/mock"
+	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
@@ -33,18 +34,20 @@ type harness struct {
 	runs     *memory.RunTaskStore
 	tasks    *memory.TaskStore
 	sessions *memory.SessionStore
+	states   *stateMemory.Store
 }
 
 func newHarness() *harness {
 	sessions := memory.NewSessionStore()
 	tasks := memory.NewTaskStore()
 	runs := memory.NewRunTaskStore()
+	states := stateMemory.NewStore()
 	bus := event.NewBus()
 	runtime.RegisterMockCoordinators(bus, "supervisor", "scheduler", "workpool")
-	rt := runtime.New(runs, bus)
+	rt := runtime.New(runs, tasks, states, mock.New(), bus)
 	rt.Start()
-	a := New(service.NewChatService(mock.New()), sessions, tasks, service.NewRunService(tasks, runs, bus))
-	return &harness{api: a, rt: rt, runs: runs, tasks: tasks, sessions: sessions}
+	a := New(service.NewChatService(mock.New()), sessions, tasks, service.NewRunService(tasks, runs, states, bus))
+	return &harness{api: a, rt: rt, runs: runs, tasks: tasks, sessions: sessions, states: states}
 }
 
 func (h *harness) router(t *testing.T) *route.Engine {
@@ -404,4 +407,74 @@ func TestEnableCreatesRunTaskWhenMissing(t *testing.T) {
 		t.Fatalf("enable: want 200, got %d, body=%s", resp.StatusCode(), resp.Body())
 	}
 	waitRunTask(t, h.runs, taskID, domain.RunStatusRunning)
+}
+
+// TestMultiTurnResearchFlow 验证 HTTP 层的多轮研究闭环：
+// 启用 Task 初始化 ResearchState -> 发消息 -> Supervisor 研究 -> 结果写入 ResearchState。
+func TestMultiTurnResearchFlow(t *testing.T) {
+	h := newHarness()
+	defer h.stop(t)
+	router := h.router(t)
+
+	// 创建 Session + Task（description 作为研究需求）
+	w := ut.PerformRequest(router, "POST", "/api/v1/sessions",
+		jsonBody(t, map[string]string{"title": "s"}), jsonHeader())
+	resp := w.Result()
+	if resp.StatusCode() != 201 {
+		t.Fatalf("create session: %d", resp.StatusCode())
+	}
+	var sess struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(resp.Body(), &sess)
+
+	w = ut.PerformRequest(router, "POST", "/api/v1/sessions/"+sess.ID+"/tasks",
+		jsonBody(t, map[string]string{"title": "t", "description": "研究某框架的架构"}), jsonHeader())
+	resp = w.Result()
+	if resp.StatusCode() != 201 {
+		t.Fatalf("create task: %d, body=%s", resp.StatusCode(), resp.Body())
+	}
+	var tk struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(resp.Body(), &tk)
+
+	// 启用 Task：Runtime 初始化 ResearchState（含需求）并启动 SupervisorLoop。
+	w = ut.PerformRequest(router, "PATCH", "/api/v1/tasks/"+tk.ID,
+		jsonBody(t, map[string]bool{"enabled": true}), jsonHeader())
+	if resp = w.Result(); resp.StatusCode() != 200 {
+		t.Fatalf("enable: %d, body=%s", resp.StatusCode(), resp.Body())
+	}
+
+	// 发一条消息
+	w = ut.PerformRequest(router, "POST", "/api/v1/sessions/"+sess.ID+"/messages",
+		jsonBody(t, map[string]string{"message": "请分析"}), jsonHeader())
+	if resp = w.Result(); resp.StatusCode() != 202 {
+		t.Fatalf("send message: %d, body=%s", resp.StatusCode(), resp.Body())
+	}
+
+	// 轮询研究状态，直到出现研究结果
+	waitResearchFindings(t, h.states, sess.ID, 1)
+
+	st, _ := h.states.Get(context.Background(), sess.ID)
+	if st.Requirement != "研究某框架的架构" {
+		t.Fatalf("requirement = %q", st.Requirement)
+	}
+	if len(st.Findings) != 1 || st.Findings[0].Content != "mock reply to: 请分析" {
+		t.Fatalf("findings = %+v", st.Findings)
+	}
+}
+
+func waitResearchFindings(t *testing.T, states *stateMemory.Store, sessionID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := states.Get(context.Background(), sessionID)
+		if err == nil && len(st.Findings) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	st, _ := states.Get(context.Background(), sessionID)
+	t.Fatalf("want %d findings, got %+v", want, st)
 }

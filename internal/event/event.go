@@ -30,6 +30,16 @@ const (
 	EventRunTaskDeleteRequested = "run_task_delete_requested"
 	// EventCoordinationRequested 表示 Runtime 向依赖组件发起的协商请求。
 	EventCoordinationRequested = "coordination_requested"
+	// EventUserMessage 表示用户向某 Session 的研究提交了一条对话消息。
+	EventUserMessage = "user_message"
+	// EventResearchStateCommitted 表示 ResearchState 出现一次新的 Commit。
+	EventResearchStateCommitted = "research_state_committed"
+	// EventStopRequested 表示用户主动请求中止当前研究运行。
+	EventStopRequested = "stop_requested"
+	// EventModelOutput 表示 Supervisor 流式输出的一块内容。
+	EventModelOutput = "model_output"
+	// EventModelOutputDone 表示本次研究（某条用户消息）的流式输出结束。
+	EventModelOutputDone = "model_output_done"
 )
 
 // 协调动作（Runtime 发起的生命周期协商）。
@@ -37,6 +47,7 @@ const (
 	ActionCreate = "create" // 协商创建并初始化新的 RunTask（含初始化要求）
 	ActionResume = "resume" // 恢复运行
 	ActionPause  = "pause"  // 暂停运行
+	ActionStop   = "stop"   // 用户主动中止
 	ActionDelete = "delete" // 删除
 )
 
@@ -240,3 +251,51 @@ type CoordinationRequestedEvent struct {
 
 // EventType 实现 Event 接口。
 func (CoordinationRequestedEvent) EventType() string { return EventCoordinationRequested }
+
+// UserMessageEvent 表示用户向某 Session 的研究提交了一条对话消息。
+type UserMessageEvent struct {
+	SessionID string
+	RunTaskID string
+	Message   string
+}
+
+// EventType 实现 Event 接口。
+func (UserMessageEvent) EventType() string { return EventUserMessage }
+
+// ResearchStateCommittedEvent 表示 ResearchState 出现一次新的 Commit，
+// 用于抢占正在推理的 SupervisorLoop。
+type ResearchStateCommittedEvent struct {
+	SessionID string
+	Version   int64
+}
+
+// EventType 实现 Event 接口。
+func (ResearchStateCommittedEvent) EventType() string { return EventResearchStateCommitted }
+
+// StopRequestedEvent 表示用户主动请求中止当前研究运行。
+type StopRequestedEvent struct {
+	SessionID string
+	RunTaskID string
+}
+
+// EventType 实现 Event 接口。
+func (StopRequestedEvent) EventType() string { return EventStopRequested }
+
+// ModelOutputEvent 表示 Supervisor 流式输出的一块内容。
+type ModelOutputEvent struct {
+	SessionID string
+	RunTaskID string
+	Chunk     string
+}
+
+// EventType 实现 Event 接口。
+func (ModelOutputEvent) EventType() string { return EventModelOutput }
+
+// ModelOutputDoneEvent 表示本次研究（某条用户消息）的流式输出结束。
+type ModelOutputDoneEvent struct {
+	SessionID string
+	RunTaskID string
+}
+
+// EventType 实现 Event 接口。
+func (ModelOutputDoneEvent) EventType() string { return EventModelOutputDone }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage/memory"
 )
@@ -48,11 +49,12 @@ func (r *recordingSender) types() []string {
 func newTestRunService() (*RunService, *memory.TaskStore, *memory.RunTaskStore, *recordingSender) {
 	tasks := memory.NewTaskStore()
 	runs := memory.NewRunTaskStore()
+	states := stateMemory.NewStore()
 	bus := event.NewBus()
 	rec := &recordingSender{}
 	bus.Subscribe(event.EventTaskEnabled, rec)
 	bus.Subscribe(event.EventTaskDisabled, rec)
-	return NewRunService(tasks, runs, bus), tasks, runs, rec
+	return NewRunService(tasks, runs, states, bus), tasks, runs, rec
 }
 
 // setupTask 创建一个 Task 及关联 RunTask，作为启用/禁用的前置条件。
@@ -139,7 +141,7 @@ func TestGetRunTaskByTask(t *testing.T) {
 	ctx := context.Background()
 	tasks := memory.NewTaskStore()
 	runs := memory.NewRunTaskStore()
-	svc := NewRunService(tasks, runs, event.NewBus())
+	svc := NewRunService(tasks, runs, stateMemory.NewStore(), event.NewBus())
 
 	if err := runs.Create(ctx, &domain.RunTask{ID: "r1", TaskID: "t1", Status: domain.RunStatusRunning}); err != nil {
 		t.Fatalf("create run task: %v", err)

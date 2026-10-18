@@ -40,6 +40,7 @@ const (
 	RunStatusCreated   RunStatus = "created"
 	RunStatusRunning   RunStatus = "running"
 	RunStatusPaused    RunStatus = "paused"
+	RunStatusStopped   RunStatus = "stopped"
 	RunStatusWaiting   RunStatus = "waiting"
 	RunStatusCompleted RunStatus = "completed"
 	RunStatusFailed    RunStatus = "failed"
