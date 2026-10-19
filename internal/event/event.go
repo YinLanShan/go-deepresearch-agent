@@ -40,6 +40,8 @@ const (
 	EventModelOutput = "model_output"
 	// EventModelOutputDone 表示本次研究（某条用户消息）的流式输出结束。
 	EventModelOutputDone = "model_output_done"
+	// EventResearchFinished 表示研究任务已完成（模型给出最终结论）。
+	EventResearchFinished = "research_finished"
 )
 
 // 协调动作（Runtime 发起的生命周期协商）。
@@ -255,6 +257,7 @@ func (CoordinationRequestedEvent) EventType() string { return EventCoordinationR
 // UserMessageEvent 表示用户向某 Session 的研究提交了一条对话消息。
 type UserMessageEvent struct {
 	SessionID string
+	TaskID    string
 	RunTaskID string
 	Message   string
 }
@@ -266,6 +269,7 @@ func (UserMessageEvent) EventType() string { return EventUserMessage }
 // 用于抢占正在推理的 SupervisorLoop。
 type ResearchStateCommittedEvent struct {
 	SessionID string
+	TaskID    string
 	Version   int64
 }
 
@@ -275,6 +279,7 @@ func (ResearchStateCommittedEvent) EventType() string { return EventResearchStat
 // StopRequestedEvent 表示用户主动请求中止当前研究运行。
 type StopRequestedEvent struct {
 	SessionID string
+	TaskID    string
 	RunTaskID string
 }
 
@@ -299,3 +304,14 @@ type ModelOutputDoneEvent struct {
 
 // EventType 实现 Event 接口。
 func (ModelOutputDoneEvent) EventType() string { return EventModelOutputDone }
+
+// ResearchFinishedEvent 表示研究任务已完成（模型给出最终结论）。
+// Runtime 收到后把对应 RunTask 从 Running 置为 Finished。
+type ResearchFinishedEvent struct {
+	SessionID string
+	TaskID    string
+	RunTaskID string
+}
+
+// EventType 实现 Event 接口。
+func (ResearchFinishedEvent) EventType() string { return EventResearchFinished }

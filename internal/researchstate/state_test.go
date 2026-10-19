@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildContext(t *testing.T) {
-	st := New("id1", "s1", "研究某框架的架构与性能")
+	st := New("id1", "t1", "s1", "研究某框架的架构与性能")
 
 	ctx := st.BuildContext()
 	for _, want := range []string{
@@ -48,15 +48,18 @@ func TestBuildContext(t *testing.T) {
 }
 
 func TestNewWithRelated(t *testing.T) {
-	prev := New("id0", "s0", "上一个研究需求")
+	prev := New("id0", "t0", "s0", "上一个研究需求")
 	prev.Findings = append(prev.Findings, Finding{Turn: 1, Content: "上一个结论"})
 
-	// 新对话：新建 ResearchState，携带上一对话结论作为 RelatedFinding
+	// 新研究任务：新建 ResearchState，携带上一研究任务结论作为 RelatedFinding
 	related := []RelatedFinding{{SessionID: "s0", Summary: prev.Summary()}}
-	st := NewWithRelated("id1", "s1", "新研究需求", related)
+	st := NewWithRelated("id1", "t1", "s1", "新研究需求", related)
 
 	if st.Requirement != "新研究需求" {
 		t.Fatalf("requirement = %q", st.Requirement)
+	}
+	if st.TaskID != "t1" {
+		t.Fatalf("taskID = %q", st.TaskID)
 	}
 	if len(st.RelatedFindings) != 1 || !strings.Contains(st.RelatedFindings[0].Summary, "上一个结论") {
 		t.Fatalf("related = %+v", st.RelatedFindings)

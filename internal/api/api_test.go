@@ -19,7 +19,7 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
-	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm/mock"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm"
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
@@ -44,9 +44,14 @@ func newHarness() *harness {
 	states := stateMemory.NewStore()
 	bus := event.NewBus()
 	runtime.RegisterMockCoordinators(bus, "supervisor", "scheduler", "workpool")
-	rt := runtime.New(runs, tasks, states, mock.New(), bus)
+	mdl, err := llm.NewSwappable(context.Background(), llm.Config{Provider: "mock"})
+	if err != nil {
+		panic(err)
+	}
+	rt := runtime.New(runs, tasks, states, mdl, bus)
 	rt.Start()
-	a := New(service.NewChatService(mock.New()), sessions, tasks, service.NewRunService(tasks, runs, states, bus))
+	a := New(service.NewChatService(mdl), sessions, tasks,
+		service.NewRunService(tasks, runs, states, bus), service.NewConfigService(mdl))
 	return &harness{api: a, rt: rt, runs: runs, tasks: tasks, sessions: sessions, states: states}
 }
 
@@ -263,7 +268,8 @@ func TestCreateTaskUnderMissingSession(t *testing.T) {
 	}
 }
 
-func TestCreateSecondTaskConflict(t *testing.T) {
+// TestCreateMultipleTasksAllowed 验证一个 Session 可创建多个 Task。
+func TestCreateMultipleTasksAllowed(t *testing.T) {
 	h := newHarness()
 	defer h.stop(t)
 	router := h.router(t)
@@ -289,8 +295,22 @@ func TestCreateSecondTaskConflict(t *testing.T) {
 
 	w = ut.PerformRequest(router, "POST", "/api/v1/sessions/"+sess.ID+"/tasks",
 		jsonBody(t, map[string]string{"title": "t2"}), jsonHeader())
-	if resp = w.Result(); resp.StatusCode() != 409 {
-		t.Fatalf("second task: want 409, got %d, body=%s", resp.StatusCode(), resp.Body())
+	if resp = w.Result(); resp.StatusCode() != 201 {
+		t.Fatalf("second task: want 201, got %d, body=%s", resp.StatusCode(), resp.Body())
+	}
+
+	// 列出应有 2 个 Task
+	w = ut.PerformRequest(router, "GET", "/api/v1/sessions/"+sess.ID+"/tasks", nil)
+	var list struct {
+		Tasks []struct {
+			ID string `json:"id"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(w.Result().Body(), &list); err != nil {
+		t.Fatalf("unmarshal tasks: %v", err)
+	}
+	if len(list.Tasks) != 2 {
+		t.Fatalf("want 2 tasks, got %d", len(list.Tasks))
 	}
 }
 
@@ -409,9 +429,10 @@ func TestEnableCreatesRunTaskWhenMissing(t *testing.T) {
 	waitRunTask(t, h.runs, taskID, domain.RunStatusRunning)
 }
 
-// TestMultiTurnResearchFlow 验证 HTTP 层的多轮研究闭环：
-// 启用 Task 初始化 ResearchState -> 发消息 -> Supervisor 研究 -> 结果写入 ResearchState。
-func TestMultiTurnResearchFlow(t *testing.T) {
+// TestResearchLifecycleFlow 验证 HTTP 层的研究生命周期：
+// 启用 Task -> 发消息 -> 研究完成后 RunTask 置 Finished -> 再发消息自动新建 Task 与
+// 新 ResearchState（继承上一份结论为 RelatedFinding）。
+func TestResearchLifecycleFlow(t *testing.T) {
 	h := newHarness()
 	defer h.stop(t)
 	router := h.router(t)
@@ -439,7 +460,7 @@ func TestMultiTurnResearchFlow(t *testing.T) {
 	}
 	_ = json.Unmarshal(resp.Body(), &tk)
 
-	// 启用 Task：Runtime 初始化 ResearchState（含需求）并启动 SupervisorLoop。
+	// 启用 Task：Runtime 初始化该 Task 的 ResearchState 并启动 SupervisorLoop。
 	w = ut.PerformRequest(router, "PATCH", "/api/v1/tasks/"+tk.ID,
 		jsonBody(t, map[string]bool{"enabled": true}), jsonHeader())
 	if resp = w.Result(); resp.StatusCode() != 200 {
@@ -456,25 +477,87 @@ func TestMultiTurnResearchFlow(t *testing.T) {
 	// 轮询研究状态，直到出现研究结果
 	waitResearchFindings(t, h.states, sess.ID, 1)
 
-	st, _ := h.states.Get(context.Background(), sess.ID)
+	st, err := h.states.GetLatestBySession(context.Background(), sess.ID)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
 	if st.Requirement != "研究某框架的架构" {
 		t.Fatalf("requirement = %q", st.Requirement)
 	}
 	if len(st.Findings) != 1 || st.Findings[0].Content != "mock reply to: 请分析" {
 		t.Fatalf("findings = %+v", st.Findings)
 	}
+	firstTaskID := st.TaskID
+
+	// 等研究完成（RunTask -> Finished）
+	waitRunStatus(t, h.runs, tk.ID, domain.RunStatusFinished)
+
+	// 再次发消息：应自动新建 Task + 新 ResearchState（继承上一份结论）
+	w = ut.PerformRequest(router, "POST", "/api/v1/sessions/"+sess.ID+"/messages",
+		jsonBody(t, map[string]string{"message": "继续深入"}), jsonHeader())
+	if resp = w.Result(); resp.StatusCode() != 202 {
+		t.Fatalf("send second message: %d, body=%s", resp.StatusCode(), resp.Body())
+	}
+
+	waitTaskCount(t, h.tasks, sess.ID, 2)
+	waitResearchFindings(t, h.states, sess.ID, 1)
+
+	latest, err := h.states.GetLatestBySession(context.Background(), sess.ID)
+	if err != nil {
+		t.Fatalf("get latest state: %v", err)
+	}
+	if latest.TaskID == firstTaskID {
+		t.Fatalf("should create a new ResearchState for the new Task, still %q", latest.TaskID)
+	}
+	if len(latest.RelatedFindings) == 0 {
+		t.Fatalf("new ResearchState should carry RelatedFindings from previous task")
+	}
+	if !strings.Contains(latest.RelatedFindings[0].Summary, "mock reply to: 请分析") {
+		t.Fatalf("related finding should contain previous conclusion, got %q", latest.RelatedFindings[0].Summary)
+	}
+	if latest.Requirement != "继续深入" {
+		t.Fatalf("new requirement should be the follow-up message, got %q", latest.Requirement)
+	}
 }
 
 func waitResearchFindings(t *testing.T, states *stateMemory.Store, sessionID string, want int) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		st, err := states.Get(context.Background(), sessionID)
+		st, err := states.GetLatestBySession(context.Background(), sessionID)
 		if err == nil && len(st.Findings) >= want {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	st, _ := states.Get(context.Background(), sessionID)
+	st, _ := states.GetLatestBySession(context.Background(), sessionID)
 	t.Fatalf("want %d findings, got %+v", want, st)
+}
+
+func waitRunStatus(t *testing.T, runs *memory.RunTaskStore, taskID string, want domain.RunStatus) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rt, err := runs.GetByTask(context.Background(), taskID)
+		if err == nil && rt.Status == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	rt, _ := runs.GetByTask(context.Background(), taskID)
+	t.Fatalf("want run status %q, got %+v", want, rt)
+}
+
+func waitTaskCount(t *testing.T, tasks *memory.TaskStore, sessionID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		list, err := tasks.ListBySession(context.Background(), sessionID)
+		if err == nil && len(list) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	list, _ := tasks.ListBySession(context.Background(), sessionID)
+	t.Fatalf("want %d tasks, got %d", want, len(list))
 }

@@ -42,12 +42,16 @@ type Config struct {
 	Model     model.BaseChatModel
 	States    researchstate.Store
 	SessionID string
+	TaskID    string
+	RunTaskID string
 	Bus       *event.Bus
 }
 
 // Loop 是 SupervisorLoop 的最小闭环。
 type Loop struct {
 	sessionID string
+	taskID    string
+	runTaskID string
 	model     model.BaseChatModel
 	states    researchstate.Store
 	bus       *event.Bus
@@ -63,6 +67,8 @@ var _ event.EventSender = (*Loop)(nil)
 func New(cfg Config) *Loop {
 	l := &Loop{
 		sessionID: cfg.SessionID,
+		taskID:    cfg.TaskID,
+		runTaskID: cfg.RunTaskID,
 		model:     cfg.Model,
 		states:    cfg.States,
 		bus:       cfg.Bus,
@@ -84,16 +90,16 @@ func (l *Loop) Start() {
 	l.loop.Run(context.Background())
 }
 
-// Send 实现 event.EventSender：过滤本 Session 的事件并推入 TurnLoop。
+// Send 实现 event.EventSender：按 RunTaskID 过滤消息、按 TaskID 过滤 Commit 事件。
 func (l *Loop) Send(_ context.Context, e event.EventEnvelope) error {
 	switch ev := e.Data.(type) {
 	case event.UserMessageEvent:
-		if ev.SessionID != l.sessionID {
+		if ev.RunTaskID != l.runTaskID {
 			return nil
 		}
 		l.loop.Push(Input{Message: ev.Message})
 	case event.ResearchStateCommittedEvent:
-		if ev.SessionID != l.sessionID {
+		if ev.TaskID != l.taskID {
 			return nil
 		}
 		// 抢占当前轮次（在模型/工具调用间隙中断），并开启重新规划轮次。
@@ -140,7 +146,7 @@ func (l *Loop) genInput(_ context.Context, _ *adk.TurnLoop[Input, *schema.Messag
 func (l *Loop) prepareAgent(ctx context.Context, _ *adk.TurnLoop[Input, *schema.Message],
 	_ []Input) (adk.Agent, error) {
 	instruction := ""
-	if st, err := l.states.Get(ctx, l.sessionID); err == nil {
+	if st, err := l.states.Get(ctx, l.taskID); err == nil {
 		instruction = st.BuildContext()
 	}
 	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
@@ -194,6 +200,7 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 
 	err := l.commitFinding(ctx, output.String())
 	l.publishOutputDone()
+	l.publishResearchFinished()
 	return err
 }
 
@@ -225,7 +232,7 @@ func (l *Loop) publishOutput(chunk string) {
 		return
 	}
 	_ = l.bus.Publish(context.Background(), event.EventEnvelope{
-		Data: event.ModelOutputEvent{SessionID: l.sessionID, Chunk: chunk},
+		Data: event.ModelOutputEvent{SessionID: l.sessionID, RunTaskID: l.runTaskID, Chunk: chunk},
 	})
 }
 
@@ -235,7 +242,21 @@ func (l *Loop) publishOutputDone() {
 		return
 	}
 	_ = l.bus.Publish(context.Background(), event.EventEnvelope{
-		Data: event.ModelOutputDoneEvent{SessionID: l.sessionID},
+		Data: event.ModelOutputDoneEvent{SessionID: l.sessionID, RunTaskID: l.runTaskID},
+	})
+}
+
+// publishResearchFinished 发布研究完成事件，通知 Runtime 把 RunTask 置为 Finished。
+func (l *Loop) publishResearchFinished() {
+	if l.bus == nil {
+		return
+	}
+	_ = l.bus.Publish(context.Background(), event.EventEnvelope{
+		Data: event.ResearchFinishedEvent{
+			SessionID: l.sessionID,
+			TaskID:    l.taskID,
+			RunTaskID: l.runTaskID,
+		},
 	})
 }
 
@@ -244,12 +265,12 @@ func (l *Loop) commitFinding(ctx context.Context, answer string) error {
 	if answer == "" {
 		return nil
 	}
-	st, err := l.states.Get(ctx, l.sessionID)
+	st, err := l.states.Get(ctx, l.taskID)
 	if err != nil {
 		return err
 	}
 	finding := st.InterruptedContext + answer
-	return l.states.Commit(ctx, l.sessionID, researchstate.CommitInput{
+	return l.states.Commit(ctx, l.taskID, researchstate.CommitInput{
 		ResultContent:  answer,
 		FindingContent: finding,
 	})
@@ -260,8 +281,8 @@ func (l *Loop) saveInterrupted(ctx context.Context, text string) {
 	if text == "" {
 		return
 	}
-	if err := l.states.AccumulateInterruptedContext(ctx, l.sessionID, text); err != nil {
-		slog.Error("accumulate interrupted context failed", "session", l.sessionID, "err", err)
+	if err := l.states.AccumulateInterruptedContext(ctx, l.taskID, text); err != nil {
+		slog.Error("accumulate interrupted context failed", "task", l.taskID, "err", err)
 	}
 }
 

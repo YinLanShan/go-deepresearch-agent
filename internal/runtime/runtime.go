@@ -8,7 +8,14 @@
 //   - RunTask 不由 HTTP Handler 直接创建或变更；用户操作以事件提交到 Runtime。
 //   - Runtime 收到变更事件后，先向依赖组件（Supervisor / Scheduler / WorkPool 等，
 //     本阶段为 Mock）发起协商，协商全部成功后，才原子地落地内存状态。
-//   - RunTask 启动（创建）时，Runtime 初始化 ResearchState 与 SupervisorLoop。
+//   - RunTask 启动（创建）时，Runtime 初始化 ResearchState（按 TaskID）与 SupervisorLoop。
+//
+// 生命周期语义（本阶段）：
+//   - 一个 Session 可对应多个 Task，一个 Task 对应一个 RunTask；
+//   - 全局同一时间只有一个 RunTask 处于 Running（使能新 Session 前先失能旧 Session）；
+//   - 失能 = 全局中止 + RunTask 置 Paused（可经"继续"恢复为 Running）；
+//   - 用户主动中止 = 全局中止 + RunTask 置 Stopped（终止态，发新消息会新建 Task）；
+//   - 模型完成研究 = RunTask 置 Finished（终止态，发新消息会新建 Task）。
 package runtime
 
 import (
@@ -42,7 +49,7 @@ type Runtime struct {
 	model  model.BaseChatModel
 	bus    *event.Bus
 
-	// supervisors 维护每个 Session 的 SupervisorLoop（RunTask 启动时创建）。
+	// supervisors 维护每个运行中 Task 的 SupervisorLoop（按 TaskID）。
 	mu          sync.Mutex
 	supervisors map[string]*supervisor.Loop
 
@@ -79,6 +86,7 @@ func New(runs storage.RunTaskStore, tasks storage.TaskStore, states researchstat
 		bus.Subscribe(event.EventTaskDisabled, r)
 		bus.Subscribe(event.EventRunTaskDeleteRequested, r)
 		bus.Subscribe(event.EventStopRequested, r)
+		bus.Subscribe(event.EventResearchFinished, r)
 	}
 	return r
 }
@@ -161,21 +169,33 @@ func (r *Runtime) process(ctx context.Context, e event.EventEnvelope) error {
 	case event.RunTaskDeleteRequestedEvent:
 		return r.onRunTaskDelete(ctx, ev.TaskID)
 	case event.StopRequestedEvent:
-		return r.onStop(ctx, ev.SessionID)
+		return r.onStop(ctx, ev.TaskID)
+	case event.ResearchFinishedEvent:
+		return r.onResearchFinished(ctx, ev.TaskID)
 	default:
 		return nil
 	}
 }
 
-// onTaskEnabled 在 Task 启用时恢复对应 RunTask 为 running。
-// 若 RunTask 不存在，先协商创建（含初始化要求），协商完成后新建 RunTask，
-// 并初始化 ResearchState 与 SupervisorLoop。
+// onTaskEnabled 处理 Task 使能：
+//   - RunTask 不存在：协商创建，失能其他运行中的 Session，再新建 RunTask 并初始化研究；
+//   - RunTask 已存在（Paused）：协商恢复，失能其他运行中的 Session，再置 Running。
 func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
+	task, err := r.tasks.Get(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	sessionID := task.SessionID
+
 	rt, err := r.runs.GetByTask(ctx, taskID)
 
-	// 使能时没有对应 RunTask：协商创建（初始化）后再新建。
 	if errors.Is(err, storage.ErrNotFound) {
+		// 使能时没有对应 RunTask：协商创建（初始化）后再新建。
 		if err := r.coordinate(ctx, taskID, "", event.ActionCreate); err != nil {
+			return err
+		}
+		// 全局单例运行：使能本 Session 前，先失能其他运行中的 Session。
+		if err := r.disableOtherRunningSessions(ctx, taskID); err != nil {
 			return err
 		}
 		now := r.now()
@@ -189,14 +209,28 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 		if err := r.runs.Create(ctx, rt); err != nil {
 			return err
 		}
-		return r.initResearchRun(ctx, taskID)
+		return r.initResearchRun(ctx, taskID, rt.ID)
 	}
 	if err != nil {
 		return err
 	}
 
-	// 已存在：协商恢复后置 running。
+	// 已存在：协商恢复（继续），由 Paused 置 Running。
+	// 注意：Finished / Stopped 为终止态，不可经"继续"复活；仅 Paused（及 Created）可恢复。
+	if rt.Status == domain.RunStatusFinished || rt.Status == domain.RunStatusStopped {
+		if task.Enabled {
+			// 保持终止态一致：Task 不应处于可运行标记。
+			task.Enabled = false
+			task.UpdatedAt = r.now()
+			return r.tasks.Update(ctx, task)
+		}
+		return nil
+	}
+
 	if err := r.coordinate(ctx, taskID, rt.ID, event.ActionResume); err != nil {
+		return err
+	}
+	if err := r.disableOtherRunningSessions(ctx, taskID); err != nil {
 		return err
 	}
 	rt.Status = domain.RunStatusRunning
@@ -204,17 +238,44 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
-	// 恢复研究：重新开启提交门控，并确保 SupervisorLoop 存在（中止后重建）。
-	if task, err := r.tasks.Get(ctx, taskID); err == nil {
-		_ = r.states.ResumeCommits(ctx, task.SessionID)
-		r.ensureSupervisor(task.SessionID)
-	}
+	// 恢复研究：重新开启提交门控，并确保 SupervisorLoop 存在。
+	_ = r.states.ResumeCommits(ctx, taskID)
+	r.ensureSupervisor(taskID, sessionID, rt.ID)
 	return nil
 }
 
-// onTaskDisabled 在 Task 禁用时，暂停对应 RunTask 为 paused。
-// 无 RunTask 时视为幂等（返回 nil）。
+// onTaskDisabled 处理 Task 失能：执行全局中止，但状态置为 Paused（可经"继续"恢复）。
 func (r *Runtime) onTaskDisabled(ctx context.Context, taskID string) error {
+	rt, err := r.runs.GetByTask(ctx, taskID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil // 无 RunTask，幂等
+	}
+	if err != nil {
+		return err
+	}
+	if rt.Status != domain.RunStatusRunning {
+		return nil // 已暂停/已完成/已中止，无需处理
+	}
+	return r.globalStop(ctx, taskID, domain.RunStatusPaused)
+}
+
+// onStop 处理用户主动中止：执行全局中止，状态置为 Stopped（终止态）。
+func (r *Runtime) onStop(ctx context.Context, taskID string) error {
+	rt, err := r.runs.GetByTask(ctx, taskID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil // 无 RunTask，幂等
+	}
+	if err != nil {
+		return err
+	}
+	if rt.Status != domain.RunStatusRunning {
+		return nil // 仅运行中可中止
+	}
+	return r.globalStop(ctx, taskID, domain.RunStatusStopped)
+}
+
+// onResearchFinished 处理模型完成研究：Running -> Finished（终止态）。
+func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 	rt, err := r.runs.GetByTask(ctx, taskID)
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil
@@ -222,12 +283,23 @@ func (r *Runtime) onTaskDisabled(ctx context.Context, taskID string) error {
 	if err != nil {
 		return err
 	}
-	if err := r.coordinate(ctx, taskID, rt.ID, event.ActionPause); err != nil {
+	if rt.Status != domain.RunStatusRunning {
+		return nil // 非运行态，幂等
+	}
+	r.stopSupervisor(taskID)
+	_ = r.states.StopCommits(ctx, taskID)
+	rt.Status = domain.RunStatusFinished
+	rt.UpdatedAt = r.now()
+	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
-	rt.Status = domain.RunStatusPaused
-	rt.UpdatedAt = r.now()
-	return r.runs.Update(ctx, rt)
+	// 研究完成：Task 不再处于可运行态。
+	if task, err := r.tasks.Get(ctx, taskID); err == nil {
+		task.Enabled = false
+		task.UpdatedAt = r.now()
+		_ = r.tasks.Update(ctx, task)
+	}
+	return nil
 }
 
 // onRunTaskDelete 协商后原子删除指定 Task 的 RunTask。
@@ -246,90 +318,118 @@ func (r *Runtime) onRunTaskDelete(ctx context.Context, taskID string) error {
 	if err := r.runs.Delete(ctx, rt.ID); err != nil {
 		return err
 	}
-	// 停止该 RunTask 的 SupervisorLoop（ResearchState 属 Session，保留）。
-	if task, err := r.tasks.Get(ctx, taskID); err == nil {
-		r.stopSupervisor(task.SessionID)
+	r.stopSupervisor(taskID)
+	return nil
+}
+
+// disableOtherRunningSessions 关闭其它 Session 中处于 Running 的 RunTask，
+// 使其 Task 失能并置为 Paused，保证全局同一时间只有一个 RunTask 处于 Running。
+func (r *Runtime) disableOtherRunningSessions(ctx context.Context, currentTaskID string) error {
+	runs, err := r.runs.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, rt := range runs {
+		if rt.TaskID == currentTaskID {
+			continue
+		}
+		if rt.Status != domain.RunStatusRunning {
+			continue
+		}
+		if err := r.globalStop(ctx, rt.TaskID, domain.RunStatusPaused); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// onStop 处理用户主动中止：协商后停止 SupervisorLoop、置 RunTask 为 stopped、
-// 并关闭 ResearchState 的提交门控（停止接收新 Commit，正在进行的 Commit 继续完成）。
-func (r *Runtime) onStop(ctx context.Context, sessionID string) error {
-	tasks, err := r.tasks.ListBySession(ctx, sessionID)
+// globalStop 协作式全局中止：协商后停止 SupervisorLoop、关闭提交门控、
+// 置 RunTask 为目标状态、并失能对应 Task。
+func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.RunStatus) error {
+	task, err := r.tasks.Get(ctx, taskID)
 	if err != nil {
 		return err
 	}
-	if len(tasks) == 0 {
-		return nil // 无 Task，无事可做
-	}
-	taskID := tasks[0].ID
-
 	rt, err := r.runs.GetByTask(ctx, taskID)
-	if errors.Is(err, storage.ErrNotFound) {
-		return nil // 无 RunTask，无事可做
-	}
 	if err != nil {
 		return err
 	}
 
-	// 协作式中止：向依赖组件协商。
 	if err := r.coordinate(ctx, taskID, rt.ID, event.ActionStop); err != nil {
 		return err
 	}
 
 	// 停止 SupervisorLoop。
-	r.stopSupervisor(sessionID)
+	r.stopSupervisor(taskID)
 
 	// 关闭 ResearchState 提交门控。
-	_ = r.states.StopCommits(ctx, sessionID)
+	_ = r.states.StopCommits(ctx, taskID)
 
-	// 置状态为 stopped。
-	rt.Status = domain.RunStatusStopped
+	// 置 RunTask 状态。
+	rt.Status = target
 	rt.UpdatedAt = r.now()
-	return r.runs.Update(ctx, rt)
+	if err := r.runs.Update(ctx, rt); err != nil {
+		return err
+	}
+
+	// 失能对应 Task。
+	task.Enabled = false
+	task.UpdatedAt = r.now()
+	return r.tasks.Update(ctx, task)
 }
 
-// initResearchRun 在 RunTask 创建后初始化 ResearchState（按 Session，若不存在）
-// 并启动该 Session 的 SupervisorLoop。
-func (r *Runtime) initResearchRun(ctx context.Context, taskID string) error {
+// initResearchRun 在 RunTask 创建后初始化该 Task 的 ResearchState（按 TaskID），
+// 若该 Session 已有上一份研究状态，则把其结论作为 RelatedFinding 继承，
+// 并启动该 Task 的 SupervisorLoop。
+func (r *Runtime) initResearchRun(ctx context.Context, taskID, runTaskID string) error {
 	task, err := r.tasks.Get(ctx, taskID)
 	if err != nil {
 		return err
 	}
 	sessionID := task.SessionID
-	if _, err := r.states.Get(ctx, sessionID); errors.Is(err, researchstate.ErrNotFound) {
-		if err := r.states.Create(ctx, researchstate.New(ids.New(), sessionID, taskRequirement(task))); err != nil {
-			return err
-		}
+
+	// 继承上一研究任务的结论作为 RelatedFinding。
+	var related []researchstate.RelatedFinding
+	if prev, err := r.states.GetLatestBySession(ctx, sessionID); err == nil {
+		related = append(related, researchstate.RelatedFinding{
+			SessionID: prev.SessionID,
+			Summary:   prev.Summary(),
+		})
 	}
-	r.ensureSupervisor(sessionID)
+
+	st := researchstate.NewWithRelated(ids.New(), taskID, sessionID, taskRequirement(task), related)
+	if err := r.states.Create(ctx, st); err != nil {
+		return err
+	}
+	r.ensureSupervisor(taskID, sessionID, runTaskID)
 	return nil
 }
 
-// ensureSupervisor 确保该 Session 的 SupervisorLoop 已创建并启动。
-func (r *Runtime) ensureSupervisor(sessionID string) {
+// ensureSupervisor 确保指定 Task 的 SupervisorLoop 已创建并启动。
+func (r *Runtime) ensureSupervisor(taskID, sessionID, runTaskID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.supervisors[sessionID]; ok {
+	if _, ok := r.supervisors[taskID]; ok {
 		return
 	}
 	l := supervisor.New(supervisor.Config{
 		Model:     r.model,
 		States:    r.states,
 		SessionID: sessionID,
+		TaskID:    taskID,
+		RunTaskID: runTaskID,
 		Bus:       r.bus,
 	})
 	l.Start()
-	r.supervisors[sessionID] = l
+	r.supervisors[taskID] = l
 }
 
-// stopSupervisor 停止并移除指定 Session 的 SupervisorLoop。
-func (r *Runtime) stopSupervisor(sessionID string) {
+// stopSupervisor 停止并移除指定 Task 的 SupervisorLoop。
+func (r *Runtime) stopSupervisor(taskID string) {
 	r.mu.Lock()
-	l, ok := r.supervisors[sessionID]
+	l, ok := r.supervisors[taskID]
 	if ok {
-		delete(r.supervisors, sessionID)
+		delete(r.supervisors, taskID)
 	}
 	r.mu.Unlock()
 	if ok {

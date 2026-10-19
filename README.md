@@ -97,34 +97,64 @@ curl.exe -s -N -X POST http://127.0.0.1:8080/api/v1/sessions/{id}/research `
 Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/stop `
   -Method Post -ContentType "application/json" -Body '{}'
 
-# 开启新对话：建立新 ResearchState，并把上一对话结论写入 RelatedFinding
-Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/conversations `
-  -Method Post -ContentType "application/json" -Body '{"requirement":"新研究需求"}'
+# 列出全部 Session（前端侧边栏使用）
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions
+
+# 读取当前模型配置（密钥脱敏）
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/config
+
+# 运行时热切换模型配置（立即生效，无需重启）
+Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/config -Method Put `
+  -ContentType "application/json" `
+  -Body '{"provider":"openai","base_url":"https://api.deepseek.com","model_name":"deepseek-chat","api_key":"sk-..."}'
 ```
 
 > 约束：
-> - **一个 Session 只对应一个 Task**，重复创建返回 `409 Conflict`。
+> - **一个 Session 可对应多个 Task**；一个 Task 对应一个 RunTask。
+> - **同一时间全局只有一个 RunTask 处于 Running**：使能新的 Task 前，Runtime 会先失能
+>   其他运行中的 Session（其 RunTask 置 `paused`、Task 置不可用）。
 > - **Task 只能启用/禁用，无直接删除路径**；新建的 Task 默认禁用。
 > - **RunTask 由独立实体 Runtime 经事件订阅维护**：启用/禁用/删除都先由 Runtime
 >   向依赖组件（Supervisor/Scheduler/WorkPool，当前为 Mock）发起协商，协商通过后才原子落地。
 > - **使能时若 RunTask 不存在，Runtime 先协商创建（含初始化要求）再新建 RunTask**，
->   同时初始化该 Session 的 ResearchState（首轮仅含研究需求）并启动 SupervisorLoop。
-> - **SupervisorLoop** 外层订阅用户消息事件，内层用 Eino 的 TurnLoop 驱动模型产出研究结论，
->   写回 ResearchState；流式输出经 ModelOutput 事件发布为 SSE。
-> - **ResearchState Commit 门控**：中止时停止接收新 Commit（返回 ErrNotAccepting），
->   正在进行的 Commit 继续完成；恢复后重新接受。
-> - **用户主动中止（stop）为协作式/全局**：Runtime 与依赖组件协商后停止 SupervisorLoop、
->   置 RunTask 为 `stopped`、关闭提交门控；之后用户再次输入会自动恢复研究并重建上下文。
-> - ResearchState 生命周期与 Session 绑定；Session 级联删除时一并删除 ResearchState。
+>   同时初始化该 Task 的 ResearchState 并启动 SupervisorLoop；若该 Session 已有上一份
+>   ResearchState，则把其结论作为 `RelatedFinding` 继承。
+> - **失能 = 全局中止 + 状态置 `paused`**：停止 SupervisorLoop、关闭提交门控；
+>   再次使能（"继续"）由 `paused` 置回 `running` 并重新打开门控。
+> - **用户主动中止 = 全局中止 + 状态置 `stopped`**：终止态，"继续"不会复活。
+> - **模型完成研究 = 状态置 `finished`**：终止态。此后用户再发消息，会在该 Session 下
+>   自动新建 Task 与新 ResearchState（上一份结论写入 `RelatedFinding`）并继续研究。
+> - **SupervisorLoop** 外层订阅用户消息事件（按 RunTaskID 路由），内层用 Eino 的
+>   TurnLoop 驱动模型产出研究结论，写回该 Task 的 ResearchState；流式输出经
+>   ModelOutput 事件发布为 SSE。
+> - **ResearchState Commit 门控**：中止/暂停时停止接收新 Commit（返回 ErrNotAccepting），
+>   正在进行的 Commit 继续完成。
+> - **模型可热切换**：`main` 持有 `llm.Swappable`，`PUT /api/v1/config` 只替换内部模型实例，
+>   Runtime / SupervisorLoop / ChatService 无需重建。
+> - ResearchState 归属 Task；Session 级联删除时一并删除其下全部 ResearchState。
 
-## 前端模板
+## 前端控制台
 
-`web/index.html` 是一个零依赖的单文件控制台，用于检验 SSE 流式输出效果：
+`web/index.html` 是单文件前端（无构建步骤），布局参考 eino-examples 的 chatwitheino：
 
-1. 启动服务（默认监听 `127.0.0.1:8080`，已开启 CORS）。
-2. 用浏览器直接打开 `web/index.html`（`file://` 方式即可，服务端已允许跨源）。
-3. 依次：创建 Session → 创建 Task → 启用 → 「研究（流式）」→ 观察 SSE 逐块输出；
-   可再测试「中止研究」与「开启新对话」。
+- 顶栏：`⚙ API 配置`、`+ 新建研究`
+- 左侧：研究会话列表（可删除）
+- 中间：卡片式聊天区，Supervisor 输出以 SSE 流式增量渲染（Markdown、自动滚动）；
+  头部显示 RunTask 状态徽章（研究中 / 已暂停 / 已中止 / 已完成）
+- 右侧：ResearchState 面板（需求 / 版本 / Finding / Result / 中断上下文 / RelatedFinding）
+- 底部：输入框 + 主按钮 + 中止。主按钮随状态切换：
+  - `running` → 发送
+  - `paused` → **继续**（把 RunTask 由 paused 置回 running）
+  - `finished` / `stopped` → 发送（发送后自动新建 Task 与新 ResearchState）
+
+使用方式（二选一）：
+
+1. **直接由服务提供**：启动服务后访问 `http://127.0.0.1:8080/`。
+2. **以文件方式打开**：浏览器打开 `web/index.html`（`file://`），
+   在「API 配置 → 服务地址」填写 `http://127.0.0.1:8080`（服务端已开启 CORS）。
+
+「API 配置」支持设置服务地址、模型提供方（mock / openai）、Base URL、模型名称与 API Key；
+保存后立即生效。密钥留空表示沿用已保存的密钥，界面只展示脱敏提示。
 
 用 curl.exe 时，把 JSON 写入文件（无 BOM 的 UTF-8）再发送，可避免引号/编码问题：
 

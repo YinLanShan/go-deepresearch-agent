@@ -20,8 +20,9 @@ type Session struct {
 // Task 表示用户提出的研究目标，是用户意图的表达，不直接代表一次运行。
 //
 // Enabled 表示 Task 是否允许启动新的执行（创建 RunTask）。
-// Task 被禁用后禁止启动新的执行；对已运行 RunTask 的处理由明确的生命周期
-// 策略决定，不与 Task 的启用/禁用行为默认绑定。
+// 一个 Session 可对应多个 Task，但同一时间只能有一个 Task 处于运行态
+// （全局也只有一个 RunTask 处于 Running）。Task 被禁用后禁止启动新的执行；
+// 对已运行 RunTask 的处理由明确的生命周期策略决定，不与 Task 的启用/禁用行为默认绑定。
 type Task struct {
 	ID          string    `json:"id"`
 	SessionID   string    `json:"session_id"`
@@ -41,6 +42,7 @@ const (
 	RunStatusRunning   RunStatus = "running"
 	RunStatusPaused    RunStatus = "paused"
 	RunStatusStopped   RunStatus = "stopped"
+	RunStatusFinished  RunStatus = "finished"
 	RunStatusWaiting   RunStatus = "waiting"
 	RunStatusCompleted RunStatus = "completed"
 	RunStatusFailed    RunStatus = "failed"

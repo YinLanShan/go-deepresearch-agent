@@ -28,9 +28,13 @@ const (
 	ResultCommitted ResultStatus = "committed"
 )
 
-// State 是某个 Session 的研究状态，是研究发现资产的权威来源。
+// State 是某个研究任务（Task）的研究状态，是研究发现资产的权威来源。
+//
+// ResearchState 按 Task 归属（一个 Task 一份，随 RunTask 创建而创建）；
+// 一个 Session 下多个 Task 各自拥有一份 ResearchState。
 type State struct {
 	ID        string `json:"id"`
+	TaskID    string `json:"task_id"`
 	SessionID string `json:"session_id"`
 
 	// Requirement 是用户随 Task 提交的第一条研究需求内容。
@@ -86,11 +90,12 @@ type CommitInput struct {
 	FindingContent string
 }
 
-// New 创建一个首轮研究状态：仅含研究需求，无任何研究产物。
-func New(id, sessionID, requirement string) *State {
+// New 创建一个研究任务的初始研究状态：仅含研究需求，无任何研究产物。
+func New(id, taskID, sessionID, requirement string) *State {
 	now := time.Now()
 	return &State{
 		ID:          id,
+		TaskID:      taskID,
 		SessionID:   sessionID,
 		Requirement: requirement,
 		Results:     []Result{},
@@ -100,15 +105,16 @@ func New(id, sessionID, requirement string) *State {
 	}
 }
 
-// NewWithRelated 创建一个新对话的研究状态，并携带上一对话的研究结论作为 RelatedFinding。
-// 每新开展一次对话，都会建立一个新 ResearchState，用于记载该对话的全部研究上下文。
-func NewWithRelated(id, sessionID, requirement string, related []RelatedFinding) *State {
-	st := New(id, sessionID, requirement)
+// NewWithRelated 创建一份研究状态，并携带先前研究任务的结论作为 RelatedFinding。
+// 当一个研究任务完成/中止后，用户继续对话会新建一个 Task 与一份新 ResearchState，
+// 上一份研究状态的全部上下文以 RelatedFinding 的形式继承。
+func NewWithRelated(id, taskID, sessionID, requirement string, related []RelatedFinding) *State {
+	st := New(id, taskID, sessionID, requirement)
 	st.RelatedFindings = append([]RelatedFinding(nil), related...)
 	return st
 }
 
-// Summary 返回该研究状态的结论摘要，用于作为后续对话的 RelatedFinding 内容。
+// Summary 返回该研究状态的结论摘要，用于作为后续研究任务的 RelatedFinding 内容。
 func (s *State) Summary() string {
 	return s.findingsSummary()
 }

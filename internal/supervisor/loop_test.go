@@ -12,42 +12,61 @@ import (
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 )
 
+// newLoop 构造一个绑定到固定 Task/RunTask 的 SupervisorLoop。
+func newLoop(t *testing.T, states researchstate.Store, bus *event.Bus, slow bool) *Loop {
+	t.Helper()
+	cfg := Config{
+		States:    states,
+		SessionID: "s1",
+		TaskID:    "t1",
+		RunTaskID: "r1",
+		Bus:       bus,
+	}
+	if slow {
+		cfg.Model = mockModel.NewSlowModel(30 * time.Millisecond)
+	} else {
+		cfg.Model = mockModel.New()
+	}
+	loop := New(cfg)
+	loop.Start()
+	return loop
+}
+
+func shutdownLoop(t *testing.T, loop *Loop) {
+	t.Helper()
+	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = loop.Shutdown(sctx)
+}
+
 // TestMultiTurnClosedLoop 验证 SupervisorLoop 的最小闭环：
-// 用户消息经事件进入 TurnLoop，模型（mock）产出研究结论，写回 ResearchState。
+// 用户消息经事件进入 TurnLoop，模型（mock）产出研究结论，写回该 Task 的 ResearchState。
 func TestMultiTurnClosedLoop(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "s1", "研究某框架的架构")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", "研究某框架的架构")); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
 	bus := event.NewBus()
-	loop := New(Config{
-		Model:     mockModel.New(),
-		States:    states,
-		SessionID: "s1",
-		Bus:       bus,
-	})
-	loop.Start()
-	defer func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = loop.Shutdown(sctx)
-	}()
+	loop := newLoop(t, states, bus, false)
+	defer shutdownLoop(t, loop)
 
 	// 第一轮：用户输入 → Supervisor 研究 → 结果写回。
-	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.UserMessageEvent{SessionID: "s1", Message: "第一轮问题"}}); err != nil {
+	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.UserMessageEvent{
+		SessionID: "s1", TaskID: "t1", RunTaskID: "r1", Message: "第一轮问题"}}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	waitFindings(t, states, "s1", 1)
+	waitFindings(t, states, "t1", 1)
 
 	// 第二轮：再次输入 → 再次研究 → 追加结果。
-	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.UserMessageEvent{SessionID: "s1", Message: "第二轮问题"}}); err != nil {
+	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.UserMessageEvent{
+		SessionID: "s1", TaskID: "t1", RunTaskID: "r1", Message: "第二轮问题"}}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	waitFindings(t, states, "s1", 2)
+	waitFindings(t, states, "t1", 2)
 
-	st, err := states.Get(ctx, "s1")
+	st, err := states.Get(ctx, "t1")
 	if err != nil {
 		t.Fatalf("get state: %v", err)
 	}
@@ -69,17 +88,41 @@ func TestMultiTurnClosedLoop(t *testing.T) {
 	}
 }
 
-func waitFindings(t *testing.T, states researchstate.Store, sessionID string, want int) {
+// TestOtherTaskMessagesIgnored 验证 SupervisorLoop 只处理本 RunTask 的消息与 Commit 事件。
+func TestOtherTaskMessagesIgnored(t *testing.T) {
+	ctx := context.Background()
+	states := stateMemory.NewStore()
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", "需求")); err != nil {
+		t.Fatalf("create state: %v", err)
+	}
+
+	bus := event.NewBus()
+	loop := newLoop(t, states, bus, false)
+	defer shutdownLoop(t, loop)
+
+	// 其它 RunTask 的消息应被忽略
+	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.UserMessageEvent{
+		SessionID: "s1", TaskID: "t-other", RunTaskID: "r-other", Message: "别人的消息"}}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	st, _ := states.Get(ctx, "t1")
+	if len(st.Findings) != 0 {
+		t.Fatalf("other task message should be ignored, got %+v", st.Findings)
+	}
+}
+
+func waitFindings(t *testing.T, states researchstate.Store, taskID string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		st, err := states.Get(context.Background(), sessionID)
+		st, err := states.Get(context.Background(), taskID)
 		if err == nil && len(st.Findings) >= want {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	st, _ := states.Get(context.Background(), sessionID)
+	st, _ := states.Get(context.Background(), taskID)
 	t.Fatalf("want %d findings, got %+v", want, st)
 }
 
@@ -89,39 +132,31 @@ func waitFindings(t *testing.T, states researchstate.Store, sessionID string, wa
 func TestPreemptCapturesInterruptedContext(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "s1", "研究需求")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", "研究需求")); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
 	bus := event.NewBus()
-	loop := New(Config{
-		Model:     mockModel.NewSlowModel(30 * time.Millisecond),
-		States:    states,
-		SessionID: "s1",
-		Bus:       bus,
-	})
-	loop.Start()
-	defer func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = loop.Shutdown(sctx)
-	}()
+	loop := newLoop(t, states, bus, true)
+	defer shutdownLoop(t, loop)
 
 	// 用户消息 → 模型慢速流式输出
-	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.UserMessageEvent{SessionID: "s1", Message: "请分析架构"}}); err != nil {
+	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.UserMessageEvent{
+		SessionID: "s1", TaskID: "t1", RunTaskID: "r1", Message: "请分析架构"}}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
 	// 等模型输出部分 chunk 后，模拟一次外部 Commit 抢占
 	time.Sleep(80 * time.Millisecond)
-	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.ResearchStateCommittedEvent{SessionID: "s1", Version: 1}}); err != nil {
+	if err := bus.Publish(ctx, event.EventEnvelope{Data: event.ResearchStateCommittedEvent{
+		SessionID: "s1", TaskID: "t1", Version: 1}}); err != nil {
 		t.Fatalf("publish preempt: %v", err)
 	}
 
 	// 抢占后开启重新规划轮次，最终应 Commit 一条 Finding
-	waitFindings(t, states, "s1", 1)
+	waitFindings(t, states, "t1", 1)
 
-	st, err := states.Get(ctx, "s1")
+	st, err := states.Get(ctx, "t1")
 	if err != nil {
 		t.Fatalf("get state: %v", err)
 	}

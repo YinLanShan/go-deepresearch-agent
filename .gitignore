@@ -4,6 +4,9 @@
 *.test
 *.out
 
+# Hertz 静态文件缓存
+*.hertz.gz
+
 # IDE
 .idea/
 .vscode/

@@ -8,10 +8,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
@@ -35,8 +37,8 @@ func NewRunService(tasks storage.TaskStore, runs storage.RunTaskStore, states re
 // SetTaskEnabled 修改 Task 的启用/禁用状态，并以同步事件提交给 Runtime 协商处理。
 //
 //   - 启用：发布 EventTaskEnabled。Runtime 若发现 RunTask 不存在，会先协商创建
-//     （含初始化要求）再新建 RunTask；已存在则协商恢复为 running。
-//   - 禁用：发布 EventTaskDisabled，Runtime 协商后暂停 RunTask 为 paused。
+//     （含初始化要求）再新建 RunTask；已存在（Paused）则协商恢复为 running。
+//   - 禁用：发布 EventTaskDisabled，Runtime 执行全局中止并把 RunTask 置为 paused。
 //
 // 不在此做 RunTask 存在性预检：RunTask 的创建由 Runtime 协商完成。
 // 状态未变化时幂等返回，不发布事件。
@@ -102,86 +104,127 @@ func (s *RunService) RequestDeleteRunTask(ctx context.Context, taskID string) er
 	})
 }
 
-// SendUserMessage 向指定 Session 的研究提交一条用户消息（发布事件，异步处理）。
-// 若 RunTask 已被中止，先恢复研究再提交消息。
+// SendUserMessage 向指定 Session 的研究提交一条用户消息。
+//
+// 语义（对应研究生命周期）：
+//   - 当前任务 Running：直接投递给其 SupervisorLoop；
+//   - 当前任务 Finished / Stopped（终止态）：新建一个 Task（研究需求=本条消息），
+//     新建一份 ResearchState（继承上一份的结论为 RelatedFinding）并启用，再投递消息；
+//   - 当前任务 Paused：需先经"继续"恢复，返回错误。
 func (s *RunService) SendUserMessage(ctx context.Context, sessionID, message string) error {
-	if err := s.ensureRunning(ctx, sessionID); err != nil {
+	task, rt, err := s.currentResearch(ctx, sessionID)
+	if err != nil {
 		return err
 	}
-	return s.bus.Publish(ctx, event.EventEnvelope{
-		Meta: event.EventMeta{
-			EventID:    ids.New(),
-			Source:     "run_service",
-			OccurredAt: s.now(),
-		},
-		Data: event.UserMessageEvent{SessionID: sessionID, Message: message},
-	})
+	if task == nil {
+		// 无 Task：直接发布（无 SupervisorLoop，消息会被丢弃）。正常流程应先创建并启用。
+		return s.publishMessage(ctx, sessionID, "", "", message)
+	}
+	if rt == nil {
+		// 有 Task 但尚未启用：直接发布（无 SupervisorLoop）。
+		return s.publishMessage(ctx, sessionID, task.ID, "", message)
+	}
+
+	switch rt.Status {
+	case domain.RunStatusFinished, domain.RunStatusStopped:
+		return s.startNextResearch(ctx, sessionID, message)
+	case domain.RunStatusPaused:
+		return fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
+			"research is paused; continue it first")
+	default:
+		return s.publishMessage(ctx, sessionID, task.ID, rt.ID, message)
+	}
 }
 
-// RequestStop 发起用户主动中止请求（协作式、全局范围）。
+// RequestStop 发起用户主动中止请求（协作式、全局范围），作用于当前运行中的任务。
 func (s *RunService) RequestStop(ctx context.Context, sessionID string) error {
+	task, rt, err := s.currentResearch(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if task == nil || rt == nil || rt.Status != domain.RunStatusRunning {
+		return nil // 无运行中任务，幂等
+	}
 	return s.bus.PublishSync(ctx, event.EventEnvelope{
 		Meta: event.EventMeta{
 			EventID:    ids.New(),
 			Source:     "run_service",
+			TaskID:     task.ID,
+			RunTaskID:  rt.ID,
 			OccurredAt: s.now(),
 		},
-		Data: event.StopRequestedEvent{SessionID: sessionID},
+		Data: event.StopRequestedEvent{SessionID: sessionID, TaskID: task.ID, RunTaskID: rt.ID},
 	})
 }
 
-// ensureRunning 若该 Session 的 RunTask 已中止，则先恢复研究。
-func (s *RunService) ensureRunning(ctx context.Context, sessionID string) error {
+// currentResearch 返回指定 Session 当前（最近创建的）Task 及其 RunTask。
+// 无 Task 时返回 (nil, nil, nil)。
+func (s *RunService) currentResearch(ctx context.Context, sessionID string) (*domain.Task, *domain.RunTask, error) {
 	tasks, err := s.tasks.ListBySession(ctx, sessionID)
 	if err != nil || len(tasks) == 0 {
-		return nil
+		return nil, nil, err
 	}
-	rt, err := s.runs.GetByTask(ctx, tasks[0].ID)
+	task := tasks[len(tasks)-1] // ListBySession 按创建时间升序，最后一个为最新
+	rt, err := s.runs.GetByTask(ctx, task.ID)
 	if err != nil {
-		return nil
+		if errors.Is(err, storage.ErrNotFound) {
+			return task, nil, nil
+		}
+		return nil, nil, err
 	}
-	if rt.Status == domain.RunStatusStopped {
-		// 恢复：发布 TaskEnabled（Runtime 恢复门控 + SupervisorLoop + 状态）。
-		return s.bus.PublishSync(ctx, event.EventEnvelope{
-			Meta: event.EventMeta{
-				EventID:    ids.New(),
-				Source:     "run_service",
-				TaskID:     tasks[0].ID,
-				OccurredAt: s.now(),
-			},
-			Data: event.TaskEnabledEvent{TaskID: tasks[0].ID},
-		})
-	}
-	return nil
+	return task, rt, nil
 }
 
-// StartNewConversation 开启一个新对话：建立新的 ResearchState，并把上一对话的研究结论
-// 写入 RelatedFinding（每新开展一次对话，即一个新的 ResearchState）。
-func (s *RunService) StartNewConversation(ctx context.Context, sessionID, requirement string) (*researchstate.State, error) {
-	var related []researchstate.RelatedFinding
-	if prev, err := s.states.Get(ctx, sessionID); err == nil {
-		related = append(related, researchstate.RelatedFinding{
-			SessionID: prev.SessionID,
-			Summary:   prev.Summary(),
-		})
+// startNextResearch 在上一任务终止（Finished/Stopped）后开启新研究：
+// 新建 Task（研究需求=本条消息）→ 启用（Runtime 创建 RunTask 与新 ResearchState，
+// 并继承上一份研究状态的结论为 RelatedFinding）→ 投递消息。
+func (s *RunService) startNextResearch(ctx context.Context, sessionID, message string) error {
+	now := s.now()
+	t := &domain.Task{
+		ID:          ids.New(),
+		SessionID:   sessionID,
+		Title:       "继续研究",
+		Description: message,
+		Enabled:     false,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
-	// 新对话使用新的 ResearchState ID，但仍绑定同一 Session。
-	st := researchstate.NewWithRelated(ids.New(), sessionID, requirement, related)
-	if err := s.states.Create(ctx, st); err != nil {
-		return nil, err
+	if err := s.tasks.Create(ctx, t); err != nil {
+		return err
 	}
-	return st, nil
+	if _, err := s.SetTaskEnabled(ctx, t.ID, true); err != nil {
+		return err
+	}
+	rt, err := s.runs.GetByTask(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	return s.publishMessage(ctx, sessionID, t.ID, rt.ID, message)
+}
+
+// publishMessage 发布用户消息事件。
+func (s *RunService) publishMessage(ctx context.Context, sessionID, taskID, runTaskID, message string) error {
+	return s.bus.Publish(ctx, event.EventEnvelope{
+		Meta: event.EventMeta{
+			EventID:    ids.New(),
+			Source:     "run_service",
+			TaskID:     taskID,
+			RunTaskID:  runTaskID,
+			OccurredAt: s.now(),
+		},
+		Data: event.UserMessageEvent{SessionID: sessionID, TaskID: taskID, RunTaskID: runTaskID, Message: message},
+	})
 }
 
 // Bus 返回事件总线（供 API 层订阅流式输出事件等）。
 func (s *RunService) Bus() *event.Bus { return s.bus }
 
-// GetResearchState 查询指定 Session 的研究状态。
+// GetResearchState 查询指定 Session 当前研究任务（最近一份）的研究状态。
 func (s *RunService) GetResearchState(ctx context.Context, sessionID string) (*researchstate.State, error) {
-	return s.states.Get(ctx, sessionID)
+	return s.states.GetLatestBySession(ctx, sessionID)
 }
 
-// DeleteResearchState 删除指定 Session 的研究状态（Session 级联删除时调用）。
+// DeleteResearchState 删除指定 Session 的全部研究状态（Session 级联删除时调用）。
 func (s *RunService) DeleteResearchState(ctx context.Context, sessionID string) error {
-	return s.states.Delete(ctx, sessionID)
+	return s.states.DeleteBySession(ctx, sessionID)
 }

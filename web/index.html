@@ -1,181 +1,872 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DeepResearch Agent 控制台</title>
-  <style>
-    :root { color-scheme: light dark; }
-    * { box-sizing: border-box; }
-    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px; line-height: 1.5; }
-    h1 { font-size: 20px; margin: 0 0 16px; }
-    section { margin-bottom: 20px; padding: 16px; border: 1px solid #8884; border-radius: 8px; }
-    section h2 { font-size: 14px; margin: 0 0 10px; color: #888; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
-    input, textarea { padding: 6px 8px; border-radius: 6px; border: 1px solid #8888; font-size: 13px; }
-    input[type=text] { flex: 1; min-width: 160px; }
-    button { padding: 6px 12px; border-radius: 6px; border: 1px solid #8888; background: #2a7fff; color: #fff; cursor: pointer; font-size: 13px; }
-    button.secondary { background: #666; }
-    button.danger { background: #c0392b; }
-    pre { background: #0001; padding: 12px; border-radius: 6px; overflow: auto; max-height: 320px; font-size: 12px; white-space: pre-wrap; }
-    #output { min-height: 60px; }
-    .muted { color: #888; font-size: 12px; }
-    code { background: #0001; padding: 1px 5px; border-radius: 4px; }
-  </style>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>DeepResearch Agent</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    height: 100vh; display: flex; flex-direction: column; background: #f5f5f5;
+    color: #1f2937;
+  }
+
+  /* ── Header ───────────────────────────────────────────── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; background: #fff; border-bottom: 1px solid #e0e0e0;
+  }
+  header h1 { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  header h1 .logo {
+    width: 22px; height: 22px; border-radius: 6px;
+    background: linear-gradient(135deg, #2563eb, #7c3aed);
+  }
+  header .actions { display: flex; gap: 8px; }
+  header button {
+    padding: 6px 14px; background: #2563eb; color: #fff; border: none;
+    border-radius: 6px; cursor: pointer; font-size: 0.85rem;
+  }
+  header button:hover { background: #1d4ed8; }
+  header button.ghost { background: #fff; color: #374151; border: 1px solid #d1d5db; }
+  header button.ghost:hover { background: #f3f4f6; }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* ── Sidebar ──────────────────────────────────────────── */
+  .sidebar {
+    width: 230px; background: #fff; border-right: 1px solid #e0e0e0;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .sidebar-title {
+    padding: 10px 14px; font-size: 0.72rem; color: #888;
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  .session-list { flex: 1; overflow-y: auto; }
+  .session-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 14px; cursor: pointer; font-size: 0.85rem; color: #333;
+    border-left: 3px solid transparent; transition: background .1s;
+  }
+  .session-item:hover { background: #f0f4ff; }
+  .session-item.active { background: #eff6ff; border-left-color: #2563eb; font-weight: 500; color: #1d40af; }
+  .session-item .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .session-item .del-btn {
+    opacity: 0; font-size: 0.7rem; color: #999; background: none;
+    border: none; cursor: pointer; padding: 2px 4px;
+  }
+  .session-item:hover .del-btn { opacity: 1; }
+  .session-item .del-btn:hover { color: #dc2626; }
+  .sidebar-empty { padding: 16px 14px; font-size: 0.8rem; color: #9ca3af; line-height: 1.7; }
+
+  /* ── Chat area ────────────────────────────────────────── */
+  .chat-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  .chat-header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 20px; background: #fafafa; border-bottom: 1px solid #e5e7eb;
+    font-size: 0.8rem; color: #4b5563; min-height: 44px;
+  }
+  .badge {
+    padding: 2px 8px; border-radius: 999px; font-size: 0.7rem;
+    font-weight: 600; letter-spacing: .02em;
+  }
+  .badge.running { background: #d1fae5; color: #065f46; }
+  .badge.stopped { background: #fee2e2; color: #991b1b; }
+  .badge.paused  { background: #fef3c7; color: #92400e; }
+  .badge.finished { background: #dbeafe; color: #1e40af; }
+  .badge.unknown { background: #e5e7eb; color: #6b7280; }
+  .chat-header .spacer { flex: 1; }
+  .chat-header button {
+    padding: 4px 10px; font-size: 0.75rem; border-radius: 6px;
+    border: 1px solid #d1d5db; background: #fff; cursor: pointer; color: #374151;
+  }
+  .chat-header button:hover { background: #f3f4f6; }
+
+  #chat-container { flex: 1; overflow-y: auto; padding: 20px; }
+  #chat-container .column { display: flex; flex-direction: column; gap: 14px; }
+  #chat-container .card {
+    background: #fff; border-radius: 10px; padding: 14px 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08); max-width: 820px;
+  }
+  #chat-container .card .column { gap: 6px; }
+  #chat-container .caption {
+    font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .06em; color: #6b7280;
+  }
+  #chat-container .body { font-size: 0.9rem; line-height: 1.65; color: #1f2937; word-break: break-word; }
+  #chat-container .body p { margin-bottom: 0.5em; }
+  #chat-container .body pre { background: #f3f4f6; border-radius: 6px; padding: 10px 12px; overflow-x: auto; font-size: 0.82rem; margin: 8px 0; }
+  #chat-container .body code { background: #f3f4f6; border-radius: 3px; padding: 1px 4px; font-size: 0.82rem; }
+  #chat-container .body pre code { background: none; padding: 0; }
+  #chat-container .body:empty::after { content: "▍"; color: #93c5fd; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  #chat-container .card[data-role="You"] { margin-left: auto; background: #eff6ff; }
+  #chat-container .card[data-role="You"] .caption { color: #2563eb; }
+  #chat-container .card[data-role="Supervisor"] .caption { color: #7c3aed; }
+  #chat-container .card[data-role="状态"] {
+    background: #f9fafb; border: 1px solid #e5e7eb; padding: 8px 12px;
+    box-shadow: none; max-width: 640px;
+  }
+  #chat-container .card[data-role="状态"] .caption { color: #6b7280; }
+  #chat-container .card[data-role="状态"] .body { font-size: 0.8rem; color: #374151; }
+  #chat-container .card[data-role="error"] {
+    background: #fef2f2; border: 1px solid #fca5a5; padding: 8px 12px; box-shadow: none;
+  }
+  #chat-container .card[data-role="error"] .caption { color: #dc2626; }
+
+  /* ── Bottom bar ───────────────────────────────────────── */
+  .bottom-bar {
+    padding: 12px 20px; background: #fff; border-top: 1px solid #e0e0e0;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .input-row { display: flex; gap: 10px; align-items: flex-end; }
+  #msg-input {
+    flex: 1; padding: 9px 12px; border: 1px solid #d1d5db; border-radius: 8px;
+    font-size: 0.9rem; resize: none; height: 44px; max-height: 140px; font-family: inherit;
+  }
+  #msg-input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,.15); }
+  #msg-input:disabled { background: #f9fafb; }
+  #send-btn {
+    padding: 10px 18px; background: #2563eb; color: #fff; border: none;
+    border-radius: 8px; cursor: pointer; font-size: 0.9rem; white-space: nowrap;
+  }
+  #send-btn:hover { background: #1d4ed8; }
+  #send-btn:disabled { background: #93c5fd; cursor: not-allowed; }
+  #send-btn.continue { background: #059669; }
+  #send-btn.continue:hover { background: #047857; }
+  #stop-btn {
+    display: none; padding: 10px 16px; background: #dc2626; color: #fff; border: none;
+    border-radius: 8px; cursor: pointer; font-size: 0.9rem; white-space: nowrap;
+  }
+  #stop-btn:hover { background: #b91c1c; }
+  .hint { font-size: 0.72rem; color: #9ca3af; }
+
+  /* ── Right state panel ────────────────────────────────── */
+  .state-panel {
+    width: 288px; background: #fff; border-left: 1px solid #e0e0e0;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .state-panel .panel-title {
+    padding: 10px 14px; font-size: 0.72rem; color: #888;
+    text-transform: uppercase; letter-spacing: .05em;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .state-panel .panel-title button {
+    background: none; border: none; cursor: pointer; color: #2563eb; font-size: 0.72rem;
+  }
+  .state-body { flex: 1; overflow-y: auto; padding: 0 14px 14px; font-size: 0.8rem; }
+  .state-block { margin-bottom: 14px; }
+  .state-block h4 {
+    font-size: 0.72rem; color: #6b7280; text-transform: uppercase;
+    letter-spacing: .04em; margin-bottom: 6px;
+  }
+  .state-block .kv { margin-bottom: 4px; line-height: 1.5; }
+  .state-block .kv .k { color: #9ca3af; }
+  .state-item {
+    background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px;
+    padding: 6px 8px; margin-bottom: 6px; line-height: 1.5; white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .state-item .turn { color: #9ca3af; font-size: 0.7rem; }
+  .state-empty { color: #9ca3af; line-height: 1.7; }
+
+  /* ── Modal ────────────────────────────────────────────── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45);
+    z-index: 50; align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: #fff; border-radius: 12px; padding: 22px; width: 470px;
+    max-width: calc(100vw - 32px); max-height: calc(100vh - 48px); overflow-y: auto;
+    box-shadow: 0 20px 50px rgba(0,0,0,.25);
+  }
+  .modal h2 { font-size: 1rem; margin-bottom: 4px; }
+  .modal .sub { font-size: 0.78rem; color: #9ca3af; margin-bottom: 16px; line-height: 1.6; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 0.78rem; color: #4b5563; margin-bottom: 4px; font-weight: 500; }
+  .field input, .field select, .field textarea {
+    width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 7px;
+    font-size: 0.85rem; font-family: inherit; background: #fff;
+  }
+  .field textarea { resize: vertical; min-height: 72px; }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,.15);
+  }
+  .field .help { font-size: 0.7rem; color: #9ca3af; margin-top: 4px; line-height: 1.5; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; align-items: center; }
+  .modal-actions button {
+    padding: 8px 16px; border-radius: 7px; font-size: 0.85rem; cursor: pointer;
+    border: 1px solid #d1d5db; background: #fff; color: #374151;
+  }
+  .modal-actions button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .modal-actions button.primary:hover { background: #1d4ed8; }
+  .modal-actions button:disabled { opacity: .55; cursor: not-allowed; }
+  .config-status { font-size: 0.78rem; margin-right: auto; }
+  .config-status.ok { color: #059669; }
+  .config-status.err { color: #dc2626; }
+
+  .empty-state { text-align: center; color: #9ca3af; margin-top: 80px; font-size: 0.9rem; line-height: 2; }
+  .empty-state .kbd {
+    display: inline-block; padding: 1px 6px; border: 1px solid #d1d5db;
+    border-radius: 4px; font-size: 0.78rem; background: #f9fafb;
+  }
+</style>
 </head>
 <body>
-  <h1>DeepResearch Agent 控制台</h1>
 
-  <section>
-    <h2>服务地址</h2>
-    <div class="row">
-      <input id="base" type="text" value="http://127.0.0.1:8080" />
+<header>
+  <h1><span class="logo"></span>DeepResearch Agent</h1>
+  <div class="actions">
+    <button id="api-config-btn" class="ghost">⚙ API 配置</button>
+    <button id="new-session-btn">+ 新建研究</button>
+  </div>
+</header>
+
+<div class="main">
+  <aside class="sidebar">
+    <div class="sidebar-title">研究会话</div>
+    <div class="session-list" id="session-list"></div>
+  </aside>
+
+  <div class="chat-area">
+    <div class="chat-header" id="chat-header">
+      <span>未选择会话</span>
     </div>
-  </section>
 
-  <section>
-    <h2>1. 创建会话与任务</h2>
-    <div class="row">
-      <input id="title" type="text" placeholder="研究主题" value="研究某框架的架构" />
-      <button id="btn-session">创建 Session</button>
+    <div id="chat-container">
+      <div class="empty-state">
+        选择或新建一个研究会话开始研究。<br/>
+        发送消息即可驱动 Supervisor 流式研究，<span class="kbd">Enter</span> 发送，<span class="kbd">Shift+Enter</span> 换行。
+      </div>
     </div>
-    <div class="row">
-      <input id="requirement" type="text" placeholder="研究需求（Task description）" value="研究某Agent框架的架构与性能" />
-      <button id="btn-task" class="secondary" disabled>在 Session 下创建 Task</button>
-      <button id="btn-enable" class="secondary" disabled>启用 Task（开始研究）</button>
+
+    <div class="bottom-bar">
+      <div class="input-row">
+        <textarea id="msg-input" placeholder="输入研究指令…" rows="1" disabled></textarea>
+        <button id="send-btn" disabled>发送</button>
+        <button id="stop-btn">中止</button>
+      </div>
+      <div class="hint" id="hint">向当前会话的研究提交问题，Supervisor 会流式返回研究结论。</div>
     </div>
-    <div class="muted">Session: <span id="session-id">-</span> · Task: <span id="task-id">-</span></div>
-  </section>
+  </div>
 
-  <section>
-    <h2>2. 发送研究消息（SSE 流式）</h2>
-    <div class="row">
-      <input id="message" type="text" placeholder="输入研究指令" value="请分析该框架的执行模型" />
-      <button id="btn-research">研究（流式）</button>
-      <button id="btn-stop" class="danger">中止研究</button>
-      <button id="btn-conversation" class="secondary">开启新对话</button>
+  <aside class="state-panel">
+    <div class="panel-title">
+      <span>ResearchState</span>
+      <button id="refresh-state-btn">刷新</button>
     </div>
-    <pre id="output">（流式输出将显示在这里）</pre>
-  </section>
-
-  <section>
-    <h2>3. 研究状态</h2>
-    <div class="row">
-      <button id="btn-state" class="secondary">查询 ResearchState</button>
+    <div class="state-body" id="state-body">
+      <div class="state-empty">选择会话后显示研究状态。</div>
     </div>
-    <pre id="state">-</pre>
-  </section>
+  </aside>
+</div>
 
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const base = () => $('base').value.replace(/\/$/, '');
-    const state = { sessionID: '', taskID: '' };
+<!-- API 配置 -->
+<div class="modal-overlay" id="api-modal">
+  <div class="modal">
+    <h2>API 配置</h2>
+    <div class="sub">修改后立即生效，无需重启服务。</div>
 
-    function setStatus(text) { $('session-id').textContent = state.sessionID || '-'; $('task-id').textContent = state.taskID || '-'; }
+    <div class="field">
+      <label for="cfg-base">服务地址</label>
+      <input id="cfg-base" type="text" placeholder="http://127.0.0.1:8080"/>
+      <div class="help">前端通过该地址访问后端 API。以 file:// 打开时需填写完整地址。</div>
+    </div>
 
-    async function post(url, body) {
-      const resp = await fetch(base() + url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body ?? {}),
-      });
-      if (!resp.ok) {
-        const t = await resp.text();
-        throw new Error(`${resp.status} ${t}`);
-      }
-      return resp;
+    <div class="field">
+      <label for="cfg-provider">模型提供方</label>
+      <select id="cfg-provider">
+        <option value="mock">mock（进程内测试，无需密钥）</option>
+        <option value="openai">openai（OpenAI 兼容接口）</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="cfg-baseurl">接口地址（Base URL）</label>
+      <input id="cfg-baseurl" type="text" placeholder="https://api.deepseek.com（留空使用默认）"/>
+    </div>
+
+    <div class="field">
+      <label for="cfg-model">模型名称</label>
+      <input id="cfg-model" type="text" placeholder="gpt-4o-mini / deepseek-chat"/>
+    </div>
+
+    <div class="field">
+      <label for="cfg-apikey">API Key</label>
+      <input id="cfg-apikey" type="password" placeholder="留空表示不修改已保存的密钥"/>
+      <div class="help" id="cfg-apikey-help">当前未设置密钥。</div>
+    </div>
+
+    <div class="modal-actions">
+      <span class="config-status" id="cfg-status"></span>
+      <button id="cfg-cancel">取消</button>
+      <button id="cfg-save" class="primary">保存并生效</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新建研究 -->
+<div class="modal-overlay" id="new-modal">
+  <div class="modal">
+    <h2>新建研究</h2>
+    <div class="sub">一个会话对应一个研究任务；研究需求会作为首轮上下文。</div>
+
+    <div class="field">
+      <label for="new-title">会话标题</label>
+      <input id="new-title" type="text" placeholder="例如：某 Agent 框架架构调研"/>
+    </div>
+
+    <div class="field">
+      <label for="new-req">研究需求</label>
+      <textarea id="new-req" placeholder="例如：研究该框架的执行模型、调度机制与性能表现"></textarea>
+      <div class="help">留空则使用会话标题作为研究需求。</div>
+    </div>
+
+    <div class="modal-actions">
+      <span class="config-status" id="new-status"></span>
+      <button id="new-cancel">取消</button>
+      <button id="new-create" class="primary">创建并启用</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── 基础状态 ────────────────────────────────────────────────────────────────
+const isFile = location.protocol === 'file:';
+const DEFAULT_BASE = isFile ? 'http://127.0.0.1:8080' : location.origin;
+
+const state = {
+  base: localStorage.getItem('dra_base') || DEFAULT_BASE,
+  sessionId: null,
+  taskId: null,
+  runStatus: '',
+  streaming: false,
+  abort: null,
+  sessions: [],
+};
+
+const $ = (id) => document.getElementById(id);
+const apiBase = () => state.base.replace(/\/$/, '') + '/api/v1';
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function md(s) {
+  return (typeof marked !== 'undefined' && s) ? marked.parse(s) : esc(s || '');
+}
+
+async function api(method, path, body) {
+  const res = await fetch(apiBase() + path, {
+    method,
+    headers: {'Content-Type': 'application/json'},
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+  if (!res.ok) {
+    const msg = (data && data.error) ? data.error : (typeof data === 'string' ? data : res.statusText);
+    throw new Error(`${res.status} ${msg}`);
+  }
+  return data;
+}
+
+// ─── 消息渲染 ────────────────────────────────────────────────────────────────
+function clearChat() { $('chat-container').innerHTML = ''; }
+
+function isNearBottom() {
+  const c = $('chat-container');
+  return c.scrollHeight - c.scrollTop - c.clientHeight < 150;
+}
+function scrollToBottom(force) {
+  const c = $('chat-container');
+  if (force || isNearBottom()) c.scrollTop = c.scrollHeight;
+}
+
+function addCard(role, text, opts) {
+  const container = $('chat-container');
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.setAttribute('data-role', role);
+  card.innerHTML = `<div class="column">
+      <div class="caption">${esc(role)}</div>
+      <div class="body"></div>
+    </div>`;
+  const body = card.querySelector('.body');
+  const handle = { card, body, raw: '' };
+  if (opts && opts.raw) { handle.raw = text || ''; body.textContent = text || ''; }
+  else { handle.raw = text || ''; body.innerHTML = md(text || ''); }
+  container.appendChild(card);
+  scrollToBottom(true);
+  return handle;
+}
+
+function appendText(handle, delta) {
+  handle.raw = (handle.raw || '') + delta;
+  handle.body.innerHTML = md(handle.raw);
+  scrollToBottom(false);
+}
+
+// ─── 会话列表 ────────────────────────────────────────────────────────────────
+async function loadSessions() {
+  let sessions = [];
+  try {
+    sessions = await api('GET', '/sessions') || [];
+  } catch (e) {
+    $('session-list').innerHTML =
+      `<div class="sidebar-empty">加载失败：${esc(e.message)}<br/>请检查「API 配置 → 服务地址」。</div>`;
+    return;
+  }
+  state.sessions = sessions;
+  const list = $('session-list');
+  list.innerHTML = '';
+  if (!sessions.length) {
+    list.innerHTML = '<div class="sidebar-empty">还没有会话，点击右上角「新建研究」。</div>';
+    return;
+  }
+  for (const s of sessions) {
+    const item = document.createElement('div');
+    item.className = 'session-item' + (s.id === state.sessionId ? ' active' : '');
+    item.innerHTML = `<span class="title">${esc(s.title || s.id.slice(0, 8))}</span>
+                      <button class="del-btn" title="删除">✕</button>`;
+    item.querySelector('.title').addEventListener('click', () => selectSession(s.id));
+    item.querySelector('.del-btn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!confirm('删除该会话及其研究数据？')) return;
+      try {
+        await fetch(apiBase() + `/sessions/${s.id}`, {method: 'DELETE'});
+        if (state.sessionId === s.id) resetSession();
+        await loadSessions();
+      } catch (err) { alert('删除失败：' + err.message); }
+    });
+    list.appendChild(item);
+  }
+}
+
+function resetSession() {
+  state.sessionId = null; state.taskId = null; state.runStatus = '';
+  state.streaming = false; state.abort = null;
+  $('chat-header').innerHTML = '<span>未选择会话</span>';
+  $('chat-container').innerHTML = '<div class="empty-state">选择或新建一个研究会话开始研究。</div>';
+  $('state-body').innerHTML = '<div class="state-empty">选择会话后显示研究状态。</div>';
+  updateComposerState();
+}
+
+// ─── 选择会话 ────────────────────────────────────────────────────────────────
+async function selectSession(id) {
+  state.sessionId = id;
+  state.taskId = null;
+  state.runStatus = '';
+  clearChat();
+  $('chat-header').innerHTML = '<span>加载中…</span>';
+  $('state-body').innerHTML = '<div class="state-empty">加载中…</div>';
+  await loadSessions();
+
+  try {
+    const tasks = await api('GET', `/sessions/${id}/tasks`) || [];
+    if (tasks.length) {
+      // 一个 Session 可有多个 Task，当前研究任务取最新一个
+      state.taskId = tasks[tasks.length - 1].id;
+      await refreshRunStatus();
     }
+    await refreshState();
+  } catch (e) {
+    addCard('error', '加载会话失败：' + e.message, {raw: true});
+  }
+  renderChatHeader();
+  if (state.taskId && state.runStatus !== 'paused') $('msg-input').focus();
+}
 
-    $('btn-session').onclick = async () => {
-      try {
-        const resp = await post('/api/v1/sessions', { title: $('title').value });
-        const s = await resp.json();
-        state.sessionID = s.id;
-        setStatus();
-        $('btn-task').disabled = false;
-        log(`Session 已创建：${s.id}`);
-      } catch (e) { log('错误：' + e.message); }
-    };
+async function refreshRunStatus() {
+  if (!state.taskId) { state.runStatus = ''; return; }
+  try {
+    const rt = await api('GET', `/tasks/${state.taskId}/run`);
+    state.runStatus = rt && rt.status ? rt.status : '';
+  } catch (_) { state.runStatus = ''; }
+}
 
-    $('btn-task').onclick = async () => {
-      try {
-        const resp = await post(`/api/v1/sessions/${state.sessionID}/tasks`, { title: '研究任务', description: $('requirement').value });
-        const t = await resp.json();
-        state.taskID = t.id;
-        setStatus();
-        $('btn-enable').disabled = false;
-        log(`Task 已创建：${t.id}`);
-      } catch (e) { log('错误：' + e.message); }
-    };
+// refreshTask 重新取该 Session 最新的 Task（研究完成/中止后发消息会新建 Task）。
+async function refreshTask() {
+  if (!state.sessionId) return;
+  try {
+    const tasks = await api('GET', `/sessions/${state.sessionId}/tasks`) || [];
+    if (tasks.length) state.taskId = tasks[tasks.length - 1].id;
+  } catch (_) { /* 保留原值 */ }
+}
 
-    $('btn-enable').onclick = async () => {
-      try {
-        await fetch(base() + `/api/v1/tasks/${state.taskID}`, {
-          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true }),
-        });
-        log('Task 已启用，RunTask 与 ResearchState 已初始化');
-      } catch (e) { log('错误：' + e.message); }
-    };
+function renderChatHeader() {
+  const s = state.sessions.find(x => x.id === state.sessionId);
+  const title = s ? (s.title || s.id.slice(0, 8)) : '—';
+  const status = state.runStatus || 'unknown';
+  const badgeCls = ['running','stopped','paused','finished'].includes(status) ? status : 'unknown';
+  const statusText = {
+    running: '研究中', paused: '已暂停', stopped: '已中止', finished: '已完成',
+  }[status] || status;
+  $('chat-header').innerHTML = `
+    <strong>${esc(title)}</strong>
+    <span class="badge ${badgeCls}">${esc(statusText)}</span>
+    <span class="spacer"></span>
+    <span class="hint" id="header-hint"></span>
+  `;
+  updateComposerState();
+}
 
-    // SSE 流式研究：用 fetch + ReadableStream 消费 text/event-stream
-    $('btn-research').onclick = async () => {
-      const out = $('output');
-      out.textContent = '';
-      try {
-        const resp = await fetch(base() + `/api/v1/sessions/${state.sessionID}/research`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: $('message').value }),
-        });
-        if (!resp.ok) { out.textContent = `HTTP ${resp.status}`; return; }
+// 根据 RunTask 状态调整输入区：Paused 时禁用输入并提供"继续"。
+function updateComposerState() {
+  const input = $('msg-input');
+  const sendBtn = $('send-btn');
+  const stopBtn = $('stop-btn');
+  const hint = $('header-hint');
+  const status = state.runStatus;
 
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          // 解析 SSE：按空行分事件，取 data: 行
-          let idx;
-          while ((idx = buf.indexOf('\n\n')) >= 0) {
-            const ev = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
-            for (const line of ev.split('\n')) {
-              if (line.startsWith('data:')) {
-                out.textContent += line.slice(5).trimStart();
-              }
-            }
-          }
+  const hasTask = !!state.taskId;
+  const paused = status === 'paused';
+  const finished = status === 'finished';
+  const stopped = status === 'stopped';
+
+  input.disabled = !hasTask || paused;
+  sendBtn.disabled = !hasTask || paused;
+  sendBtn.textContent = paused ? '继续' : '发送';
+  sendBtn.classList.toggle('continue', paused);
+
+  if (paused) {
+    input.placeholder = '研究已暂停，点击"继续"恢复';
+    if (hint) hint.textContent = '已暂停——点击“继续”恢复研究';
+  } else if (finished) {
+    input.placeholder = '研究已完成，发送消息将开启新的研究任务';
+    if (hint) hint.textContent = '已完成——发送消息会新建研究任务并继承本次结论';
+  } else if (stopped) {
+    input.placeholder = '研究已中止，发送消息将开启新的研究任务';
+    if (hint) hint.textContent = '已中止——发送消息会新建研究任务并继承本次结论';
+  } else {
+    input.placeholder = '输入研究指令…';
+    if (hint) hint.textContent = '';
+  }
+}
+
+// ─── ResearchState ───────────────────────────────────────────────────────────
+async function refreshState() {
+  if (!state.sessionId) return;
+  const body = $('state-body');
+  try {
+    const st = await api('GET', `/sessions/${state.sessionId}/research-state`);
+    body.innerHTML = renderState(st);
+  } catch (e) {
+    body.innerHTML = '<div class="state-empty">暂无研究状态（启用研究后生成）。</div>';
+  }
+}
+
+function renderState(st) {
+  if (!st) return '<div class="state-empty">暂无研究状态。</div>';
+  const findings = st.findings || [];
+  const results = st.results || [];
+  const related = st.related_findings || [];
+
+  let html = '';
+  html += `<div class="state-block"><h4>研究需求</h4>
+    <div class="state-item">${esc(st.requirement || '—')}</div></div>`;
+
+  html += `<div class="state-block"><h4>版本 / 计数</h4>
+    <div class="kv"><span class="k">Version：</span>${esc(st.version || 0)}</div>
+    <div class="kv"><span class="k">Findings：</span>${findings.length}</div>
+    <div class="kv"><span class="k">Results：</span>${results.length}</div></div>`;
+
+  if (st.interrupted_context) {
+    html += `<div class="state-block"><h4>被中断的上下文</h4>
+      <div class="state-item">${esc(st.interrupted_context)}</div></div>`;
+  }
+
+  if (related.length) {
+    html += `<div class="state-block"><h4>关联的先前结论</h4>`;
+    for (const r of related) html += `<div class="state-item">${esc(r.summary || '')}</div>`;
+    html += `</div>`;
+  }
+
+  html += `<div class="state-block"><h4>研究结论（Finding）</h4>`;
+  if (!findings.length) html += '<div class="state-empty">暂无</div>';
+  for (const f of findings) {
+    html += `<div class="state-item"><span class="turn">第 ${esc(f.turn)} 轮</span><br/>${esc(f.content || '')}</div>`;
+  }
+  html += `</div>`;
+
+  html += `<div class="state-block"><h4>研究产物（Result）</h4>`;
+  if (!results.length) html += '<div class="state-empty">暂无</div>';
+  for (const r of results) {
+    const pending = r.status === 'pending' ? '<br/><em>（尚未返回结果）</em>' : '';
+    html += `<div class="state-item"><span class="turn">第 ${esc(r.turn)} 轮</span><br/>${esc(r.content || '')}${pending}</div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
+// ─── 发送消息（SSE 流式） ────────────────────────────────────────────────────
+async function sendMessage() {
+  // 暂停态：按钮语义为"继续"
+  if (state.runStatus === 'paused') {
+    await continueResearch();
+    return;
+  }
+
+  const input = $('msg-input');
+  const message = input.value.trim();
+  if (!message || !state.sessionId || state.streaming) return;
+
+  input.value = '';
+  input.style.height = '44px';
+
+  addCard('You', message);
+
+  state.streaming = true;
+  $('send-btn').disabled = true;
+  $('stop-btn').style.display = 'inline-block';
+  $('msg-input').disabled = true;
+
+  const handle = addCard('Supervisor', '');
+  const ctrl = new AbortController();
+  state.abort = ctrl;
+
+  try {
+    const res = await fetch(apiBase() + `/sessions/${state.sessionId}/research`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message}),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      let msg = t;
+      try { msg = JSON.parse(t).error || t; } catch (_) {}
+      throw new Error(`${res.status} ${msg}`);
+    }
+    await consumeSSE(res, ctrl.signal, handle);
+  } catch (err) {
+    if (!ctrl.signal.aborted) {
+      handle.card.setAttribute('data-role', 'error');
+      handle.card.querySelector('.caption').textContent = 'error';
+      handle.body.textContent = '研究失败：' + err.message;
+    }
+  } finally {
+    state.streaming = false;
+    state.abort = null;
+    $('stop-btn').style.display = 'none';
+    // 研究完成后可能已新建 Task，刷新当前 Task 引用
+    await refreshTask();
+    await refreshRunStatus();
+    renderChatHeader();
+    await refreshState();
+    $('msg-input').focus();
+  }
+}
+
+async function consumeSSE(res, signal, handle) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const chunk = line.slice(5).replace(/^ /, '');
+          if (chunk) appendText(handle, chunk);
         }
-      } catch (e) { out.textContent += '\n[错误] ' + e.message; }
-    };
+      }
+    }
+  } catch (err) {
+    if (signal && signal.aborted) return;
+    throw err;
+  }
+}
 
-    $('btn-stop').onclick = async () => {
-      try {
-        await post(`/api/v1/sessions/${state.sessionID}/stop`, {});
-        log('已发起中止');
-      } catch (e) { log('错误：' + e.message); }
-    };
+// ─── 中止 ────────────────────────────────────────────────────────────────────
+async function stopResearch() {
+  if (!state.sessionId) return;
+  if (state.abort) { state.abort.abort(); state.abort = null; }
+  state.streaming = false;
+  $('stop-btn').style.display = 'none';
+  $('send-btn').disabled = false;
+  $('msg-input').disabled = false;
 
-    $('btn-conversation').onclick = async () => {
-      try {
-        const resp = await post(`/api/v1/sessions/${state.sessionID}/conversations`, { requirement: $('requirement').value });
-        const st = await resp.json();
-        log('已开启新对话，ResearchState 已重建（含 RelatedFinding）');
-        $('state').textContent = JSON.stringify(st, null, 2);
-      } catch (e) { log('错误：' + e.message); }
-    };
+  try {
+    await api('POST', `/sessions/${state.sessionId}/stop`, {});
+    addCard('状态', '已请求中止（协作式）。中止后 ResearchState 停止接收新的 Commit；再次发送消息会新建研究任务，并继承本次研究结论。', {raw: true});
+  } catch (e) {
+    addCard('error', '中止失败：' + e.message, {raw: true});
+  }
+  await refreshRunStatus();
+  renderChatHeader();
+  await refreshState();
+}
 
-    $('btn-state').onclick = async () => {
-      try {
-        const resp = await fetch(base() + `/api/v1/sessions/${state.sessionID}/research-state`);
-        const st = await resp.json();
-        $('state').textContent = JSON.stringify(st, null, 2);
-      } catch (e) { $('state').textContent = '错误：' + e.message; }
-    };
+// ─── 继续（Paused -> Running） ────────────────────────────────────────────────
+async function continueResearch() {
+  if (!state.sessionId || !state.taskId) return;
+  try {
+    await api('PATCH', `/tasks/${state.taskId}`, {enabled: true});
+    addCard('状态', '已继续研究（Paused → Running）。', {raw: true});
+  } catch (e) {
+    addCard('error', '继续失败：' + e.message, {raw: true});
+  }
+  await refreshRunStatus();
+  renderChatHeader();
+  await refreshState();
+}
 
-    function log(msg) { $('output').textContent += '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n'; }
-  </script>
+// ─── 新建研究 ────────────────────────────────────────────────────────────────
+function openNewModal() {
+  $('new-title').value = '';
+  $('new-req').value = '';
+  $('new-status').textContent = '';
+  $('new-modal').classList.add('open');
+  $('new-title').focus();
+}
+function closeNewModal() { $('new-modal').classList.remove('open'); }
+
+async function createResearch() {
+  const title = $('new-title').value.trim();
+  const requirement = $('new-req').value.trim() || title;
+  if (!title) { newStatus('请填写会话标题', true); return; }
+
+  $('new-create').disabled = true;
+  newStatus('创建中…', false);
+  try {
+    const sess = await api('POST', '/sessions', {title});
+    const task = await api('POST', `/sessions/${sess.id}/tasks`, {
+      title: title, description: requirement,
+    });
+    await api('PATCH', `/tasks/${task.id}`, {enabled: true});
+
+    closeNewModal();
+    state.sessionId = sess.id;
+    state.taskId = task.id;
+    await loadSessions();
+    await refreshRunStatus();
+    renderChatHeader();
+    clearChat();
+    addCard('状态', `研究已创建并启用。\n研究需求：${requirement}`, {raw: true});
+    if (state.runStatus !== 'paused') $('msg-input').focus();
+    await refreshState();
+  } catch (e) {
+    newStatus('失败：' + e.message, true);
+  } finally {
+    $('new-create').disabled = false;
+  }
+}
+function newStatus(text, isErr) {
+  const el = $('new-status');
+  el.textContent = text;
+  el.className = 'config-status ' + (isErr ? 'err' : 'ok');
+}
+
+// ─── API 配置 ────────────────────────────────────────────────────────────────
+function openApiModal() {
+  $('cfg-base').value = state.base;
+  $('cfg-status').textContent = '';
+  $('cfg-status').className = 'config-status';
+  $('cfg-apikey').value = '';
+  $('api-modal').classList.add('open');
+  loadConfig();
+}
+function closeApiModal() { $('api-modal').classList.remove('open'); }
+
+async function loadConfig() {
+  try {
+    const cfg = await api('GET', '/config');
+    $('cfg-provider').value = cfg.provider || 'mock';
+    $('cfg-baseurl').value = cfg.base_url || '';
+    $('cfg-model').value = cfg.model_name || '';
+    $('cfg-apikey-help').textContent = cfg.api_key_set
+      ? `当前已设置密钥：${cfg.api_key_hint}（留空表示不修改）`
+      : '当前未设置密钥。';
+  } catch (e) {
+    cfgStatus('读取配置失败：' + e.message, true);
+  }
+}
+
+async function saveConfig() {
+  const base = $('cfg-base').value.trim();
+  if (base) {
+    state.base = base.replace(/\/$/, '');
+    localStorage.setItem('dra_base', state.base);
+  }
+  $('cfg-save').disabled = true;
+  cfgStatus('保存中…', false);
+  try {
+    const updated = await api('PUT', '/config', {
+      provider: $('cfg-provider').value,
+      base_url: $('cfg-baseurl').value.trim(),
+      api_key: $('cfg-apikey').value.trim(),
+      model_name: $('cfg-model').value.trim(),
+    });
+    cfgStatus('✓ 已保存并生效', false);
+    $('cfg-apikey').value = '';
+    $('cfg-apikey-help').textContent = updated.api_key_set
+      ? `当前已设置密钥：${updated.api_key_hint}`
+      : '当前未设置密钥。';
+    await loadSessions();
+  } catch (e) {
+    cfgStatus('保存失败：' + e.message, true);
+  } finally {
+    $('cfg-save').disabled = false;
+  }
+}
+function cfgStatus(text, isErr) {
+  const el = $('cfg-status');
+  el.textContent = text;
+  el.className = 'config-status ' + (isErr ? 'err' : 'ok');
+}
+
+// ─── 事件绑定 ────────────────────────────────────────────────────────────────
+$('new-session-btn').addEventListener('click', openNewModal);
+$('new-cancel').addEventListener('click', closeNewModal);
+$('new-create').addEventListener('click', createResearch);
+$('new-modal').addEventListener('click', (e) => {
+  if (e.target === $('new-modal')) closeNewModal();
+});
+
+$('api-config-btn').addEventListener('click', openApiModal);
+$('cfg-cancel').addEventListener('click', closeApiModal);
+$('cfg-save').addEventListener('click', saveConfig);
+$('api-modal').addEventListener('click', (e) => {
+  if (e.target === $('api-modal')) closeApiModal();
+});
+
+$('send-btn').addEventListener('click', sendMessage);
+$('stop-btn').addEventListener('click', stopResearch);
+$('refresh-state-btn').addEventListener('click', refreshState);
+
+$('msg-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+$('msg-input').addEventListener('input', () => {
+  const el = $('msg-input');
+  el.style.height = '44px';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { closeApiModal(); closeNewModal(); }
+});
+
+// ─── 启动 ────────────────────────────────────────────────────────────────────
+(async function init() {
+  await loadSessions();
+  if (state.sessions.length) await selectSession(state.sessions[0].id);
+})();
+</script>
 </body>
 </html>

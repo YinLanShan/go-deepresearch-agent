@@ -7,6 +7,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
@@ -101,22 +102,13 @@ func (s *SessionStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-// Create 保存一个 Task，并原子地保证"一个 Session 只对应一个 Task"。
-// 当该 Session 已存在其他 Task 时返回 storage.ErrSessionHasTask。
+// Create 保存一个 Task。一个 Session 可对应多个 Task，不做唯一性约束。
 func (s *TaskStore) Create(_ context.Context, t *domain.Task) error {
 	if t == nil || t.ID == "" {
 		return storage.ErrNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, existing := range s.m {
-		if existing.ID == t.ID {
-			continue // 同一 Task 的幂等重复创建
-		}
-		if existing.SessionID == t.SessionID {
-			return storage.ErrSessionHasTask
-		}
-	}
 	cp := *t
 	s.m[t.ID] = &cp
 	return nil
@@ -134,8 +126,7 @@ func (s *TaskStore) Get(_ context.Context, id string) (*domain.Task, error) {
 	return &cp, nil
 }
 
-// ListBySession 返回属于指定 Session 的全部 Task。
-// 在"一个 Session 只对应一个 Task"约束下，结果最多一个元素。
+// ListBySession 返回属于指定 Session 的全部 Task，按创建时间升序排列。
 func (s *TaskStore) ListBySession(_ context.Context, sessionID string) ([]*domain.Task, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -146,6 +137,7 @@ func (s *TaskStore) ListBySession(_ context.Context, sessionID string) ([]*domai
 			out = append(out, &cp)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
 }
 
@@ -218,6 +210,18 @@ func (s *RunTaskStore) GetByTask(_ context.Context, taskID string) (*domain.RunT
 	rt := s.m[id]
 	cp := *rt
 	return &cp, nil
+}
+
+// List 返回全部 RunTask。
+func (s *RunTaskStore) List(_ context.Context) ([]*domain.RunTask, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*domain.RunTask, 0, len(s.m))
+	for _, rt := range s.m {
+		cp := *rt
+		out = append(out, &cp)
+	}
+	return out, nil
 }
 
 // Update 用传入的 RunTask 覆盖同 ID 的既有 RunTask，不存在时返回 storage.ErrNotFound。

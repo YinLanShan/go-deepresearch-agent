@@ -26,7 +26,8 @@ func main() {
 	cfg := config.Load()
 	setupLog(cfg.LogLevel)
 
-	model, err := llm.New(context.Background(), llm.Config{
+	// 构建可热切换的模型：API 配置界面保存后立即生效，无需重启服务。
+	model, err := llm.NewSwappable(context.Background(), llm.Config{
 		Provider:  cfg.Model.Provider,
 		BaseURL:   cfg.Model.BaseURL,
 		APIKey:    cfg.Model.APIKey,
@@ -61,6 +62,7 @@ func main() {
 		memory.NewSessionStore(),
 		taskStore,
 		service.NewRunService(taskStore, runTaskStore, stateStore, bus),
+		service.NewConfigService(model),
 	)
 
 	h := server.Default(
@@ -70,6 +72,9 @@ func main() {
 	// CORS：允许前端模板（web/index.html 经 file:// 打开）跨源访问本服务。
 	h.Use(corsMiddleware)
 	a.Register(h)
+
+	// 同时把前端模板挂在根路径，便于直接访问 http://<addr>/ 使用。
+	h.StaticFile("/", "./web/index.html")
 
 	slog.Info("server starting", "addr", cfg.HTTPAddr, "model_provider", cfg.Model.Provider)
 	h.Spin()

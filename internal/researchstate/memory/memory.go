@@ -3,6 +3,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -10,11 +11,12 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 )
 
-// Store 是 researchstate.Store 的进程内实现，按 SessionID 组织。
+// Store 是 researchstate.Store 的进程内实现，按 TaskID 组织。
 type Store struct {
 	mu        sync.RWMutex
-	m         map[string]*researchstate.State
-	accepting map[string]bool // sessionID -> 是否接受新的 Commit
+	m         map[string]*researchstate.State // taskID -> State
+	accepting map[string]bool                 // taskID -> 是否接受新的 Commit
+	latest    map[string]string               // sessionID -> 最近创建的 taskID
 }
 
 var _ researchstate.Store = (*Store)(nil)
@@ -24,26 +26,44 @@ func NewStore() *Store {
 	return &Store{
 		m:         make(map[string]*researchstate.State),
 		accepting: make(map[string]bool),
+		latest:    make(map[string]string),
 	}
 }
 
-// Create 保存一份研究状态，并开启提交门控。
+// Create 保存一份研究状态（按 TaskID），并开启提交门控。
 func (s *Store) Create(_ context.Context, st *researchstate.State) error {
-	if st == nil || st.SessionID == "" {
+	if st == nil || st.TaskID == "" {
 		return researchstate.ErrNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m[st.SessionID] = clone(st)
-	s.accepting[st.SessionID] = true
+	s.m[st.TaskID] = clone(st)
+	s.accepting[st.TaskID] = true
+	// 记录该 Session 最近创建的研究状态，供 GetLatestBySession 使用。
+	s.latest[st.SessionID] = st.TaskID
 	return nil
 }
 
-// Get 按 SessionID 返回研究状态，不存在时返回 researchstate.ErrNotFound。
-func (s *Store) Get(_ context.Context, sessionID string) (*researchstate.State, error) {
+// Get 按 TaskID 返回研究状态，不存在时返回 researchstate.ErrNotFound。
+func (s *Store) Get(_ context.Context, taskID string) (*researchstate.State, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	st, ok := s.m[sessionID]
+	st, ok := s.m[taskID]
+	if !ok {
+		return nil, researchstate.ErrNotFound
+	}
+	return clone(st), nil
+}
+
+// GetLatestBySession 返回指定 Session 下最近创建的一份研究状态。
+func (s *Store) GetLatestBySession(_ context.Context, sessionID string) (*researchstate.State, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	taskID, ok := s.latest[sessionID]
+	if !ok {
+		return nil, researchstate.ErrNotFound
+	}
+	st, ok := s.m[taskID]
 	if !ok {
 		return nil, researchstate.ErrNotFound
 	}
@@ -55,14 +75,14 @@ func (s *Store) Get(_ context.Context, sessionID string) (*researchstate.State, 
 //
 // 若提交门控已关闭（中止状态），返回 researchstate.ErrNotAccepting；
 // 正在进行的 Commit（已获得锁）会继续完成。
-func (s *Store) Commit(_ context.Context, sessionID string, in researchstate.CommitInput) error {
+func (s *Store) Commit(_ context.Context, taskID string, in researchstate.CommitInput) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st, ok := s.m[sessionID]
+	st, ok := s.m[taskID]
 	if !ok {
 		return researchstate.ErrNotFound
 	}
-	if !s.accepting[sessionID] {
+	if !s.accepting[taskID] {
 		return researchstate.ErrNotAccepting
 	}
 	now := time.Now()
@@ -88,13 +108,13 @@ func (s *Store) Commit(_ context.Context, sessionID string, in researchstate.Com
 }
 
 // AccumulateInterruptedContext 累积追加被中断的上下文原文（多次中断累积到同一字段）。
-func (s *Store) AccumulateInterruptedContext(_ context.Context, sessionID, text string) error {
+func (s *Store) AccumulateInterruptedContext(_ context.Context, taskID, text string) error {
 	if text == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st, ok := s.m[sessionID]
+	st, ok := s.m[taskID]
 	if !ok {
 		return researchstate.ErrNotFound
 	}
@@ -104,36 +124,46 @@ func (s *Store) AccumulateInterruptedContext(_ context.Context, sessionID, text 
 }
 
 // StopCommits 关闭提交门控：此后新的 Commit 返回 ErrNotAccepting。
-func (s *Store) StopCommits(_ context.Context, sessionID string) error {
+func (s *Store) StopCommits(_ context.Context, taskID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.m[sessionID]; !ok {
+	if _, ok := s.m[taskID]; !ok {
 		return researchstate.ErrNotFound
 	}
-	s.accepting[sessionID] = false
+	s.accepting[taskID] = false
 	return nil
 }
 
-// ResumeCommits 重新开启提交门控（中止后恢复研究时调用）。
-func (s *Store) ResumeCommits(_ context.Context, sessionID string) error {
+// ResumeCommits 重新开启提交门控（暂停后恢复研究时调用）。
+func (s *Store) ResumeCommits(_ context.Context, taskID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.m[sessionID]; !ok {
+	if _, ok := s.m[taskID]; !ok {
 		return researchstate.ErrNotFound
 	}
-	s.accepting[sessionID] = true
+	s.accepting[taskID] = true
 	return nil
 }
 
-// Delete 删除指定 Session 的研究状态，不存在时返回 researchstate.ErrNotFound。
-func (s *Store) Delete(_ context.Context, sessionID string) error {
+// DeleteBySession 删除指定 Session 的全部研究状态。
+func (s *Store) DeleteBySession(_ context.Context, sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.m[sessionID]; !ok {
+	var idsToDelete []string
+	for taskID, st := range s.m {
+		if st.SessionID == sessionID {
+			idsToDelete = append(idsToDelete, taskID)
+		}
+	}
+	if len(idsToDelete) == 0 {
 		return researchstate.ErrNotFound
 	}
-	delete(s.m, sessionID)
-	delete(s.accepting, sessionID)
+	sort.Strings(idsToDelete)
+	for _, taskID := range idsToDelete {
+		delete(s.m, taskID)
+		delete(s.accepting, taskID)
+	}
+	delete(s.latest, sessionID)
 	return nil
 }
 

@@ -46,12 +46,14 @@ type API struct {
 	sessions storage.SessionStore
 	tasks    storage.TaskStore
 	runs     *service.RunService
+	config   *service.ConfigService
 	now      func() time.Time
 }
 
 // New 构造一个 API 实例。
-func New(chat *service.ChatService, sessions storage.SessionStore, tasks storage.TaskStore, runs *service.RunService) *API {
-	return &API{chat: chat, sessions: sessions, tasks: tasks, runs: runs, now: time.Now}
+func New(chat *service.ChatService, sessions storage.SessionStore, tasks storage.TaskStore,
+	runs *service.RunService, cfg *service.ConfigService) *API {
+	return &API{chat: chat, sessions: sessions, tasks: tasks, runs: runs, config: cfg, now: time.Now}
 }
 
 // Register 在路由上注册全部 HTTP 接口。
@@ -60,6 +62,7 @@ func (a *API) Register(r route.IRouter) {
 	v1 := r.Group("/api/v1")
 	v1.POST("/chat", a.handleChat)
 	v1.POST("/sessions", a.handleCreateSession)
+	v1.GET("/sessions", a.handleListSessions)
 	v1.POST("/sessions/:id/tasks", a.handleCreateTask)
 	v1.GET("/sessions/:id/tasks", a.handleListTasks)
 	v1.DELETE("/sessions/:id", a.handleDeleteSession)
@@ -70,7 +73,8 @@ func (a *API) Register(r route.IRouter) {
 	v1.GET("/sessions/:id/research-state", a.handleGetResearchState)
 	v1.POST("/sessions/:id/stop", a.handleStop)
 	v1.POST("/sessions/:id/research", a.handleResearchStream)
-	v1.POST("/sessions/:id/conversations", a.handleStartConversation)
+	v1.GET("/config", a.handleGetConfig)
+	v1.PUT("/config", a.handleUpdateConfig)
 }
 
 type chatRequest struct {
@@ -123,6 +127,46 @@ func (a *API) handleCreateSession(_ context.Context, c *app.RequestContext) {
 	c.JSON(http.StatusCreated, sess)
 }
 
+// handleListSessions 列出全部 Session，供前端侧边栏使用。
+func (a *API) handleListSessions(ctx context.Context, c *app.RequestContext) {
+	sessions, err := a.sessions.List(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if sessions == nil {
+		sessions = []*domain.Session{}
+	}
+	c.JSON(http.StatusOK, sessions)
+}
+
+// handleGetConfig 返回当前模型配置视图（密钥脱敏）。
+func (a *API) handleGetConfig(_ context.Context, c *app.RequestContext) {
+	if a.config == nil {
+		c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "config service unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, a.config.Get())
+}
+
+// handleUpdateConfig 热切换模型配置并立即生效。
+func (a *API) handleUpdateConfig(ctx context.Context, c *app.RequestContext) {
+	if a.config == nil {
+		c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "config service unavailable"})
+		return
+	}
+	var req service.ModelConfigUpdate
+	if err := c.BindAndValidate(&req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if err := a.config.Update(ctx, req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, a.config.Get())
+}
+
 type taskRequest struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
@@ -155,10 +199,6 @@ func (a *API) handleCreateTask(_ context.Context, c *app.RequestContext) {
 		UpdatedAt:   now,
 	}
 	if err := a.tasks.Create(context.Background(), t); err != nil {
-		if errors.Is(err, storage.ErrSessionHasTask) {
-			c.JSON(http.StatusConflict, map[string]string{"error": "session already has a task"})
-			return
-		}
 		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -380,34 +420,6 @@ func (a *API) handleStop(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	c.JSON(http.StatusOK, map[string]string{"status": "stopped"})
-}
-
-type conversationRequest struct {
-	Requirement string `json:"requirement"`
-}
-
-// handleStartConversation 开启一个新对话：建立新 ResearchState，携带上一对话结论。
-func (a *API) handleStartConversation(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
-		return
-	}
-	var req conversationRequest
-	if err := c.BindAndValidate(&req); err != nil {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
-		return
-	}
-	if strings.TrimSpace(req.Requirement) == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "requirement is required"})
-		return
-	}
-	st, err := a.runs.StartNewConversation(ctx, sessionID, req.Requirement)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusCreated, st)
 }
 
 // handleResearchStream 以 SSE 流式返回 Supervisor 的研究输出。
