@@ -20,6 +20,7 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
@@ -481,11 +482,18 @@ func TestResearchLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get state: %v", err)
 	}
-	if st.Requirement != "研究某框架的架构" {
-		t.Fatalf("requirement = %q", st.Requirement)
+	// 研究需求来自用户发送的第一条消息，而不是 Task 的 Title/Description。
+	if st.Requirement != "请分析" {
+		t.Fatalf("requirement should be the first user message, got %q", st.Requirement)
 	}
 	if len(st.Findings) != 1 || st.Findings[0].Content != "mock reply to: 请分析" {
 		t.Fatalf("findings = %+v", st.Findings)
+	}
+	// 对话历史应记录 user + assistant 两条
+	if len(st.History) != 2 ||
+		st.History[0].Role != researchstate.RoleUser || st.History[0].Content != "请分析" ||
+		st.History[1].Role != researchstate.RoleAssistant {
+		t.Fatalf("history = %+v", st.History)
 	}
 	firstTaskID := st.TaskID
 
@@ -509,14 +517,46 @@ func TestResearchLifecycleFlow(t *testing.T) {
 	if latest.TaskID == firstTaskID {
 		t.Fatalf("should create a new ResearchState for the new Task, still %q", latest.TaskID)
 	}
-	if len(latest.RelatedFindings) == 0 {
-		t.Fatalf("new ResearchState should carry RelatedFindings from previous task")
+	if len(latest.RelatedNodes) == 0 {
+		t.Fatalf("new ResearchState should carry RelatedNodes from previous task")
 	}
-	if !strings.Contains(latest.RelatedFindings[0].Summary, "mock reply to: 请分析") {
-		t.Fatalf("related finding should contain previous conclusion, got %q", latest.RelatedFindings[0].Summary)
+	prevNode := latest.RelatedNodes[0]
+	if prevNode.Ordinal != 1 {
+		t.Fatalf("related node ordinal should be 1, got %d", prevNode.Ordinal)
+	}
+	if latest.Ordinal != 2 {
+		t.Fatalf("new state ordinal should be 2, got %d", latest.Ordinal)
+	}
+	if len(prevNode.Findings) == 0 ||
+		!strings.Contains(prevNode.Findings[0].Content, "mock reply to: 请分析") {
+		t.Fatalf("related node should carry previous finding, got %+v", prevNode.Findings)
 	}
 	if latest.Requirement != "继续深入" {
 		t.Fatalf("new requirement should be the follow-up message, got %q", latest.Requirement)
+	}
+
+	// 对话历史接口应能回放两个任务的全部消息（每任务 user+assistant，共 4 条）
+	w = ut.PerformRequest(router, "GET", "/api/v1/sessions/"+sess.ID+"/history", nil)
+	if resp = w.Result(); resp.StatusCode() != 200 {
+		t.Fatalf("get history: %d, body=%s", resp.StatusCode(), resp.Body())
+	}
+	var hist struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(resp.Body(), &hist); err != nil {
+		t.Fatalf("unmarshal history: %v", err)
+	}
+	if len(hist.Messages) != 4 {
+		t.Fatalf("want 4 history messages, got %d: %+v", len(hist.Messages), hist.Messages)
+	}
+	if hist.Messages[0].Role != "user" || hist.Messages[0].Content != "请分析" {
+		t.Fatalf("history[0] = %+v", hist.Messages[0])
+	}
+	if hist.Messages[2].Role != "user" || hist.Messages[2].Content != "继续深入" {
+		t.Fatalf("history[2] = %+v", hist.Messages[2])
 	}
 }
 

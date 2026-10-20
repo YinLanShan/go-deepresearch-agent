@@ -35,7 +35,57 @@ func NewSlowModel(delay time.Duration) *SlowModel {
 var (
 	_ model.BaseChatModel = (*Model)(nil)
 	_ model.BaseChatModel = (*SlowModel)(nil)
+	_ model.BaseChatModel = (*ToolModel)(nil)
 )
+
+// ToolModel 是用于验证 ReAct 工具调用链路的确定性模型。
+//
+// 行为：输入中没有工具结果时，先发起一次 web_search 工具调用；
+// 已看到工具结果后，输出最终研究结论。
+type ToolModel struct {
+	// ToolName 是要调用的工具名，默认 web_search。
+	ToolName string
+	// Arguments 是工具调用参数（JSON），默认 {"query":"框架执行模型"}。
+	Arguments string
+}
+
+// NewToolModel 构造一个会发起工具调用的模型。
+func NewToolModel() *ToolModel {
+	return &ToolModel{
+		ToolName:  "web_search",
+		Arguments: `{"query":"框架执行模型"}`,
+	}
+}
+
+// Generate 首次发起工具调用，看到工具结果后输出最终回答。
+func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	for _, msg := range input {
+		if msg != nil && msg.Role == schema.Tool {
+			return schema.AssistantMessage(
+				"根据检索结果，可以得出结论：该框架采用 DAG 执行模型，适合确定性 Workflow。", nil), nil
+		}
+	}
+
+	msg := schema.AssistantMessage("我需要先检索相关资料。", nil)
+	msg.ToolCalls = []schema.ToolCall{{
+		ID:   "call-1",
+		Type: "function",
+		Function: schema.FunctionCall{
+			Name:      m.ToolName,
+			Arguments: m.Arguments,
+		},
+	}}
+	return msg, nil
+}
+
+// Stream 以单块流返回与 Generate 相同的内容。
+func (m *ToolModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	msg, err := m.Generate(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
 
 // Generate 返回一条完整回复。
 func (m *Model) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {

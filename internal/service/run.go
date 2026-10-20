@@ -19,19 +19,36 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 )
 
+// Approver 由 Runtime 实现：把审批决定交给对应 SupervisorLoop 走 Eino 恢复流程。
+type Approver interface {
+	Approve(ctx context.Context, sessionID, interruptID string, approved bool, reason string) error
+}
+
 // RunService 负责 Task 的启用/禁用、RunTask 的查询/删除请求，以及研究状态访问。
 type RunService struct {
-	tasks  storage.TaskStore
-	runs   storage.RunTaskStore
-	states researchstate.Store
-	bus    *event.Bus
-	now    func() time.Time
+	tasks    storage.TaskStore
+	runs     storage.RunTaskStore
+	states   researchstate.Store
+	bus      *event.Bus
+	approver Approver
+	now      func() time.Time
 }
 
 // NewRunService 构造一个 RunService。
 func NewRunService(tasks storage.TaskStore, runs storage.RunTaskStore, states researchstate.Store,
 	bus *event.Bus) *RunService {
 	return &RunService{tasks: tasks, runs: runs, states: states, bus: bus, now: time.Now}
+}
+
+// SetApprover 注入审批处理器（由 Runtime 提供）。
+func (s *RunService) SetApprover(a Approver) { s.approver = a }
+
+// Approve 提交一次工具审批决定。
+func (s *RunService) Approve(ctx context.Context, sessionID, interruptID string, approved bool, reason string) error {
+	if s.approver == nil {
+		return errors.New("service: approver not configured")
+	}
+	return s.approver.Approve(ctx, sessionID, interruptID, approved, reason)
 }
 
 // SetTaskEnabled 修改 Task 的启用/禁用状态，并以同步事件提交给 Runtime 协商处理。
@@ -176,18 +193,20 @@ func (s *RunService) currentResearch(ctx context.Context, sessionID string) (*do
 }
 
 // startNextResearch 在上一任务终止（Finished/Stopped）后开启新研究：
-// 新建 Task（研究需求=本条消息）→ 启用（Runtime 创建 RunTask 与新 ResearchState，
-// 并继承上一份研究状态的结论为 RelatedFinding）→ 投递消息。
+// 新建 Task → 启用（Runtime 创建 RunTask 与新 ResearchState，并继承上一份研究状态的
+// 结论为 RelatedFinding）→ 投递消息。
+//
+// 后续 Task 的 Title/Description 留空：它们只是会话标识，不进入提示词；
+// 新 ResearchState 的 Requirement 由本条消息决定。
 func (s *RunService) startNextResearch(ctx context.Context, sessionID, message string) error {
 	now := s.now()
 	t := &domain.Task{
-		ID:          ids.New(),
-		SessionID:   sessionID,
-		Title:       "继续研究",
-		Description: message,
-		Enabled:     false,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:        ids.New(),
+		SessionID: sessionID,
+		Title:     "",
+		Enabled:   false,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	if err := s.tasks.Create(ctx, t); err != nil {
 		return err
@@ -222,6 +241,28 @@ func (s *RunService) Bus() *event.Bus { return s.bus }
 // GetResearchState 查询指定 Session 当前研究任务（最近一份）的研究状态。
 func (s *RunService) GetResearchState(ctx context.Context, sessionID string) (*researchstate.State, error) {
 	return s.states.GetLatestBySession(ctx, sessionID)
+}
+
+// GetConversationHistory 返回指定 Session 全部研究任务的对话历史（按 Task 创建顺序拼接）。
+//
+// 用于前端切换会话时回放历史。历史按 Task 存储于各自 ResearchState 的 History 字段。
+func (s *RunService) GetConversationHistory(ctx context.Context, sessionID string) ([]researchstate.Message, error) {
+	tasks, err := s.tasks.ListBySession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]researchstate.Message, 0)
+	for _, t := range tasks {
+		st, err := s.states.Get(ctx, t.ID)
+		if err != nil {
+			if errors.Is(err, researchstate.ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, st.History...)
+	}
+	return out, nil
 }
 
 // DeleteResearchState 删除指定 Session 的全部研究状态（Session 级联删除时调用）。

@@ -17,6 +17,9 @@ type Config struct {
 
 	// Model 是模型调用相关配置。
 	Model ModelConfig
+
+	// Tool 是 Supervisor（ReAct Agent）的工具配置。
+	Tool ToolConfig
 }
 
 // ModelConfig 描述模型提供方及其连接参数。
@@ -31,6 +34,18 @@ type ModelConfig struct {
 	ModelName string
 }
 
+// ToolConfig 描述工具来源与审批策略。
+type ToolConfig struct {
+	// MCPServersJSON 是 MCP Server 列表的 JSON 配置，结构见 internal/tool.MCPServerConfig。
+	MCPServersJSON string
+	// EnableBuiltinSearch 为 true 时注册内置演示搜索工具（无 MCP Server 也能跑通链路）。
+	EnableBuiltinSearch bool
+	// RequireApproval 是需要人工审批的工具名，逗号分隔；"*" 表示全部工具。
+	RequireApproval string
+	// ApprovalTimeoutSeconds 是审批等待超时秒数，<=0 时使用默认值。
+	ApprovalTimeoutSeconds int
+}
+
 // Load 从环境变量读取配置，缺失时使用默认值。
 func Load() Config {
 	return Config{
@@ -42,6 +57,12 @@ func Load() Config {
 			APIKey:    getenv("DRA_OPENAI_API_KEY", ""),
 			ModelName: getenv("DRA_OPENAI_MODEL", "gpt-4o-mini"),
 		},
+		Tool: ToolConfig{
+			MCPServersJSON:         getenv("DRA_MCP_SERVERS", ""),
+			EnableBuiltinSearch:    getenv("DRA_ENABLE_BUILTIN_SEARCH", "true") != "false",
+			RequireApproval:        getenv("DRA_TOOL_REQUIRE_APPROVAL", "*"),
+			ApprovalTimeoutSeconds: getenvInt("DRA_APPROVAL_TIMEOUT_SECONDS", 300),
+		},
 	}
 }
 
@@ -50,4 +71,19 @@ func getenv(key, def string) string {
 		return strings.TrimSpace(v)
 	}
 	return def
+}
+
+func getenvInt(key string, def int) int {
+	v := getenv(key, "")
+	if v == "" {
+		return def
+	}
+	var n int
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return def
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
 }

@@ -55,7 +55,7 @@ func (s *Store) Get(_ context.Context, taskID string) (*researchstate.State, err
 	return clone(st), nil
 }
 
-// GetLatestBySession 返回指定 Session 下最近创建的一份研究状态。
+// GetLatestBySession 返回指定 Session 下最新序号的 ResearchState。
 func (s *Store) GetLatestBySession(_ context.Context, sessionID string) (*researchstate.State, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -70,11 +70,24 @@ func (s *Store) GetLatestBySession(_ context.Context, sessionID string) (*resear
 	return clone(st), nil
 }
 
-// Commit 追加一轮研究产物（Result）与研究结论（Finding），
-// 清空已合并进 Finding 的被中断上下文，并自增版本号。
+// ListBySession 返回指定 Session 下全部 ResearchState，按序号升序。
+func (s *Store) ListBySession(_ context.Context, sessionID string) ([]*researchstate.State, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*researchstate.State, 0)
+	for _, st := range s.m {
+		if st.SessionID == sessionID {
+			out = append(out, clone(st))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Ordinal < out[j].Ordinal })
+	return out, nil
+}
+
+// Commit 追加一轮研究产物（Result）与研究结论（Finding），并自增版本号。
 //
-// 若提交门控已关闭（中止状态），返回 researchstate.ErrNotAccepting；
-// 正在进行的 Commit（已获得锁）会继续完成。
+// InterruptedContext 不参与 Commit：它独立累积，始终作为分区进入上下文。
+// 若提交门控已关闭（暂停状态），返回 researchstate.ErrNotAccepting。
 func (s *Store) Commit(_ context.Context, taskID string, in researchstate.CommitInput) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,8 +113,29 @@ func (s *Store) Commit(_ context.Context, taskID string, in researchstate.Commit
 		Content:   in.FindingContent,
 		CreatedAt: now,
 	})
-	// 被中断的上下文已合并进本轮 Finding，清空。
-	st.InterruptedContext = ""
+	st.Version++
+	st.UpdatedAt = now
+	return nil
+}
+
+// AppendResult 仅追加一条 Result（用于任务中止后到达的迟到产物）。
+//
+// 不产生 Finding、不触碰 InterruptedContext、不受提交门控限制。
+func (s *Store) AppendResult(_ context.Context, taskID string, in researchstate.CommitInput) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[taskID]
+	if !ok {
+		return researchstate.ErrNotFound
+	}
+	now := time.Now()
+	st.Results = append(st.Results, researchstate.Result{
+		ID:        ids.New(),
+		Turn:      len(st.Results) + 1,
+		Content:   in.ResultContent,
+		Status:    researchstate.ResultCommitted,
+		CreatedAt: now,
+	})
 	st.Version++
 	st.UpdatedAt = now
 	return nil
@@ -120,6 +154,38 @@ func (s *Store) AccumulateInterruptedContext(_ context.Context, taskID, text str
 	}
 	st.InterruptedContext += text
 	st.UpdatedAt = time.Now()
+	return nil
+}
+
+// SetRequirementIfEmpty 在需求为空时写入（首条用户消息即研究需求）。
+func (s *Store) SetRequirementIfEmpty(_ context.Context, taskID, requirement string) error {
+	if requirement == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[taskID]
+	if !ok {
+		return researchstate.ErrNotFound
+	}
+	if st.SetRequirementIfEmpty(requirement) {
+		st.UpdatedAt = time.Now()
+	}
+	return nil
+}
+
+// AppendMessage 追加一条对话历史。
+func (s *Store) AppendMessage(_ context.Context, taskID string, role researchstate.MessageRole, content string) error {
+	if content == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[taskID]
+	if !ok {
+		return researchstate.ErrNotFound
+	}
+	st.AddMessage(role, content)
 	return nil
 }
 
@@ -172,6 +238,15 @@ func clone(st *researchstate.State) *researchstate.State {
 	cp := *st
 	cp.Results = append([]researchstate.Result(nil), st.Results...)
 	cp.Findings = append([]researchstate.Finding(nil), st.Findings...)
-	cp.RelatedFindings = append([]researchstate.RelatedFinding(nil), st.RelatedFindings...)
+	cp.History = append([]researchstate.Message(nil), st.History...)
+	if len(st.RelatedNodes) > 0 {
+		nodes := make([]researchstate.RelatedNode, len(st.RelatedNodes))
+		for i, n := range st.RelatedNodes {
+			n.Results = append([]researchstate.Result(nil), n.Results...)
+			n.Findings = append([]researchstate.Finding(nil), n.Findings...)
+			nodes[i] = n
+		}
+		cp.RelatedNodes = nodes
+	}
 	return &cp
 }

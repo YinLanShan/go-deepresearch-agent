@@ -71,7 +71,9 @@ func (a *API) Register(r route.IRouter) {
 	v1.GET("/run-tasks/:runTaskID", a.handleGetRunTask)
 	v1.POST("/sessions/:id/messages", a.handleSendMessage)
 	v1.GET("/sessions/:id/research-state", a.handleGetResearchState)
+	v1.GET("/sessions/:id/history", a.handleGetHistory)
 	v1.POST("/sessions/:id/stop", a.handleStop)
+	v1.POST("/sessions/:id/approve", a.handleApprove)
 	v1.POST("/sessions/:id/research", a.handleResearchStream)
 	v1.GET("/config", a.handleGetConfig)
 	v1.PUT("/config", a.handleUpdateConfig)
@@ -408,7 +410,20 @@ func (a *API) handleGetResearchState(ctx context.Context, c *app.RequestContext)
 	c.JSON(http.StatusOK, st)
 }
 
-// handleStop 处理用户主动中止。
+// handleGetHistory 返回指定 Session 的对话历史（前端切换会话时回放）。
+func (a *API) handleGetHistory(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	msgs, err := a.runs.GetConversationHistory(ctx, sessionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"messages": msgs})
+}
 func (a *API) handleStop(ctx context.Context, c *app.RequestContext) {
 	sessionID := c.Param("id")
 	if sessionID == "" {
@@ -420,6 +435,35 @@ func (a *API) handleStop(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	c.JSON(http.StatusOK, map[string]string{"status": "stopped"})
+}
+
+type approvalRequest struct {
+	ApprovalID string `json:"approval_id"`
+	Approved   bool   `json:"approved"`
+	Reason     string `json:"reason"`
+}
+
+// handleApprove 处理工具调用的人工审批。
+func (a *API) handleApprove(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	var req approvalRequest
+	if err := c.BindAndValidate(&req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.ApprovalID) == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "approval_id is required"})
+		return
+	}
+	if err := a.runs.Approve(ctx, sessionID, req.ApprovalID, req.Approved, req.Reason); err != nil {
+		c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"approval_id": req.ApprovalID, "approved": req.Approved})
 }
 
 // handleResearchStream 以 SSE 流式返回 Supervisor 的研究输出。
@@ -449,6 +493,11 @@ func (a *API) handleResearchStream(ctx context.Context, c *app.RequestContext) {
 	bus := a.runs.Bus()
 	bus.Subscribe(event.EventModelOutput, sub)
 	bus.Subscribe(event.EventModelOutputDone, sub)
+	// 工具动作与审批请求同样经 SSE 推送到前端。
+	bus.Subscribe(event.EventToolCall, sub)
+	bus.Subscribe(event.EventToolResult, sub)
+	bus.Subscribe(event.EventToolApprovalRequired, sub)
+	bus.Subscribe(event.EventToolApprovalCancelled, sub)
 
 	if err := a.runs.SendUserMessage(ctx, sessionID, req.Message); err != nil {
 		_ = w.WriteEvent("", "error", []byte(err.Error()))
@@ -459,12 +508,12 @@ func (a *API) handleResearchStream(ctx context.Context, c *app.RequestContext) {
 	select {
 	case <-sub.done:
 	case <-ctx.Done():
-	case <-time.After(60 * time.Second):
+	case <-time.After(10 * time.Minute): // 含人工审批等待时间
 	}
 	_ = w.Close()
 }
 
-// streamSubscriber 订阅流式输出事件并写入 SSE。
+// streamSubscriber 订阅流式输出与工具事件并写入 SSE。
 type streamSubscriber struct {
 	sessionID string
 	w         *sse.Writer
@@ -474,7 +523,9 @@ type streamSubscriber struct {
 
 var _ event.EventSender = (*streamSubscriber)(nil)
 
-// Send 实现 event.EventSender：过滤本 Session 的流式输出事件。
+// Send 实现 event.EventSender：过滤本 Session 的事件并写入 SSE。
+//
+// SSE 事件名：message（模型输出）/ tool_call / tool_result / approval_required。
 func (s *streamSubscriber) Send(_ context.Context, e event.EventEnvelope) error {
 	switch ev := e.Data.(type) {
 	case event.ModelOutputEvent:
@@ -484,6 +535,53 @@ func (s *streamSubscriber) Send(_ context.Context, e event.EventEnvelope) error 
 	case event.ModelOutputDoneEvent:
 		if ev.SessionID == s.sessionID {
 			s.once.Do(func() { close(s.done) })
+		}
+	case event.ToolCallEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"tool_name": ev.ToolName,
+			"arguments": ev.Arguments,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "tool_call", payload)
+		}
+	case event.ToolResultEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"tool_name": ev.ToolName,
+			"output":    ev.Output,
+			"error":     ev.Err,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "tool_result", payload)
+		}
+	case event.ToolApprovalRequiredEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"approval_id": ev.ApprovalID,
+			"tool_name":   ev.ToolName,
+			"arguments":   ev.Arguments,
+			"description": ev.Description,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "approval_required", payload)
+		}
+	case event.ToolApprovalCancelledEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"approval_id": ev.ApprovalID,
+			"reason":      ev.Reason,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "approval_cancelled", payload)
 		}
 	}
 	return nil

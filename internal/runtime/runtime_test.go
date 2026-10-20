@@ -49,8 +49,10 @@ func disable(t *testing.T, bus *event.Bus, taskID string) {
 	}
 }
 
-// TestStopFlow 验证用户主动中止：Running -> Stopped，提交门控关闭；
-// Stopped 为终止态，"继续"不会复活（用户再发消息会新建 Task）。
+// TestStopFlow 验证用户主动中止的终态语义：
+//   - Running -> Stopped；
+//   - 中止后属于本 Task 的迟到 Result 仍可正常提交（提交门控不关闭）；
+//   - Stopped 为终止态，"继续"不会复活（用户再发消息会新建 Task）。
 func TestStopFlow(t *testing.T) {
 	_, tasks, runs, states, bus := newRuntime(t)
 	ctx := context.Background()
@@ -69,9 +71,16 @@ func TestStopFlow(t *testing.T) {
 	}
 	waitStatus(t, runs, "t1", domain.RunStatusStopped)
 
-	// 中止后 ResearchState 停止接收新的 Commit
-	if err := states.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "x", FindingContent: "y"}); !errors.Is(err, researchstate.ErrNotAccepting) {
-		t.Fatalf("commit after stop should be ErrNotAccepting, got %v", err)
+	// 中止后，属于该 Task 的迟到 Result 仍可提交（不被门控拒绝）
+	if err := states.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "迟到结果", FindingContent: "迟到结果"}); err != nil {
+		t.Fatalf("late result commit after stop should be accepted, got %v", err)
+	}
+	st, err := states.Get(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if len(st.Results) != 1 {
+		t.Fatalf("late result should be appended, got %+v", st.Results)
 	}
 
 	// Stopped 为终止态：再次使能不应复活为 Running
@@ -124,7 +133,8 @@ func TestDisableFlow(t *testing.T) {
 	}
 }
 
-// TestGlobalSingleRunning 验证全局单例运行：使能新 Session 时失能原来运行中的 Session。
+// TestGlobalSingleRunning 验证全局单例运行：使能新 Session 时，
+// 原来运行中的 Session 被置为 Waiting（被挤掉），而不是 Paused（用户暂停）。
 func TestGlobalSingleRunning(t *testing.T) {
 	_, tasks, runs, _, bus := newRuntime(t)
 	ctx := context.Background()
@@ -139,15 +149,20 @@ func TestGlobalSingleRunning(t *testing.T) {
 	enable(t, bus, "t1")
 	waitStatus(t, runs, "t1", domain.RunStatusRunning)
 
-	// 使能另一个 Session 的任务：t1 应被失能为 Paused，t2 变为 Running
+	// 使能另一个 Session 的任务：t1 被挤掉应为 Waiting，t2 变为 Running
 	enable(t, bus, "t2")
 	waitStatus(t, runs, "t2", domain.RunStatusRunning)
-	waitStatus(t, runs, "t1", domain.RunStatusPaused)
+	waitStatus(t, runs, "t1", domain.RunStatusWaiting)
 
 	task1, _ := tasks.Get(ctx, "t1")
 	if task1.Enabled {
 		t.Fatalf("t1 should be disabled when another session starts running")
 	}
+
+	// 从 Waiting 点"继续"应能切回运行，并把 t2 挤成 Waiting
+	enable(t, bus, "t1")
+	waitStatus(t, runs, "t1", domain.RunStatusRunning)
+	waitStatus(t, runs, "t2", domain.RunStatusWaiting)
 }
 
 // TestResearchFinished 验证模型完成研究后 Running -> Finished，且 Task 失能。

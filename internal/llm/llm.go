@@ -34,11 +34,14 @@ type Config struct {
 //
 // Provider 支持：
 //   - "mock"：进程内确定性实现，用于本地联调与测试，无需密钥。
+//   - "mock-tool"：确定性实现，会发起一次 web_search 工具调用，用于验证 ReAct + 审批链路。
 //   - "openai"：OpenAI 兼容接口，可指向 OpenAI / DeepSeek 等兼容服务。
 func New(ctx context.Context, cfg Config) (ChatModel, error) {
 	switch cfg.Provider {
 	case "mock":
 		return mock.New(), nil
+	case "mock-tool":
+		return mock.NewToolModel(), nil
 	case "openai":
 		return newOpenAI(ctx, cfg)
 	default:

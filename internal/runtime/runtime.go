@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
@@ -33,6 +34,7 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/supervisor"
+	agenttool "github.com/YinLanShan/go-deepresearch-agent.git/internal/tool"
 )
 
 // delivery 是一次入队投递：env 为事件，h 为握手（异步投递时 h 为 nil）。
@@ -48,6 +50,11 @@ type Runtime struct {
 	states researchstate.Store
 	model  model.BaseChatModel
 	bus    *event.Bus
+
+	// tools 是 Supervisor（ReAct Agent）可用的工具（MCP / 内置），可为 nil。
+	tools *agenttool.Registry
+	// checkPoints 用于中断时的 Checkpoint 序列化（序列化与恢复语义由 Eino ADK 负责）。
+	checkPoints adk.CheckPointStore
 
 	// supervisors 维护每个运行中 Task 的 SupervisorLoop（按 TaskID）。
 	mu          sync.Mutex
@@ -94,6 +101,33 @@ func New(runs storage.RunTaskStore, tasks storage.TaskStore, states researchstat
 // Start 启动事件处理 goroutine。
 func (r *Runtime) Start() {
 	go r.run()
+}
+
+// SetTools 注入工具注册表与 Checkpoint 存储（供 Supervisor 作为 ReAct Agent 使用）。
+// 应在 Start 之前调用。
+func (r *Runtime) SetTools(reg *agenttool.Registry, checkPoints adk.CheckPointStore) {
+	r.tools = reg
+	r.checkPoints = checkPoints
+}
+
+// Approve 提交一次工具审批决定，触发对应 Task 的 SupervisorLoop 走 Eino 恢复流程。
+func (r *Runtime) Approve(_ context.Context, sessionID, interruptID string, approved bool, reason string) error {
+	r.mu.Lock()
+	var target *supervisor.Loop
+	for taskID, l := range r.supervisors {
+		_ = taskID
+		if l.SessionID() != sessionID || !l.HasPendingApproval() {
+			continue
+		}
+		target = l
+		break
+	}
+	r.mu.Unlock()
+
+	if target == nil {
+		return supervisor.ErrNoPendingApproval
+	}
+	return target.Approve(interruptID, approved, reason)
 }
 
 // Send 实现 event.EventSender：异步投递（队列满时返回错误，作为背压信号）。
@@ -322,8 +356,10 @@ func (r *Runtime) onRunTaskDelete(ctx context.Context, taskID string) error {
 	return nil
 }
 
-// disableOtherRunningSessions 关闭其它 Session 中处于 Running 的 RunTask，
-// 使其 Task 失能并置为 Paused，保证全局同一时间只有一个 RunTask 处于 Running。
+// disableOtherRunningSessions 保证全局同一时间只有一个 RunTask 处于 Running。
+//
+// 被挤掉的 Session 置为 Waiting（不是 Paused）：Waiting 表示"因其他研究会话占用而暂挂"，
+// Paused 只保留给用户主动暂停。
 func (r *Runtime) disableOtherRunningSessions(ctx context.Context, currentTaskID string) error {
 	runs, err := r.runs.List(ctx)
 	if err != nil {
@@ -336,15 +372,22 @@ func (r *Runtime) disableOtherRunningSessions(ctx context.Context, currentTaskID
 		if rt.Status != domain.RunStatusRunning {
 			continue
 		}
-		if err := r.globalStop(ctx, rt.TaskID, domain.RunStatusPaused); err != nil {
+		if err := r.globalStop(ctx, rt.TaskID, domain.RunStatusWaiting); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// globalStop 协作式全局中止：协商后停止 SupervisorLoop、关闭提交门控、
-// 置 RunTask 为目标状态、并失能对应 Task。
+// globalStop 协作式全局停止：协商后停止 SupervisorLoop、置 RunTask 为目标状态、失能 Task。
+//
+// 不同目标状态的处理差异（语义边界）：
+//   - Running -> Waiting：被其他会话挤掉，保留 Checkpoint 与待审批项，等待"继续"；
+//   - Running -> Paused ：用户主动暂停，同样保留现场，等待"继续"；
+//   - Running -> Stopped：任务终结（终态），作废待审批项、删除 Checkpoint，
+//     但保留 ResearchState 的全部内容（含 InterruptedContext）作为该节点的历史记录。
+//
+// 注意：Stopped 不关闭提交门控——属于本 Task 的迟到 Result 仍可正常提交。
 func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.RunStatus) error {
 	task, err := r.tasks.Get(ctx, taskID)
 	if err != nil {
@@ -359,11 +402,14 @@ func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.R
 		return err
 	}
 
-	// 停止 SupervisorLoop。
-	r.stopSupervisor(taskID)
-
-	// 关闭 ResearchState 提交门控。
-	_ = r.states.StopCommits(ctx, taskID)
+	if target == domain.RunStatusStopped {
+		// 终态：作废待审批项并清理 Checkpoint，任务不再可恢复。
+		r.terminateSupervisor(taskID)
+	} else {
+		// 暂停/等待：保留现场，仅停止运行。
+		r.stopSupervisor(taskID)
+		_ = r.states.StopCommits(ctx, taskID)
+	}
 
 	// 置 RunTask 状态。
 	rt.Status = target
@@ -378,9 +424,49 @@ func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.R
 	return r.tasks.Update(ctx, task)
 }
 
+// terminateSupervisor 终止某个 Task 的 SupervisorLoop：作废待审批项、删除 Checkpoint、停止 Loop。
+//
+// 这是"中止"的专属路径，与 stopSupervisor（暂停/等待）区分开。
+func (r *Runtime) terminateSupervisor(taskID string) {
+	// 先取出 Loop，作废其待审批项，再删除对应 Checkpoint。
+	r.mu.Lock()
+	l, ok := r.supervisors[taskID]
+	if ok {
+		delete(r.supervisors, taskID)
+	}
+	r.mu.Unlock()
+
+	if ok {
+		l.CancelPendingApproval("任务已中止")
+	}
+	r.deleteCheckpoint(taskID)
+	if ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = l.Shutdown(ctx)
+	}
+}
+
+// deleteCheckpoint 删除某个 Task 的 Checkpoint（若存储实现支持删除）。
+func (r *Runtime) deleteCheckpoint(taskID string) {
+	deleter, ok := r.checkPoints.(adk.CheckPointDeleter)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := deleter.Delete(ctx, "task:"+taskID); err != nil {
+		slog.Warn("delete checkpoint failed", "task", taskID, "err", err)
+	}
+}
+
 // initResearchRun 在 RunTask 创建后初始化该 Task 的 ResearchState（按 TaskID），
 // 若该 Session 已有上一份研究状态，则把其结论作为 RelatedFinding 继承，
 // 并启动该 Task 的 SupervisorLoop。
+//
+// 注意：Task 的 Title/Description 只作为会话标识，不作为研究需求写入上下文；
+// ResearchState 的 Requirement 由用户实际发送的第一条消息决定
+// （见 states.SetRequirementIfEmpty）。
 func (r *Runtime) initResearchRun(ctx context.Context, taskID, runTaskID string) error {
 	task, err := r.tasks.Get(ctx, taskID)
 	if err != nil {
@@ -388,16 +474,17 @@ func (r *Runtime) initResearchRun(ctx context.Context, taskID, runTaskID string)
 	}
 	sessionID := task.SessionID
 
-	// 继承上一研究任务的结论作为 RelatedFinding。
-	var related []researchstate.RelatedFinding
-	if prev, err := r.states.GetLatestBySession(ctx, sessionID); err == nil {
-		related = append(related, researchstate.RelatedFinding{
-			SessionID: prev.SessionID,
-			Summary:   prev.Summary(),
-		})
+	// 把该 Session 下所有已存在的研究节点完整快照为前序节点（按序号升序），
+	// 让新节点在上下文里能看到历史节点的需求、证据、结论与被中断原文。
+	var related []researchstate.RelatedNode
+	if prevs, err := r.states.ListBySession(ctx, sessionID); err == nil {
+		for _, prev := range prevs {
+			related = append(related, prev.Snapshot())
+		}
 	}
 
-	st := researchstate.NewWithRelated(ids.New(), taskID, sessionID, taskRequirement(task), related)
+	// 序号 = 已有节点数 + 1；需求初始为空，由首条用户消息填充。
+	st := researchstate.NewWithRelated(ids.New(), taskID, sessionID, len(related)+1, "", related)
 	if err := r.states.Create(ctx, st); err != nil {
 		return err
 	}
@@ -413,12 +500,15 @@ func (r *Runtime) ensureSupervisor(taskID, sessionID, runTaskID string) {
 		return
 	}
 	l := supervisor.New(supervisor.Config{
-		Model:     r.model,
-		States:    r.states,
-		SessionID: sessionID,
-		TaskID:    taskID,
-		RunTaskID: runTaskID,
-		Bus:       r.bus,
+		Model:       r.model,
+		States:      r.states,
+		SessionID:   sessionID,
+		TaskID:      taskID,
+		RunTaskID:   runTaskID,
+		Bus:         r.bus,
+		Tools:       r.tools.Tools(),
+		Policy:      r.tools.Policy(),
+		CheckPoints: r.checkPoints,
 	})
 	l.Start()
 	r.supervisors[taskID] = l
@@ -469,12 +559,4 @@ func (r *Runtime) coordinate(ctx context.Context, taskID, runTaskID, action stri
 		},
 		Data: event.CoordinationRequestedEvent{TaskID: taskID, RunTaskID: runTaskID, Action: action},
 	})
-}
-
-// taskRequirement 返回 Task 的第一条研究需求内容。
-func taskRequirement(t *domain.Task) string {
-	if t.Description != "" {
-		return t.Description
-	}
-	return t.Title
 }

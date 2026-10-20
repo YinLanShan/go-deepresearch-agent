@@ -52,6 +52,20 @@ func (s *ConfigService) Get() ModelConfigView {
 	}
 }
 
+// isSupportedProvider 判断模型提供方是否受支持。
+//
+//   - mock：进程内确定性模型，回显用户消息；
+//   - mock-tool：进程内确定性模型，会发起一次 web_search 工具调用（用于验证 ReAct + 审批）；
+//   - openai：OpenAI 兼容接口。
+func isSupportedProvider(provider string) bool {
+	switch provider {
+	case "mock", "mock-tool", "openai":
+		return true
+	default:
+		return false
+	}
+}
+
 // Update 校验并热切换模型配置。
 //
 // APIKey 留空时沿用当前密钥，避免前端每次都回传脱敏值导致密钥被覆盖。
@@ -60,7 +74,7 @@ func (s *ConfigService) Update(ctx context.Context, in ModelConfigUpdate) error 
 	if provider == "" {
 		return fault.New(fault.CodeInvalidInput, fault.LayerRuntime, "provider is required")
 	}
-	if provider != "mock" && provider != "openai" {
+	if !isSupportedProvider(provider) {
 		return fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
 			fmt.Sprintf("unsupported provider %q", provider))
 	}

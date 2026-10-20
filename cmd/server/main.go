@@ -5,14 +5,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/api"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/checkpoint"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/config"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm"
@@ -20,6 +24,7 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage/memory"
+	agenttool "github.com/YinLanShan/go-deepresearch-agent.git/internal/tool"
 )
 
 func main() {
@@ -47,9 +52,13 @@ func main() {
 	// Runtime 发起生命周期协商时，由它们回执"同意"；后续替换为真实实现。
 	runtime.RegisterMockCoordinators(bus, "supervisor", "scheduler", "workpool")
 
+	// 装配工具：MCP Server（可选）+ 内置演示搜索工具，以及中断用 Checkpoint 存储。
+	toolRegistry, checkPointStore := setupTools(cfg)
+
 	// Runtime 是维护 RunTask 生命周期的独立实体，单独注册并启动。
 	// 它在 RunTask 启动时初始化 ResearchState 与 SupervisorLoop。
 	rt := runtime.New(runTaskStore, taskStore, stateStore, model, bus)
+	rt.SetTools(toolRegistry, checkPointStore)
 	rt.Start()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -57,11 +66,15 @@ func main() {
 		_ = rt.Shutdown(ctx)
 	}()
 
+	runService := service.NewRunService(taskStore, runTaskStore, stateStore, bus)
+	// 审批决定交给 Runtime → SupervisorLoop，由 Eino 的 Resume 流程恢复执行。
+	runService.SetApprover(rt)
+
 	a := api.New(
 		service.NewChatService(model),
 		memory.NewSessionStore(),
 		taskStore,
-		service.NewRunService(taskStore, runTaskStore, stateStore, bus),
+		runService,
 		service.NewConfigService(model),
 	)
 
@@ -93,6 +106,39 @@ func setupLog(level string) {
 		l = slog.LevelInfo
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l})))
+}
+
+// setupTools 装配 Supervisor 可用的工具与中断用 Checkpoint 存储。
+//
+// MCP Server 通过 DRA_MCP_SERVERS 配置（JSON 数组）；未配置时退回内置演示搜索工具，
+// 以便在没有外部 MCP Server 的情况下也能验证 ReAct 工具调用、审批与前端展示链路。
+//
+// 说明：审批不再使用阻塞等待，而是由中间件调用 tool.StatefulInterrupt 暂停本轮，
+// ADK 负责把执行状态序列化进 Checkpoint；用户决定后经 Resume 恢复。
+func setupTools(cfg config.Config) (*agenttool.Registry, adk.CheckPointStore) {
+	var servers []agenttool.MCPServerConfig
+	if strings.TrimSpace(cfg.Tool.MCPServersJSON) != "" {
+		if err := json.Unmarshal([]byte(cfg.Tool.MCPServersJSON), &servers); err != nil {
+			slog.Error("parse DRA_MCP_SERVERS failed", "err", err)
+		}
+	}
+
+	var requireApproval []string
+	for _, p := range strings.Split(cfg.Tool.RequireApproval, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			requireApproval = append(requireApproval, p)
+		}
+	}
+
+	reg := agenttool.NewRegistry(context.Background(), agenttool.RegistryConfig{
+		MCPServers:          servers,
+		EnableBuiltinSearch: cfg.Tool.EnableBuiltinSearch,
+		RequireApproval:     requireApproval,
+	})
+
+	slog.Info("tools ready", "count", reg.Len(), "names", reg.Names(),
+		"require_approval", requireApproval, "mcp_servers", len(servers))
+	return reg, checkpoint.NewMemoryStore()
 }
 
 // corsMiddleware 为跨源请求设置 CORS 头，并放行预检请求。

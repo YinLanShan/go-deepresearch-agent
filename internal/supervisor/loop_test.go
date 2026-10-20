@@ -44,7 +44,7 @@ func shutdownLoop(t *testing.T, loop *Loop) {
 func TestMultiTurnClosedLoop(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", "研究某框架的架构")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "研究某框架的架构")); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestMultiTurnClosedLoop(t *testing.T) {
 func TestOtherTaskMessagesIgnored(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", "需求")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "需求")); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
@@ -128,11 +128,14 @@ func waitFindings(t *testing.T, states researchstate.Store, taskID string, want 
 
 // TestPreemptCapturesInterruptedContext 验证抢占：
 // 模型慢速流式输出时，新 Commit 事件抢占当前轮次，中断前产生的上下文被保存，
-// 抢占后开启重新规划轮次，最终 Finding 由"被中断上下文 + 模型回答"构成并 Commit。
+// 抢占后开启重新规划轮次，最终 Commit 一条 Finding。
+//
+// 注意：InterruptedContext 独立累积，不会被 Commit 消费或清空，
+// 它作为独立分区持续进入上下文构建。
 func TestPreemptCapturesInterruptedContext(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", "研究需求")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "研究需求")); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
@@ -166,8 +169,16 @@ func TestPreemptCapturesInterruptedContext(t *testing.T) {
 	if !strings.Contains(st.Findings[0].Content, "mock reply to:") {
 		t.Fatalf("finding should contain model answer, got %q", st.Findings[0].Content)
 	}
-	// 中断上下文已合并进 Finding，Commit 后应被清空
-	if st.InterruptedContext != "" {
-		t.Fatalf("interrupted context should be cleared after commit, got %q", st.InterruptedContext)
+	if !strings.Contains(st.Findings[0].Content, "replan") &&
+		!strings.Contains(st.Findings[0].Content, "重新") &&
+		!strings.Contains(st.Findings[0].Content, "结合最新上下文") {
+		t.Logf("finding = %q", st.Findings[0].Content)
+	}
+	// 中断上下文不被 Commit 消费，应持续保留
+	if st.InterruptedContext == "" {
+		t.Fatal("interrupted context should be preserved (not consumed by commit)")
+	}
+	if !strings.Contains(st.BuildContext(), st.InterruptedContext) {
+		t.Fatal("interrupted context should appear in built context")
 	}
 }

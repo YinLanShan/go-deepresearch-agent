@@ -42,6 +42,14 @@ const (
 	EventModelOutputDone = "model_output_done"
 	// EventResearchFinished 表示研究任务已完成（模型给出最终结论）。
 	EventResearchFinished = "research_finished"
+	// EventToolCall 表示 Supervisor 发起了一次工具调用。
+	EventToolCall = "tool_call"
+	// EventToolResult 表示一次工具调用返回了结果。
+	EventToolResult = "tool_result"
+	// EventToolApprovalRequired 表示某次工具调用需要人工审批后才能执行。
+	EventToolApprovalRequired = "tool_approval_required"
+	// EventToolApprovalCancelled 表示待审批的工具调用因任务中止而作废。
+	EventToolApprovalCancelled = "tool_approval_cancelled"
 )
 
 // 协调动作（Runtime 发起的生命周期协商）。
@@ -315,3 +323,56 @@ type ResearchFinishedEvent struct {
 
 // EventType 实现 Event 接口。
 func (ResearchFinishedEvent) EventType() string { return EventResearchFinished }
+
+// ToolCallEvent 表示 Supervisor 发起了一次工具调用。
+type ToolCallEvent struct {
+	SessionID string
+	TaskID    string
+	RunTaskID string
+	ToolName  string
+	Arguments string
+}
+
+// EventType 实现 Event 接口。
+func (ToolCallEvent) EventType() string { return EventToolCall }
+
+// ToolResultEvent 表示一次工具调用返回了结果。
+type ToolResultEvent struct {
+	SessionID string
+	TaskID    string
+	RunTaskID string
+	ToolName  string
+	Output    string
+	Err       string
+}
+
+// EventType 实现 Event 接口。
+func (ToolResultEvent) EventType() string { return EventToolResult }
+
+// ToolApprovalRequiredEvent 表示某次工具调用需要人工审批。
+// 前端据此展示审批卡片；用户决定后经 API 提交，工具调用方可继续。
+type ToolApprovalRequiredEvent struct {
+	SessionID   string
+	TaskID      string
+	RunTaskID   string
+	ApprovalID  string
+	ToolName    string
+	Arguments   string
+	Description string
+}
+
+// EventType 实现 Event 接口。
+func (ToolApprovalRequiredEvent) EventType() string { return EventToolApprovalRequired }
+
+// ToolApprovalCancelledEvent 表示待审批的工具调用已作废（任务被中止）。
+// 前端据此把审批卡片置为"已失效"，避免用户误批。
+type ToolApprovalCancelledEvent struct {
+	SessionID  string
+	TaskID     string
+	RunTaskID  string
+	ApprovalID string
+	Reason     string
+}
+
+// EventType 实现 Event 接口。
+func (ToolApprovalCancelledEvent) EventType() string { return EventToolApprovalCancelled }
