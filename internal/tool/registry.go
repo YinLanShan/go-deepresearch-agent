@@ -52,6 +52,9 @@ type RegistryConfig struct {
 type Registry struct {
 	raw    []tool.BaseTool
 	policy Policy
+
+	// sessions 持有已连接的 MCP 会话，用于释放（关闭 stdio 子进程）。
+	sessions []*MCPTools
 }
 
 // NewRegistry 按配置装配工具。单个 MCP Server 连接失败只记录告警，不阻断启动。
@@ -59,13 +62,14 @@ func NewRegistry(ctx context.Context, cfg RegistryConfig) *Registry {
 	r := &Registry{policy: NewPolicy(cfg.RequireApproval)}
 
 	for _, server := range cfg.MCPServers {
-		tools, err := LoadMCP(ctx, server)
+		res, err := LoadMCP(ctx, server)
 		if err != nil {
 			slog.Warn("load mcp tools failed", "server", server.Name, "err", err)
 			continue
 		}
-		slog.Info("mcp tools loaded", "server", server.Name, "count", len(tools))
-		r.raw = append(r.raw, tools...)
+		slog.Info("mcp tools loaded", "server", server.Name, "count", len(res.Tools))
+		r.raw = append(r.raw, res.Tools...)
+		r.sessions = append(r.sessions, res)
 	}
 
 	if cfg.EnableBuiltinSearch {
@@ -76,6 +80,21 @@ func NewRegistry(ctx context.Context, cfg RegistryConfig) *Registry {
 		}
 	}
 	return r
+}
+
+// Close 释放全部 MCP 会话（关闭 stdio 子进程等）。
+func (r *Registry) Close() error {
+	if r == nil {
+		return nil
+	}
+	var firstErr error
+	for _, s := range r.sessions {
+		if err := s.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	r.sessions = nil
+	return firstErr
 }
 
 // Tools 返回原始工具列表（未包装），供注入 ToolsNodeConfig。

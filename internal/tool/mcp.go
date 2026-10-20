@@ -34,13 +34,30 @@ type MCPServerConfig struct {
 	ToolNameList []string `json:"tool_name_list"`
 }
 
+// MCPTools 是连接 MCP Server 的结果，持有会话以便释放（关闭子进程）。
+type MCPTools struct {
+	// Tools 是从该 Server 加载的工具。
+	Tools []tool.BaseTool
+
+	session *mcp.ClientSession
+}
+
+// Close 关闭 MCP 会话；对 stdio 传输会终止其子进程。
+func (m *MCPTools) Close() error {
+	if m == nil || m.session == nil {
+		return nil
+	}
+	return m.session.Close()
+}
+
 // connectTimeout 是连接 MCP Server 的超时时间。
 const connectTimeout = 20 * time.Second
 
 // LoadMCP 连接一个 MCP Server 并返回其工具列表。
 //
 // 复用官方 go-sdk 客户端与 eino-ext 的 officialmcp 组件，不自行实现 MCP 协议。
-func LoadMCP(ctx context.Context, cfg MCPServerConfig) ([]tool.BaseTool, error) {
+// 调用方应在不再需要工具时调用返回值的 Close 释放会话。
+func LoadMCP(ctx context.Context, cfg MCPServerConfig) (*MCPTools, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 
@@ -83,9 +100,10 @@ func LoadMCP(ctx context.Context, cfg MCPServerConfig) ([]tool.BaseTool, error) 
 		ToolNameList: cfg.ToolNameList,
 	})
 	if err != nil {
+		_ = session.Close()
 		return nil, fmt.Errorf("mcp server %q: list tools failed: %w", cfg.Name, err)
 	}
-	return tools, nil
+	return &MCPTools{Tools: tools, session: session}, nil
 }
 
 // ─── 内置工具（无 MCP Server 时的可运行兜底） ────────────────────────────────

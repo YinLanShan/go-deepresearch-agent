@@ -83,13 +83,47 @@ if isTarget && hasData && data.Approved {
    eino 未提供内存实现；项目实现于 `internal/checkpoint`（另加 `Delete` 以满足
    `CheckPointDeleter`）。这里只做字节存取，**序列化与恢复语义完全由 ADK 负责**。
 
-## 3. 已验证结论
+## 3. 真实 MCP 链路（已实测）
 
-- 中断后 Checkpoint 约 25KB，`HasRunnerState=true`，`CanceledItems=1`（被中断的输入项）。
-- `Approve` → 新 TurnLoop `Run()` → `GenResume` → 工具真正执行 → 提交 Finding。
-- HTTP 全链路：`message → approval_required →（批准）→ tool_call → tool_result → message`。
+服务端用官方 `modelcontextprotocol/go-sdk` 实现（`internal/tool/mcptestserver`），
+客户端用 `officialmcp.GetTools`，两端都是真实协议，非 mock。
+
+### 3.1 服务端最小写法（官方 API）
+
+```go
+s := mcp.NewServer(&mcp.Implementation{Name: "srv", Version: "0.1.0"}, nil)
+mcp.AddTool(s, &mcp.Tool{Name: "echo", Description: "..."},
+    func(ctx context.Context, req *mcp.CallToolRequest, in Args) (*mcp.CallToolResult, any, error) {
+        return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "..."}}}, nil, nil
+    })
+s.Run(ctx, &mcp.StdioTransport{})                                   // stdio
+mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil) // http
+```
+
+- 参数/返回结构由 `json` + `jsonschema` tag 自动生成 schema。
+- **stdio 模式禁止向 stdout 打印任何内容**，否则污染协议流。
+
+### 3.2 客户端要点
+
+- `LoadMCP` 返回 `*MCPTools`，内部持有 `*mcp.ClientSession`；
+  必须调用 `Close()`，否则 stdio 子进程不退出（Windows 下临时目录无法删除）。
+- 工具调用结果形如 `{"content":[{"type":"text","text":"..."}],"isError":false}`，
+  由 `officialmcp` 序列化为 JSON 字符串返回。
+- 工具自身报错时返回 error，**错误信息里已包含服务端返回体**。
+
+### 3.3 已实测结论
+
+| 场景 | 结果 |
+|---|---|
+| stdio 子进程连接 | 发现 4 个工具，`echo`/`add` 调用成功 |
+| Streamable HTTP 连接 | 同上 |
+| `ToolNameList` 过滤 | 只加载指定工具 |
+| 工具报错 | `SafeToolMiddleware` 转为 `[tool error] ...`，ReAct 继续产出结论 |
+| 审批 + 恢复 | `message → approval_required →（批准）→ tool_call → tool_result → message` |
 
 ## 4. 尚未确认
 
 - 中断与 Stop/抢占并发时的优先级细节。
 - Checkpoint 的持久化介质（当前为进程内，多实例部署需换 Redis/DB 实现同一接口）。
+- MCP 的 OAuth / 鉴权传输（`oauthex`）未接入。
+

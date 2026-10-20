@@ -40,25 +40,88 @@ var (
 
 // ToolModel 是用于验证 ReAct 工具调用链路的确定性模型。
 //
-// 行为：输入中没有工具结果时，先发起一次 web_search 工具调用；
+// 行为：输入中没有工具结果时，先发起一次工具调用；
 // 已看到工具结果后，输出最终研究结论。
+//
+// 工具选择策略：优先调用 PreferTools 中第一个"模型实际可用"的工具，
+// 这样换成真实 MCP Server 时也能直接复用（MCP 工具名与内置不同）。
 type ToolModel struct {
-	// ToolName 是要调用的工具名，默认 web_search。
+	// ToolName 是指定的工具名；为空则按 PreferTools 从可用工具中挑选。
 	ToolName string
-	// Arguments 是工具调用参数（JSON），默认 {"query":"框架执行模型"}。
+	// PreferTools 是按优先级排列的候选工具名。
+	PreferTools []string
+	// Arguments 是工具调用参数（JSON）；默认 {"query":"框架执行模型"}。
 	Arguments string
 }
+
+// defaultPreferTools 是默认的工具优先级列表：
+// 先试内置 web_search，再试 MCP 测试服务器的 echo/add。
+var defaultPreferTools = []string{"web_search", "echo", "add"}
 
 // NewToolModel 构造一个会发起工具调用的模型。
 func NewToolModel() *ToolModel {
 	return &ToolModel{
-		ToolName:  "web_search",
-		Arguments: `{"query":"框架执行模型"}`,
+		PreferTools: defaultPreferTools,
+		Arguments:   `{"query":"框架执行模型"}`,
+	}
+}
+
+// selectTool 从模型可见的工具信息中挑出要调用的工具。
+//
+// available 为空（模型未收到工具信息）时退回默认首选名，
+// 以便在没有工具信息的纯单测场景下仍能构造确定的 ToolCall。
+func (m *ToolModel) selectTool(available []*schema.ToolInfo) (name, args string) {
+	args = m.Arguments
+	if args == "" {
+		args = `{"query":"框架执行模型"}`
+	}
+	if m.ToolName != "" {
+		return m.ToolName, args
+	}
+
+	// 按优先列表挑选实际可用的工具。
+	for _, want := range m.PreferTools {
+		for _, info := range available {
+			if info != nil && info.Name == want {
+				return want, argsFor(want, args)
+			}
+		}
+	}
+
+	// 优先列表都没命中：用模型实际拿到的第一个工具。
+	for _, info := range available {
+		if info != nil && info.Name != "" {
+			return info.Name, argsFor(info.Name, args)
+		}
+	}
+
+	return "web_search", args
+}
+
+// argsFor 按工具名给出合理的默认参数（不同工具的入参 schema 不同）。
+func argsFor(toolName, fallback string) string {
+	switch toolName {
+	case "echo":
+		return `{"text":"hello from mock model"}`
+	case "add":
+		return `{"a":17,"b":25}`
+	default:
+		return fallback
 	}
 }
 
 // Generate 首次发起工具调用，看到工具结果后输出最终回答。
-func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	var lastToolResult string
+	for _, msg := range input {
+		if msg != nil && msg.Role == schema.Tool {
+			lastToolResult = msg.Content
+		}
+	}
+	if lastToolResult != "" {
+		return schema.AssistantMessage(
+			"根据检索结果，可以得出结论："+lastToolResult, nil), nil
+	}
 	for _, msg := range input {
 		if msg != nil && msg.Role == schema.Tool {
 			return schema.AssistantMessage(
@@ -66,13 +129,19 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, _ ...mo
 		}
 	}
 
+	cfg := model.GetCommonOptions(&model.Options{}, opts...)
+	var available []*schema.ToolInfo
+	if cfg != nil {
+		available = cfg.Tools
+	}
+	name, args := m.selectTool(available)
 	msg := schema.AssistantMessage("我需要先检索相关资料。", nil)
 	msg.ToolCalls = []schema.ToolCall{{
 		ID:   "call-1",
 		Type: "function",
 		Function: schema.FunctionCall{
-			Name:      m.ToolName,
-			Arguments: m.Arguments,
+			Name:      name,
+			Arguments: args,
 		},
 	}}
 	return msg, nil

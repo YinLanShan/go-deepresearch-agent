@@ -196,6 +196,37 @@ Supervisor 是 ReAct Agent。工具在 `prepareAgent` 时注入 `ChatModelAgentC
 ]
 ```
 
+### 本地真实 MCP 测试
+
+仓库自带一个可运行的 MCP Server（`cmd/mcptestserver`，基于官方 Go SDK 实现服务端），
+提供 `echo` / `add` / `fail_tool` / `slow_task` 四个工具，用于无需第三方依赖的真实链路验证。
+
+```powershell
+go build -o bin\mcptestserver.exe ./cmd/mcptestserver
+
+# 方式一：HTTP（独立进程）
+.\bin\mcptestserver.exe -transport http -addr 127.0.0.1:18080
+$env:DRA_MCP_SERVERS = '[{"name":"test","transport":"http","url":"http://127.0.0.1:18080"}]'
+
+# 方式二：stdio（由 Agent 拉起子进程，更接近实际 MCP 部署）
+$env:DRA_MCP_SERVERS = '[{"name":"test","transport":"stdio","command":"D:\\path\\bin\\mcptestserver.exe"}]'
+
+$env:DRA_MODEL_PROVIDER   = "mock-tool"   # 确定性模型，会调用模型实际可见的工具
+$env:DRA_ENABLE_BUILTIN_SEARCH = "false"  # 只用真实 MCP 工具
+$env:DRA_TOOL_REQUIRE_APPROVAL = "*"
+.\bin\server.exe
+```
+
+启动日志应出现 `mcp tools loaded server=test server=... count=4` 与
+`tools ready count=4 names="[add echo fail_tool slow_task]"`。
+
+自动化的真实 MCP 集成测试（会编译并拉起真实服务器子进程）：
+
+```powershell
+go test -count=1 -v ./internal/tool/          # stdio + http + 错误路径 + 注册表
+go test -count=1 ./... -short                 # 跳过 MCP 集成测试，仅跑快测
+```
+
 **治理方式：全部用中间件注入**（参考 `chatwitheino/cmd/ch05`、`ch10`）：
 
 | 中间件 | 职责 |

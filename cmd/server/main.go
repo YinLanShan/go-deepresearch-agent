@@ -54,6 +54,8 @@ func main() {
 
 	// 装配工具：MCP Server（可选）+ 内置演示搜索工具，以及中断用 Checkpoint 存储。
 	toolRegistry, checkPointStore := setupTools(cfg)
+	// 退出时释放 MCP 会话（关闭 stdio 子进程）。
+	defer func() { _ = toolRegistry.Close() }()
 
 	// Runtime 是维护 RunTask 生命周期的独立实体，单独注册并启动。
 	// 它在 RunTask 启动时初始化 ResearchState 与 SupervisorLoop。

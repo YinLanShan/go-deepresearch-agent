@@ -7,6 +7,9 @@
 # Hertz 静态文件缓存
 *.hertz.gz
 
+# 临时提交信息文件
+commit_msg*.txt
+
 # IDE
 .idea/
 .vscode/
