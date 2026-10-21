@@ -34,32 +34,50 @@ type MCPServerConfig struct {
 	ToolNameList []string `json:"tool_name_list"`
 }
 
-// MCPTools 是连接 MCP Server 的结果，持有会话以便释放（关闭子进程）。
+// MCPTools 是连接 MCP Server 的结果，持有会话以便释放（关闭子进程 / 断开 HTTP 长连接）。
 type MCPTools struct {
 	// Tools 是从该 Server 加载的工具。
 	Tools []tool.BaseTool
 
 	session *mcp.ClientSession
+	// cancel 结束会话生命周期上下文。
+	cancel context.CancelFunc
 }
 
-// Close 关闭 MCP 会话；对 stdio 传输会终止其子进程。
+// Close 关闭 MCP 会话；对 stdio 传输会终止其子进程，
+// 对 Streamable HTTP 会断开长连接（hanging GET）并停止重连。
 func (m *MCPTools) Close() error {
-	if m == nil || m.session == nil {
+	if m == nil {
 		return nil
 	}
-	return m.session.Close()
+	var err error
+	if m.session != nil {
+		err = m.session.Close()
+	}
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	return err
 }
 
-// connectTimeout 是连接 MCP Server 的超时时间。
+// connectTimeout 是 MCP 握手（initialize + tools/list）的超时时间。
 const connectTimeout = 20 * time.Second
 
 // LoadMCP 连接一个 MCP Server 并返回其工具列表。
 //
 // 复用官方 go-sdk 客户端与 eino-ext 的 officialmcp 组件，不自行实现 MCP 协议。
 // 调用方应在不再需要工具时调用返回值的 Close 释放会话。
+//
+// 重要：会话必须绑定到"比 LoadMCP 更长的上下文"。
+// Streamable HTTP 传输会保持一条 hanging GET 长连接用于接收服务端通知，
+// 它继承 Connect 时传入的 ctx；若该 ctx 随 LoadMCP 返回而 cancel，
+// 长连接会断开，后续 tools/call 将报
+// "client is closing ... failed to reconnect ... context canceled"。
+// 因此这里用 context.WithoutCancel 派生会话上下文，仅在 Close 时取消。
 func LoadMCP(ctx context.Context, cfg MCPServerConfig) (*MCPTools, error) {
-	connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
-	defer cancel()
+	// 会话级上下文：不随调用方 ctx 取消，由 Close 负责结束。
+	sessionCtx, cancelSession := context.WithCancel(context.WithoutCancel(ctx))
 
 	client := mcp.NewClient(&mcp.Implementation{
 		Name:    "deepresearch-agent",
@@ -70,11 +88,13 @@ func LoadMCP(ctx context.Context, cfg MCPServerConfig) (*MCPTools, error) {
 	switch cfg.Transport {
 	case "http", "streamable-http", "":
 		if cfg.URL == "" {
+			cancelSession()
 			return nil, fmt.Errorf("mcp server %q: url is required for http transport", cfg.Name)
 		}
 		transport = &mcp.StreamableClientTransport{Endpoint: cfg.URL}
 	case "stdio":
 		if cfg.Command == "" {
+			cancelSession()
 			return nil, fmt.Errorf("mcp server %q: command is required for stdio transport", cfg.Name)
 		}
 		cmd := exec.Command(cfg.Command, cfg.Args...)
@@ -87,23 +107,30 @@ func LoadMCP(ctx context.Context, cfg MCPServerConfig) (*MCPTools, error) {
 		}
 		transport = &mcp.CommandTransport{Command: cmd}
 	default:
+		cancelSession()
 		return nil, fmt.Errorf("mcp server %q: unsupported transport %q", cfg.Name, cfg.Transport)
 	}
 
-	session, err := client.Connect(connectCtx, transport, nil)
+	// 握手阶段单独限时：超时后取消会话上下文，避免长时间挂起。
+	handshakeTimer := time.AfterFunc(connectTimeout, cancelSession)
+	defer handshakeTimer.Stop()
+
+	session, err := client.Connect(sessionCtx, transport, nil)
 	if err != nil {
+		cancelSession()
 		return nil, fmt.Errorf("mcp server %q: connect failed: %w", cfg.Name, err)
 	}
 
-	tools, err := officialmcp.GetTools(connectCtx, &officialmcp.Config{
+	tools, err := officialmcp.GetTools(sessionCtx, &officialmcp.Config{
 		Cli:          session,
 		ToolNameList: cfg.ToolNameList,
 	})
 	if err != nil {
 		_ = session.Close()
+		cancelSession()
 		return nil, fmt.Errorf("mcp server %q: list tools failed: %w", cfg.Name, err)
 	}
-	return &MCPTools{Tools: tools, session: session}, nil
+	return &MCPTools{Tools: tools, session: session, cancel: cancelSession}, nil
 }
 
 // ─── 内置工具（无 MCP Server 时的可运行兜底） ────────────────────────────────

@@ -112,7 +112,9 @@
   #chat-container .body pre code { background: none; padding: 0; }
   #chat-container .body table { border-collapse: collapse; font-size: 0.8rem; margin: 8px 0; }
   #chat-container .body th, #chat-container .body td { border: 1px solid #e5e7eb; padding: 4px 8px; }
-  #chat-container .body:empty::after { content: "▍"; color: #93c5fd; animation: blink 1s steps(2) infinite; }
+  /* 光标只在"正在流式写入且有内容待续"的卡片上显示。
+     工具调用后模型若无输出，不创建空卡片，因此不会出现孤立光标与角色标签。 */
+  #chat-container .card[data-streaming="true"] .body:empty::after { content: "▍"; color: #93c5fd; animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
 
   #chat-container .card[data-role="You"] { margin-left: auto; background: #eff6ff; }
@@ -342,11 +344,13 @@
     <div class="field">
       <label for="cfg-baseurl">接口地址（Base URL）</label>
       <input id="cfg-baseurl" type="text" placeholder="https://api.deepseek.com（留空使用默认）"/>
+      <div class="help">留空即使用默认地址 https://api.deepseek.com</div>
     </div>
 
     <div class="field">
       <label for="cfg-model">模型名称</label>
-      <input id="cfg-model" type="text" placeholder="gpt-4o-mini / deepseek-chat"/>
+      <input id="cfg-model" type="text" placeholder="deepseek-chat（留空使用默认）"/>
+      <div class="help">留空即使用默认模型 deepseek-chat</div>
     </div>
 
     <div class="field">
@@ -386,6 +390,11 @@
 // ─── 基础状态 ────────────────────────────────────────────────────────────────
 const isFile = location.protocol === 'file:';
 const DEFAULT_BASE = isFile ? 'http://127.0.0.1:8080' : location.origin;
+
+// 模型配置的默认值：与后端 llm.DefaultBaseURL / DefaultModelName 保持一致。
+// 配置留空时前后端都会回退到这些值，避免"配置不全导致模型不可调用"。
+const DEFAULT_BASE_URL = 'https://api.deepseek.com';
+const DEFAULT_MODEL_NAME = 'deepseek-chat';
 
 const state = {
   base: localStorage.getItem('dra_base') || DEFAULT_BASE,
@@ -837,8 +846,14 @@ async function sendMessage() {
   $('stop-btn').style.display = 'inline-block';
   $('msg-input').disabled = true;
 
-  // 当前正在写入的 Supervisor 卡片；工具动作后需要新起一张。
-  let handle = addCard('Supervisor', '');
+  // 当前正在写入的 Supervisor 卡片：延迟创建。
+  // 工具调用后若模型没有输出文本，就不应留下空白卡片（会显示光标和角色标签）。
+  let handle = null;
+  const ensureHandle = () => {
+    if (!handle) handle = addCard('Supervisor', '');
+    return handle;
+  };
+  const resetHandle = () => { handle = null; };
   const ctrl = new AbortController();
   state.abort = ctrl;
 
@@ -859,12 +874,12 @@ async function sendMessage() {
       onEvent: (name, data) => {
         if (name === 'tool_call') {
           addToolCard('工具调用', JSON.parse(data));
-          handle = addCard('Supervisor', '');
+          resetHandle();
           return;
         }
         if (name === 'tool_result') {
           addToolCard('工具结果', JSON.parse(data));
-          handle = addCard('Supervisor', '');
+          resetHandle();
           return;
         }
         if (name === 'approval_required') {
@@ -890,15 +905,16 @@ async function sendMessage() {
           addCard('error', data, {raw: true});
           return;
         }
-        // 默认按模型输出处理
-        appendText(handle, data);
+        // 默认按模型输出处理：只在真的有文本时才创建卡片
+        if (data) appendText(ensureHandle(), data);
       },
     });
   } catch (err) {
     if (!ctrl.signal.aborted) {
-      handle.card.setAttribute('data-role', 'error');
-      handle.card.querySelector('.caption').textContent = 'error';
-      handle.body.textContent = '研究失败：' + err.message;
+      const h = ensureHandle();
+      h.card.setAttribute('data-role', 'error');
+      h.card.querySelector('.caption').textContent = 'error';
+      h.body.textContent = '研究失败：' + err.message;
     }
   } finally {
     state.streaming = false;
@@ -1050,8 +1066,9 @@ async function loadConfig() {
   try {
     const cfg = await api('GET', '/config');
     $('cfg-provider').value = cfg.provider || 'mock';
-    $('cfg-baseurl').value = cfg.base_url || '';
-    $('cfg-model').value = cfg.model_name || '';
+    // 留空时展示默认值（后端也会回退到同样的默认值，两边保持一致）
+    $('cfg-baseurl').value = cfg.base_url || DEFAULT_BASE_URL;
+    $('cfg-model').value = cfg.model_name || DEFAULT_MODEL_NAME;
     $('cfg-apikey-help').textContent = cfg.api_key_set
       ? `当前已设置密钥：${cfg.api_key_hint}（留空表示不修改）`
       : '当前未设置密钥。';
@@ -1069,14 +1086,26 @@ async function saveConfig() {
   $('cfg-save').disabled = true;
   cfgStatus('保存中…', false);
   try {
+    const provider = $('cfg-provider').value;
+    let baseURL = $('cfg-baseurl').value.trim();
+    let modelName = $('cfg-model').value.trim();
+    // 配置不全时回退默认值，保证模型始终可调用。
+    if (provider === 'openai') {
+      if (!baseURL) baseURL = DEFAULT_BASE_URL;
+      if (!modelName) modelName = DEFAULT_MODEL_NAME;
+      $('cfg-baseurl').value = baseURL;
+      $('cfg-model').value = modelName;
+    }
     const updated = await api('PUT', '/config', {
-      provider: $('cfg-provider').value,
-      base_url: $('cfg-baseurl').value.trim(),
+      provider,
+      base_url: baseURL,
       api_key: $('cfg-apikey').value.trim(),
-      model_name: $('cfg-model').value.trim(),
+      model_name: modelName,
     });
     cfgStatus('✓ 已保存并生效', false);
     $('cfg-apikey').value = '';
+    $('cfg-baseurl').value = updated.base_url || DEFAULT_BASE_URL;
+    $('cfg-model').value = updated.model_name || DEFAULT_MODEL_NAME;
     $('cfg-apikey-help').textContent = updated.api_key_set
       ? `当前已设置密钥：${updated.api_key_hint}`
       : '当前未设置密钥。';
@@ -1093,20 +1122,34 @@ function cfgStatus(text, isErr) {
   el.className = 'config-status ' + (isErr ? 'err' : 'ok');
 }
 
+// bindOverlayClose 绑定"点击遮罩关闭弹窗"。
+//
+// 不能用 click 事件：在弹窗内按下鼠标、拖到弹窗外再松开时，
+// click 的 target 会变成遮罩（共同祖先），导致弹窗意外关闭（选中文本时尤甚）。
+// 这里要求 mousedown 与 mouseup 都发生在遮罩自身上才关闭。
+function bindOverlayClose(overlayId, closeFn) {
+  const overlay = $(overlayId);
+  if (!overlay) return;
+  let downOnOverlay = false;
+  overlay.addEventListener('mousedown', (e) => {
+    downOnOverlay = (e.target === overlay);
+  });
+  overlay.addEventListener('mouseup', (e) => {
+    if (downOnOverlay && e.target === overlay) closeFn();
+    downOnOverlay = false;
+  });
+}
+
 // ─── 事件绑定 ────────────────────────────────────────────────────────────────
 $('new-session-btn').addEventListener('click', openNewModal);
 $('new-cancel').addEventListener('click', closeNewModal);
 $('new-create').addEventListener('click', createResearch);
-$('new-modal').addEventListener('click', (e) => {
-  if (e.target === $('new-modal')) closeNewModal();
-});
+bindOverlayClose('new-modal', closeNewModal);
 
 $('api-config-btn').addEventListener('click', openApiModal);
 $('cfg-cancel').addEventListener('click', closeApiModal);
 $('cfg-save').addEventListener('click', saveConfig);
-$('api-modal').addEventListener('click', (e) => {
-  if (e.target === $('api-modal')) closeApiModal();
-});
+bindOverlayClose('api-modal', closeApiModal);
 
 $('send-btn').addEventListener('click', sendMessage);
 $('stop-btn').addEventListener('click', stopResearch);

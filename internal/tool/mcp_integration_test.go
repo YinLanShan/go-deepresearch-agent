@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 
@@ -142,7 +143,10 @@ func TestLoadMCPStreamableHTTP(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(mcptestserver.Handler())
-	defer srv.Close()
+	// 注意顺序：t.Cleanup 是后进先出。
+	// Streamable HTTP 会保持一条 hanging GET 长连接，srv.Close() 会等待该连接结束；
+	// 因此必须先关闭 MCP 会话（res.Close），再关闭测试服务器。
+	t.Cleanup(srv.Close)
 
 	res, err := LoadMCP(context.Background(), MCPServerConfig{
 		Name:      "testserver-http",
@@ -164,6 +168,45 @@ func TestLoadMCPStreamableHTTP(t *testing.T) {
 		t.Fatalf("invoke echo over http: %v", err)
 	}
 	if !strings.Contains(out, "over-http") {
+		t.Fatalf("echo output = %q", out)
+	}
+}
+
+// TestMCPStreamableHTTPLongLived 验证 HTTP 会话不随 LoadMCP 返回而失效。
+//
+// 回归用例：Streamable HTTP 会保持一条 hanging GET 长连接，它继承 Connect 时的 ctx。
+// 早期实现用 context.WithTimeout + defer cancel，LoadMCP 返回即取消该 ctx，
+// 导致长连接断开、后续 tools/call 报
+// "client is closing ... failed to reconnect ... context canceled"。
+// 这里等到超过握手超时（20s）之后再调用工具，确认会话仍然可用。
+func TestMCPStreamableHTTPLongLived(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-lived MCP http test in short mode")
+	}
+
+	srv := httptest.NewServer(mcptestserver.Handler())
+	t.Cleanup(srv.Close) // 先注册，后执行：确保会话先关闭
+
+	res, err := LoadMCP(context.Background(), MCPServerConfig{
+		Name:      "testserver-http-ttl",
+		Transport: "http",
+		URL:       srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("LoadMCP http: %v", err)
+	}
+	t.Cleanup(func() { _ = res.Close() })
+
+	byName := toolNames(t, res.Tools)
+
+	// 超过 connectTimeout 后再调用，模拟"服务启动很久后才用到工具"的真实场景。
+	time.Sleep(connectTimeout + 2*time.Second)
+
+	out, err := invoke(t, byName["echo"], `{"text":"after-idle"}`)
+	if err != nil {
+		t.Fatalf("invoke echo after idle: %v", err)
+	}
+	if !strings.Contains(out, "after-idle") {
 		t.Fatalf("echo output = %q", out)
 	}
 }

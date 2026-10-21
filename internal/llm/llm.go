@@ -8,6 +8,7 @@ package llm
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cloudwego/eino/components/model"
 
@@ -30,6 +31,42 @@ type Config struct {
 	ModelName string
 }
 
+// openai 提供方在配置不全时使用的默认值。
+//
+// 目的是"配置不全不应导致模型不可用"：BaseURL / ModelName 留空时自动回退到默认值，
+// 前端也据此展示占位提示。
+const (
+	// DefaultBaseURL 是默认的 OpenAI 兼容接口地址（DeepSeek 兼容端点）。
+	DefaultBaseURL = "https://api.deepseek.com"
+	// DefaultModelName 是默认模型名。
+	DefaultModelName = "deepseek-chat"
+)
+
+// WithDefaults 为可留空字段填充默认值。
+//
+//   - Provider 留空 → mock（进程内确定性模型）；
+//   - openai 的 BaseURL 留空 → DefaultBaseURL；
+//   - openai 的 ModelName 留空 → DefaultModelName。
+func (c Config) WithDefaults() Config {
+	out := c
+	out.Provider = strings.TrimSpace(out.Provider)
+	out.BaseURL = strings.TrimSpace(out.BaseURL)
+	out.ModelName = strings.TrimSpace(out.ModelName)
+
+	if out.Provider == "" {
+		out.Provider = "mock"
+	}
+	if out.Provider == "openai" {
+		if out.BaseURL == "" {
+			out.BaseURL = DefaultBaseURL
+		}
+		if out.ModelName == "" {
+			out.ModelName = DefaultModelName
+		}
+	}
+	return out
+}
+
 // New 根据配置构造一个 ChatModel。
 //
 // Provider 支持：
@@ -37,6 +74,8 @@ type Config struct {
 //   - "mock-tool"：确定性实现，会发起一次 web_search 工具调用，用于验证 ReAct + 审批链路。
 //   - "openai"：OpenAI 兼容接口，可指向 OpenAI / DeepSeek 等兼容服务。
 func New(ctx context.Context, cfg Config) (ChatModel, error) {
+	cfg = cfg.WithDefaults()
+
 	switch cfg.Provider {
 	case "mock":
 		return mock.New(), nil

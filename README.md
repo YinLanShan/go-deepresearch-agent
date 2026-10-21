@@ -196,6 +196,12 @@ Supervisor 是 ReAct Agent。工具在 `prepareAgent` 时注入 `ChatModelAgentC
 ]
 ```
 
+> HTTP 传输注意：MCP 会话必须绑定到长生命周期上下文（项目用
+> `context.WithoutCancel` + `Close` 取消）。若让握手超时的 ctx 在 `LoadMCP` 返回时被取消，
+> Streamable HTTP 的 hanging GET 会断开，后续调用报
+> `client is closing ... failed to reconnect ... context canceled`。详见
+> [docs/framework-notes/eino-mcp-tool-approval.md](docs/framework-notes/eino-mcp-tool-approval.md) 3.2.1。
+
 ### 本地真实 MCP 测试
 
 仓库自带一个可运行的 MCP Server（`cmd/mcptestserver`，基于官方 Go SDK 实现服务端），
@@ -260,12 +266,18 @@ go test -count=1 ./... -short                 # 跳过 MCP 集成测试，仅跑
 - 左侧：研究会话列表（可删除），切换会话会加载该会话历史对话
 - 中间：卡片式聊天区，Supervisor 输出以 SSE 流式增量渲染（Markdown、自动滚动）；
   工具动作渲染为等宽紧凑卡片（工具调用 / 工具结果），审批请求渲染为「需要审批」卡片
-- 右侧：ResearchState 面板（需求 / 版本 / Finding / Result / 中断上下文 / RelatedFinding）
-- 头部：RunTask 状态徽章（研究中 / 已暂停 / 已中止 / 已完成），每 800ms 轮询刷新
+- 右侧：ResearchState 面板（需求 / 节点序号 / 版本 / Finding / Result / 中断上下文 / 前序节点）
+- 头部：RunTask 状态徽章（研究中 / 已暂停 / **等待中** / 已中止 / 已完成），每 800ms 轮询刷新
 - 底部：输入框 + 主按钮 + 中止。主按钮随状态切换：
   - `running` → 发送
-  - `paused` → **继续**（把 RunTask 由 paused 置回 running）
+  - `paused` / `waiting` → **继续**（切回运行，会把其他会话挤成 `waiting`）
   - `finished` / `stopped` → 发送（发送后自动新建 Task 与新 ResearchState）
+
+交互细节：
+- 只有真正产生文本时才创建 Supervisor 卡片；工具调用后模型若无输出，不会留下空白卡片
+  （因此也不会出现孤立的光标与角色标签）。
+- 「API 配置」弹窗点击遮罩关闭时，要求按下与松开都发生在遮罩上；
+  在弹窗内选中文本拖到弹窗外不会误关闭。
 
 使用方式（二选一）：
 
@@ -273,8 +285,17 @@ go test -count=1 ./... -short                 # 跳过 MCP 集成测试，仅跑
 2. **以文件方式打开**：浏览器打开 `web/index.html`（`file://`），
    在「API 配置 → 服务地址」填写 `http://127.0.0.1:8080`（服务端已开启 CORS）。
 
-「API 配置」支持设置服务地址、模型提供方（mock / openai）、Base URL、模型名称与 API Key；
-保存后立即生效。密钥留空表示沿用已保存的密钥，界面只展示脱敏提示。
+「API 配置」支持设置服务地址、模型提供方（mock / mock-tool / openai）、Base URL、
+模型名称与 API Key；保存后立即生效。密钥留空表示沿用已保存的密钥，界面只展示脱敏提示。
+
+**配置不全不会导致模型不可用**：
+
+| 字段 | 留空时的行为 |
+|---|---|
+| Base URL | 回退默认 `https://api.deepseek.com` |
+| 模型名称 | 回退默认 `deepseek-chat` |
+| 提供方未变 | 沿用当前已保存的 Base URL / 模型名（只改密钥不会清空自定义配置） |
+| 提供方切换 | 使用新提供方的默认值，避免沿用旧模型名导致接口拒绝 |
 
 用 curl.exe 时，把 JSON 写入文件（无 BOM 的 UTF-8）再发送，可避免引号/编码问题：
 

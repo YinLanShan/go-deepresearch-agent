@@ -42,7 +42,7 @@ func NewConfigService(m *llm.Swappable) *ConfigService {
 
 // Get 返回当前生效的模型配置视图。
 func (s *ConfigService) Get() ModelConfigView {
-	cfg := s.model.Config()
+	cfg := s.model.Config().WithDefaults()
 	return ModelConfigView{
 		Provider:   cfg.Provider,
 		BaseURL:    cfg.BaseURL,
@@ -89,17 +89,30 @@ func (s *ConfigService) Update(ctx context.Context, in ModelConfigUpdate) error 
 			"api_key is required for openai provider")
 	}
 
+	// BaseURL / ModelName 留空时的取值规则：
+	//   - 提供方未变：沿用当前值（避免只改密钥却把自定义地址/模型名清掉）；
+	//   - 提供方切换：不使用旧值，交给 WithDefaults 填充新提供方的默认值
+	//     （否则切到 openai 仍会带着旧模型名，导致接口拒绝请求）。
+	baseURL := strings.TrimSpace(in.BaseURL)
 	modelName := strings.TrimSpace(in.ModelName)
-	if modelName == "" {
-		modelName = cur.ModelName
+	if provider == cur.Provider {
+		if baseURL == "" {
+			baseURL = cur.BaseURL
+		}
+		if modelName == "" {
+			modelName = cur.ModelName
+		}
 	}
 
-	if err := s.model.Swap(ctx, llm.Config{
+	// 配置不全时回退到默认值，避免因 BaseURL / 模型名为空导致模型不可用。
+	next := llm.Config{
 		Provider:  provider,
-		BaseURL:   strings.TrimSpace(in.BaseURL),
+		BaseURL:   baseURL,
 		APIKey:    apiKey,
 		ModelName: modelName,
-	}); err != nil {
+	}.WithDefaults()
+
+	if err := s.model.Swap(ctx, next); err != nil {
 		return fault.Wrap(fault.CodeModelUnavailable, fault.LayerRuntime,
 			"apply model config failed", err)
 	}

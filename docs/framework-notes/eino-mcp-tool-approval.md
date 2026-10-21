@@ -111,12 +111,61 @@ mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil) 
   由 `officialmcp` 序列化为 JSON 字符串返回。
 - 工具自身报错时返回 error，**错误信息里已包含服务端返回体**。
 
+### 3.2.1 会话上下文不能随 Connect 返回而取消（重要）
+
+`StreamableClientTransport` 会保持一条 **hanging GET 长连接**用于接收服务端通知，
+它继承 `client.Connect(ctx, ...)` 传入的 ctx。
+
+错误写法：
+
+```go
+connectCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+defer cancel()                              // ← LoadMCP 返回即取消
+session, _ := client.Connect(connectCtx, transport, nil)
+```
+
+后果：长连接被杀，之后任何 `tools/call` 都会失败并触发重连，而重连用的 ctx 已取消：
+
+```
+failed to call official mcp tool: connection closed: calling "tools/call":
+client is closing: hanging GET: failed to reconnect (session ID: ...):
+connection failed after 5 attempts: ... context canceled
+```
+
+stdio 不受影响（无 hanging GET），所以该问题只在 HTTP 传输下暴露。
+
+正确写法：会话绑定到"比函数更长"的上下文，仅由 `Close` 取消，握手超时单独控制。
+
+```go
+sessionCtx, cancelSession := context.WithCancel(context.WithoutCancel(ctx))
+timer := time.AfterFunc(connectTimeout, cancelSession) // 仅覆盖握手阶段
+defer timer.Stop()
+session, _ := client.Connect(sessionCtx, transport, nil)
+// ... Close() 中调用 cancelSession()
+```
+
+### 3.2.2 测试清理顺序（httptest 会挂死）
+
+`httptest.Server.Close()` 会等待所有在途请求，其中包括那条 hanging GET。
+若用 `defer srv.Close()`，它在函数返回时执行，早于 `t.Cleanup(res.Close)`，
+于是**永远等不到长连接结束，测试挂死**。
+
+正确做法：让会话先于服务器关闭（`t.Cleanup` 后进先出，先注册 `srv.Close`）：
+
+```go
+srv := httptest.NewServer(...)
+t.Cleanup(srv.Close)                     // 先注册 → 最后执行
+res, _ := LoadMCP(...)
+t.Cleanup(func() { _ = res.Close() })    // 后注册 → 先执行
+```
+
 ### 3.3 已实测结论
 
 | 场景 | 结果 |
 |---|---|
 | stdio 子进程连接 | 发现 4 个工具，`echo`/`add` 调用成功 |
 | Streamable HTTP 连接 | 同上 |
+| HTTP 空闲 22s+ 后再调用 | 正常（会话上下文修复后，见 3.2.1） |
 | `ToolNameList` 过滤 | 只加载指定工具 |
 | 工具报错 | `SafeToolMiddleware` 转为 `[tool error] ...`，ReAct 继续产出结论 |
 | 审批 + 恢复 | `message → approval_required →（批准）→ tool_call → tool_result → message` |
