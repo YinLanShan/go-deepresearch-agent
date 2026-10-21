@@ -20,6 +20,17 @@ type Config struct {
 
 	// Tool 是 Supervisor（ReAct Agent）的工具配置。
 	Tool ToolConfig
+
+	// Execution 是 Scheduler / WorkPool 的执行资源与并发配置。
+	Execution ExecutionConfig
+}
+
+// ExecutionConfig 描述执行实体的并发能力。
+type ExecutionConfig struct {
+	// MaxConcurrency 是 Scheduler 同时调度的 Assignment 上限。
+	MaxConcurrency int
+	// Workers 是 WorkPool 的 Worker 数量（并发执行 Work 的能力）。
+	Workers int
 }
 
 // ModelConfig 描述模型提供方及其连接参数。
@@ -62,6 +73,10 @@ func Load() Config {
 			EnableBuiltinSearch:    getenv("DRA_ENABLE_BUILTIN_SEARCH", "true") != "false",
 			RequireApproval:        getenv("DRA_TOOL_REQUIRE_APPROVAL", "*"),
 			ApprovalTimeoutSeconds: getenvInt("DRA_APPROVAL_TIMEOUT_SECONDS", 300),
+		},
+		Execution: ExecutionConfig{
+			MaxConcurrency: getenvInt("DRA_SCHEDULER_MAX_CONCURRENCY", 2),
+			Workers:        getenvInt("DRA_WORKPOOL_WORKERS", 2),
 		},
 	}
 }

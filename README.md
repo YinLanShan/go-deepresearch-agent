@@ -140,6 +140,53 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/approve `
 >   Runtime / SupervisorLoop / ChatService 无需重建。
 > - ResearchState 归属 Task；Session 级联删除时一并删除其下全部 ResearchState。
 
+## 执行平面：Scheduler / WorkPool / ResultAggregator
+
+三者都是**受 Runtime 管理的独立生命周期实体**，各自拥有启动与停止流程，
+不参与 SupervisorLoop 的推理过程。边界遵循 `docs/Architecture.md` 5.6：
+
+```
+Supervisor 决定研究什么  →  Scheduler 决定什么时候执行  →  Work 实际执行
+```
+
+| 实体 | 职责（本阶段实现） | 暂不实现 |
+|---|---|---|
+| `Scheduler` | Assignment 排队、并发控制、Worker 分配、全局中止时状态标记 | 优先级、依赖检查、超时、Retry、Resource Limit |
+| `WorkPool` | 固定数量 Worker、Work 执行、阶段上报（子 Agent 实时进度） | 超时中断、真实 SubAgent、工具调用 |
+| `ResultAggregator` | 槽位预留、校验、批量 Commit、通知 Scheduler 与 Supervisor | 去重、冲突处理、FindingGraph、上下文压缩 |
+
+**协作协议**（对应 7.3.8 / 7.6.4）：
+
+1. Scheduler 创建 Assignment 调度记录时，先向 ResultAggregator **预留结果槽位**；
+   预留失败则不进入调度队列。
+2. Scheduler 在并发上限内为 Assignment 创建 Work，交给 WorkPool 执行。
+3. WorkPool 执行完成后广播 `WorkResultReady`，工作阶段经 `WorkUpdated` 实时推送前端。
+4. ResultAggregator 串行处理，把**当前已到达且已登记**的多个 Result 按 Task 合并为
+   一次 `ResearchState.Commit`（不设人为等待窗口）。
+5. Commit 成功后才回调 `Scheduler.OnResultCommitted`，Scheduler 据此把 Assignment
+   置为 `completed` 并回收调度资源；失败则置 `failed` 并保留槽位以便重试。
+6. Commit 成功后发布 `ResearchStateCommitted`，SupervisorLoop 被抢占并开启新一轮决策；
+   若仍有未完成 Assignment，本轮不宣告"研究完成"。
+
+**Work 内的 Mock 执行**：`workpool.MockWorker` 不接入真实模型，按固定阶段
+（planning → retrieving → analyzing → summarizing）推进并产出确定性研究产物，
+用于打通最小链路。阶段变化即前端展示的"调用信息"。
+
+**全局中止语义**：Scheduler 把未完成 Assignment 标记 `cancelled`、
+WorkPool 把未完成 Work 标记 `cancelled`、ResultAggregator 丢弃待提交结果。
+当前阶段**只做状态标记，不做真实执行中断**。
+
+**配置**：
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `DRA_SCHEDULER_MAX_CONCURRENCY` | 2 | Scheduler 同时调度的 Assignment 上限 |
+| `DRA_WORKPOOL_WORKERS` | 2 | WorkPool 的 Worker 数量 |
+
+**查询接口**：`GET /api/v1/sessions/:id/background-tasks` 返回当前 RunTask 下的
+Assignment 与其最新 Work（状态、阶段、Worker、耗时）；SSE 同时推送
+`work_updated` / `assignment_updated` 事件。
+
 ## ResearchState 与上下文构建
 
 每个 Task 一份 ResearchState，是该节点研究资产（证据 + 知识）的权威来源：
@@ -266,7 +313,9 @@ go test -count=1 ./... -short                 # 跳过 MCP 集成测试，仅跑
 - 左侧：研究会话列表（可删除），切换会话会加载该会话历史对话
 - 中间：卡片式聊天区，Supervisor 输出以 SSE 流式增量渲染（Markdown、自动滚动）；
   工具动作渲染为等宽紧凑卡片（工具调用 / 工具结果），审批请求渲染为「需要审批」卡片
-- 右侧：ResearchState 面板（需求 / 节点序号 / 版本 / Finding / Result / 中断上下文 / 前序节点）
+- 右侧上：**后台任务面板**（子 Agent 实时信息）——状态圆点、目标、阶段标签、
+  Worker 标识、尝试次数、耗时；由 SSE `work_updated` 增量刷新，轮询兜底
+- 右侧下：ResearchState 面板（需求 / 节点序号 / 版本 / Finding / Result / 中断上下文 / 前序节点）
 - 头部：RunTask 状态徽章（研究中 / 已暂停 / **等待中** / 已中止 / 已完成），每 800ms 轮询刷新
 - 底部：输入框 + 主按钮 + 中止。主按钮随状态切换：
   - `running` → 发送

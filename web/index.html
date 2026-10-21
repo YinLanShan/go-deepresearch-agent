@@ -209,6 +209,42 @@
     background: none; border: none; cursor: pointer; color: #2563eb; font-size: 0.72rem;
   }
   .state-body { flex: 1; overflow-y: auto; padding: 0 14px 14px; font-size: 0.8rem; }
+
+  /* ── 后台任务（子 Agent） ─────────────────────────────── */
+  .bg-body {
+    max-height: 40%; overflow-y: auto; padding: 0 10px 10px;
+    font-size: 0.78rem; border-bottom: 1px solid #eef0f3;
+  }
+  .bg-count { color: #9ca3af; font-size: 0.7rem; }
+  .bg-item {
+    border: 1px solid #eceef2; border-radius: 8px; padding: 8px 10px;
+    margin-bottom: 8px; background: #fafbfc;
+  }
+  .bg-item .bg-head { display: flex; align-items: center; gap: 6px; }
+  .bg-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: #cbd5e1; }
+  .bg-dot.running   { background: #3b82f6; animation: bgpulse 1.2s ease-in-out infinite; }
+  .bg-dot.succeeded,
+  .bg-dot.completed { background: #10b981; }
+  .bg-dot.failed    { background: #ef4444; }
+  .bg-dot.cancelled { background: #9ca3af; }
+  .bg-dot.scheduled,
+  .bg-dot.pending,
+  .bg-dot.awaiting_result { background: #f59e0b; }
+  @keyframes bgpulse { 50% { opacity: .35; } }
+  .bg-goal {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: #111827;
+  }
+  .bg-stage {
+    margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px;
+    color: #6b7280; font-size: 0.72rem;
+  }
+  .bg-chip {
+    background: #eef2ff; color: #4338ca; border-radius: 4px;
+    padding: 1px 6px; font-size: 0.68rem;
+  }
+  .bg-meta { margin-top: 5px; color: #9ca3af; font-size: 0.68rem; font-family: ui-monospace, monospace; }
+  .bg-err { margin-top: 5px; color: #b91c1c; font-size: 0.7rem; }
   .state-block { margin-bottom: 14px; }
   .state-block h4 {
     font-size: 0.72rem; color: #6b7280; text-transform: uppercase;
@@ -310,6 +346,15 @@
   </div>
 
   <aside class="state-panel">
+    <!-- 后台任务：Scheduler / WorkPool 派发的子 Agent 执行实例（Assignment + Work） -->
+    <div class="panel-title">
+      <span>后台任务</span>
+      <span class="bg-count" id="bg-count"></span>
+    </div>
+    <div class="bg-body" id="bg-body">
+      <div class="state-empty">暂无后台任务。</div>
+    </div>
+
     <div class="panel-title">
       <span>ResearchState</span>
       <button id="refresh-state-btn">刷新</button>
@@ -569,6 +614,7 @@ async function selectSession(id) {
     const hist = await api('GET', `/sessions/${id}/history`);
     renderHistoryMessages(hist && hist.messages);
     await refreshState();
+    await refreshBackgroundTasks();
   } catch (e) {
     clearChat();
     addCard('error', '加载会话失败：' + e.message, {raw: true});
@@ -624,6 +670,8 @@ async function pollStatus() {
     renderChatHeader();
     await refreshState();
   }
+  // 后台任务由 Scheduler/WorkPool 异步推进，SSE 关闭后仍需轮询兜底。
+  await refreshBackgroundTasks();
 }
 
 function renderChatHeader() {
@@ -684,6 +732,120 @@ function updateComposerState() {
   } else {
     input.placeholder = '输入研究指令…';
     if (hint) hint.textContent = '';
+  }
+}
+
+// ─── 后台任务（子 Agent） ───────────────────────────────────────────────────
+// 数据来源：GET /sessions/:id/background-tasks（Assignment + 最新 Work）。
+// 实时更新：SSE 的 work_updated / assignment_updated；SSE 结束后由轮询兜底。
+const BG_STATUS_TEXT = {
+  pending: '待调度', scheduled: '已排队', running: '执行中',
+  awaiting_result: '待提交', completed: '已完成', failed: '失败', cancelled: '已取消',
+  succeeded: '成功',
+};
+const BG_STAGE_TEXT = {
+  queued: '排队', starting: '启动', planning: '规划', retrieving: '检索',
+  analyzing: '分析', summarizing: '归纳', finished: '完成',
+};
+
+function bgDotClass(task) {
+  // 优先反映执行实例状态，其次反映调度状态
+  const s = task.work_status || task.status || '';
+  return BG_STATUS_TEXT[s] ? s : 'pending';
+}
+
+function fmtDuration(started, finished) {
+  if (!started) return '';
+  const s = new Date(started).getTime();
+  if (!s) return '';
+  const end = finished ? new Date(finished).getTime() : Date.now();
+  const ms = Math.max(0, end - s);
+  if (ms < 1000) return ms + 'ms';
+  return (ms / 1000).toFixed(1) + 's';
+}
+
+function renderBackgroundTasks(payload) {
+  const body = $('bg-body');
+  const tasks = (payload && payload.tasks) || [];
+  $('bg-count').textContent = tasks.length ? `${tasks.length} 项` : '';
+  if (!tasks.length) {
+    body.innerHTML = '<div class="state-empty">暂无后台任务。</div>';
+    return;
+  }
+
+  let html = '';
+  for (const t of tasks) {
+    const status = t.work_status || t.status || 'pending';
+    const stage = t.stage || '';
+    const label = BG_STATUS_TEXT[status] || status;
+    const stageLabel = BG_STAGE_TEXT[stage] || stage;
+    const duration = fmtDuration(t.started_at, t.finished_at);
+
+    html += `<div class="bg-item" data-work-id="${esc(t.work_id || '')}">
+      <div class="bg-head">
+        <span class="bg-dot ${esc(bgDotClass(t))}"></span>
+        <span class="bg-goal" title="${esc(t.goal || '')}">${esc(t.goal || t.assignment_id || '')}</span>
+        <span class="bg-count">${esc(label)}</span>
+      </div>`;
+    if (stageLabel || t.worker_id) {
+      html += `<div class="bg-stage">`;
+      if (stageLabel) html += `<span class="bg-chip">${esc(stageLabel)}</span>`;
+      if (t.detail) html += `<span>${esc(t.detail)}</span>`;
+      html += `</div>`;
+    }
+    const meta = [];
+    if (t.worker_id) meta.push(esc(t.worker_id));
+    if (t.attempt) meta.push('第 ' + esc(t.attempt) + ' 次');
+    if (duration) meta.push(duration);
+    if (meta.length) html += `<div class="bg-meta">${meta.join(' · ')}</div>`;
+    if (t.error) html += `<div class="bg-err">${esc(t.error)}</div>`;
+    html += `</div>`;
+  }
+  body.innerHTML = html;
+}
+
+async function refreshBackgroundTasks() {
+  if (!state.sessionId) return;
+  try {
+    const payload = await api('GET', `/sessions/${state.sessionId}/background-tasks`);
+    renderBackgroundTasks(payload);
+  } catch (e) {
+    // 后台任务不是关键路径，失败时静默
+  }
+}
+
+// applyWorkUpdate 用 SSE 推送的单条 Work 状态刷新面板（避免整表重绘导致闪烁）。
+function applyWorkUpdate(p) {
+  if (!p || !p.work_id) return;
+  const body = $('bg-body');
+  const existing = body.querySelector(`[data-work-id="${p.work_id}"]`);
+  if (!existing) {
+    // 新 Work：整体刷新一次以补齐 Assignment 信息
+    refreshBackgroundTasks();
+    return;
+  }
+  const status = p.status || 'pending';
+  const label = BG_STATUS_TEXT[status] || status;
+  const dot = existing.querySelector('.bg-dot');
+  if (dot) dot.className = 'bg-dot ' + (BG_STATUS_TEXT[status] ? status : 'pending');
+  const caption = existing.querySelector('.bg-head .bg-count');
+  if (caption) caption.textContent = label;
+
+  const stageWrap = existing.querySelector('.bg-stage');
+  const stageLabel = BG_STAGE_TEXT[p.stage] || p.stage;
+  if (stageWrap && stageLabel) {
+    stageWrap.innerHTML =
+      `<span class="bg-chip">${esc(stageLabel)}</span>` +
+      (p.detail ? `<span>${esc(p.detail)}</span>` : '');
+  }
+  if (p.error) {
+    let err = existing.querySelector('.bg-err');
+    if (!err) {
+      err = document.createElement('div');
+      err.className = 'bg-err';
+      existing.appendChild(err);
+    }
+    err.textContent = p.error;
   }
 }
 
@@ -899,6 +1061,14 @@ async function sendMessage() {
             if (bar) bar.remove();
             pendingApprovals.delete(p.approval_id);
           }
+          return;
+        }
+        if (name === 'work_updated') {
+          applyWorkUpdate(JSON.parse(data));
+          return;
+        }
+        if (name === 'assignment_updated') {
+          refreshBackgroundTasks();
           return;
         }
         if (name === 'error') {

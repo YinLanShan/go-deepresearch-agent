@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,9 +33,12 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/resultagg"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/scheduler"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/supervisor"
 	agenttool "github.com/YinLanShan/go-deepresearch-agent.git/internal/tool"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/workpool"
 )
 
 // delivery 是一次入队投递：env 为事件，h 为握手（异步投递时 h 为 nil）。
@@ -59,6 +63,14 @@ type Runtime struct {
 	// supervisors 维护每个运行中 Task 的 SupervisorLoop（按 TaskID）。
 	mu          sync.Mutex
 	supervisors map[string]*supervisor.Loop
+
+	// 以下为受 Runtime 管理的独立生命周期实体（Scheduler / WorkPool / ResultAggregator）。
+	// 它们各自拥有启动与停止流程，不参与 SupervisorLoop 的推理过程。
+	assignments storage.AssignmentStore
+	works       storage.WorkStore
+	scheduler   *scheduler.Scheduler
+	workPool    *workpool.WorkPool
+	aggregator  *resultagg.Aggregator
 
 	events chan delivery
 	stop   chan struct{}
@@ -98,8 +110,20 @@ func New(runs storage.RunTaskStore, tasks storage.TaskStore, states researchstat
 	return r
 }
 
-// Start 启动事件处理 goroutine。
+// Start 启动 Runtime 自身的事件循环，并启动其管理的执行实体。
+//
+// Scheduler / WorkPool / ResultAggregator 是独立生命周期实体：
+// Runtime 只负责启动与停止，不介入它们的内部调度与处理过程。
 func (r *Runtime) Start() {
+	if r.aggregator != nil {
+		r.aggregator.Start()
+	}
+	if r.workPool != nil {
+		r.workPool.Start()
+	}
+	if r.scheduler != nil {
+		r.scheduler.Start()
+	}
 	go r.run()
 }
 
@@ -108,6 +132,126 @@ func (r *Runtime) Start() {
 func (r *Runtime) SetTools(reg *agenttool.Registry, checkPoints adk.CheckPointStore) {
 	r.tools = reg
 	r.checkPoints = checkPoints
+}
+
+// SetExecution 注入受 Runtime 管理的三个独立执行实体及其存储。
+//
+// 依赖方向：Scheduler → (WorkPool, ResultAggregator) → ResearchState，
+// ResultAggregator 通过 SchedulerNotifier 回调 Scheduler 完成回收确认。
+// 三者都不反向依赖 SupervisorLoop。
+//
+// 应在 Start 之前调用。
+func (r *Runtime) SetExecution(
+	assignments storage.AssignmentStore,
+	works storage.WorkStore,
+	sched *scheduler.Scheduler,
+	pool *workpool.WorkPool,
+	agg *resultagg.Aggregator,
+) {
+	r.assignments = assignments
+	r.works = works
+	r.scheduler = sched
+	r.workPool = pool
+	r.aggregator = agg
+}
+
+// ExecutionStatus 返回执行实体的运行态摘要（诊断用）。
+func (r *Runtime) ExecutionStatus() map[string]int {
+	out := map[string]int{}
+	if r.scheduler != nil {
+		q, running := r.scheduler.Status()
+		out["scheduler_queued"] = q
+		out["scheduler_running"] = running
+	}
+	if r.workPool != nil {
+		q, running := r.workPool.Status()
+		out["workpool_queued"] = q
+		out["workpool_running"] = running
+	}
+	if r.aggregator != nil {
+		inbox, slots := r.aggregator.Status()
+		out["aggregator_inbox"] = inbox
+		out["aggregator_slots"] = slots
+	}
+	return out
+}
+
+// ProposeAssignments 由 SupervisorLoop 调用：提交一批 Mock Assignment。
+//
+// 本阶段为最小链路实现——每个 RunTask 只在首轮产生一次 Assignment，
+// 目标由研究需求派生（不调用模型），避免形成无限扩增。
+//
+// 返回 dispatched 表示本次是否真的派发了 Assignment。
+func (r *Runtime) ProposeAssignments(ctx context.Context, taskID, runTaskID, requirement string) (bool, error) {
+	if r.assignments == nil || r.bus == nil {
+		return false, nil
+	}
+	if existing, err := r.assignments.ListByRunTask(ctx, runTaskID); err == nil && len(existing) > 0 {
+		return false, nil // 已有 Assignment，不重复派发
+	}
+
+	task, err := r.tasks.Get(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	now := r.now()
+	goals := mockAssignmentGoals(requirement)
+	list := make([]*domain.Assignment, 0, len(goals))
+	for _, goal := range goals {
+		list = append(list, &domain.Assignment{
+			ID:        ids.New(),
+			SessionID: task.SessionID,
+			TaskID:    taskID,
+			RunTaskID: runTaskID,
+			Goal:      goal,
+			Status:    domain.AssignmentPending,
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+	}
+
+	slog.Info("runtime: proposing assignments", "task", taskID, "count", len(list))
+	// 同步发布，确保返回时 Scheduler 已完成登记，后续"是否仍有未完成 Assignment"判断可靠。
+	if err := r.bus.PublishSync(ctx, event.EventEnvelope{
+		Data: event.AssignmentSubmittedEvent{
+			SessionID:   task.SessionID,
+			TaskID:      taskID,
+			RunTaskID:   runTaskID,
+			Assignments: list,
+		},
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// HasPendingAssignments 判断某个 RunTask 是否仍有未完成的 Assignment。
+func (r *Runtime) HasPendingAssignments(ctx context.Context, runTaskID string) bool {
+	if r.assignments == nil || runTaskID == "" {
+		return false
+	}
+	list, err := r.assignments.ListByRunTask(ctx, runTaskID)
+	if err != nil {
+		return false
+	}
+	for _, a := range list {
+		if !a.Status.IsTerminal() {
+			return true
+		}
+	}
+	return false
+}
+
+// mockAssignmentGoals 从研究需求派生固定的 Mock 研究目标。
+func mockAssignmentGoals(requirement string) []string {
+	req := strings.TrimSpace(requirement)
+	if req == "" {
+		req = "当前研究主题"
+	}
+	return []string{
+		"收集与「" + req + "」相关的基础事实",
+		"分析「" + req + "」的关键权衡与约束",
+	}
 }
 
 // Approve 提交一次工具审批决定，触发对应 Task 的 SupervisorLoop 走 Eino 恢复流程。
@@ -150,12 +294,24 @@ func (r *Runtime) enqueue(d delivery) error {
 	}
 }
 
-// Shutdown 停止事件循环并等待退出，并停止所有 SupervisorLoop。
+// Shutdown 停止事件循环、所有 SupervisorLoop，以及 Runtime 管理的执行实体。
+//
+// 停止顺序与启动相反：先停调度入口（Scheduler），再停执行资源（WorkPool），
+// 最后停结果处理（ResultAggregator），避免停止过程中仍有新 Work 涌入。
 func (r *Runtime) Shutdown(ctx context.Context) error {
 	r.once.Do(func() { close(r.stop) })
 	select {
 	case <-r.done:
 		r.stopAllSupervisors()
+		if r.scheduler != nil {
+			_ = r.scheduler.Shutdown(ctx)
+		}
+		if r.workPool != nil {
+			_ = r.workPool.Shutdown(ctx)
+		}
+		if r.aggregator != nil {
+			_ = r.aggregator.Shutdown(ctx)
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -509,6 +665,7 @@ func (r *Runtime) ensureSupervisor(taskID, sessionID, runTaskID string) {
 		Tools:       r.tools.Tools(),
 		Policy:      r.tools.Policy(),
 		CheckPoints: r.checkPoints,
+		Proposer:    r,
 	})
 	l.Start()
 	r.supervisors[taskID] = l

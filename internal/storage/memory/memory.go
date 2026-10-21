@@ -7,6 +7,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -33,9 +34,25 @@ type RunTaskStore struct {
 	byTask map[string]string          // TaskID -> RunTaskID，保证一对一
 }
 
+// AssignmentStore 是 AssignmentStore 接口的进程内实现。
+type AssignmentStore struct {
+	mu  sync.RWMutex
+	m   map[string]*domain.Assignment
+	seq []string // 按创建顺序保存 ID，保证 ListByRunTask 稳定
+}
+
+// WorkStore 是 WorkStore 接口的进程内实现。
+type WorkStore struct {
+	mu  sync.RWMutex
+	m   map[string]*domain.Work
+	seq []string // 按创建顺序保存 ID
+}
+
 var _ storage.SessionStore = (*SessionStore)(nil)
 var _ storage.TaskStore = (*TaskStore)(nil)
 var _ storage.RunTaskStore = (*RunTaskStore)(nil)
+var _ storage.AssignmentStore = (*AssignmentStore)(nil)
+var _ storage.WorkStore = (*WorkStore)(nil)
 
 // NewSessionStore 创建一个空的 SessionStore。
 func NewSessionStore() *SessionStore {
@@ -53,6 +70,16 @@ func NewRunTaskStore() *RunTaskStore {
 		m:      make(map[string]*domain.RunTask),
 		byTask: make(map[string]string),
 	}
+}
+
+// NewAssignmentStore 创建一个空的 AssignmentStore。
+func NewAssignmentStore() *AssignmentStore {
+	return &AssignmentStore{m: make(map[string]*domain.Assignment)}
+}
+
+// NewWorkStore 创建一个空的 WorkStore。
+func NewWorkStore() *WorkStore {
+	return &WorkStore{m: make(map[string]*domain.Work)}
 }
 
 // Create 保存一个 Session。
@@ -250,4 +277,123 @@ func (s *RunTaskStore) Delete(_ context.Context, id string) error {
 	delete(s.m, id)
 	delete(s.byTask, rt.TaskID)
 	return nil
+}
+
+// ─── AssignmentStore ────────────────────────────────────────────────────────
+
+// Create 保存一个 Assignment。
+func (s *AssignmentStore) Create(_ context.Context, a *domain.Assignment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[a.ID]; ok {
+		return fmt.Errorf("storage: assignment %q already exists", a.ID)
+	}
+	cp := *a
+	s.m[a.ID] = &cp
+	s.seq = append(s.seq, a.ID)
+	return nil
+}
+
+// Get 返回指定 Assignment 的副本。
+func (s *AssignmentStore) Get(_ context.Context, id string) (*domain.Assignment, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.m[id]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	cp := *a
+	return &cp, nil
+}
+
+// ListByRunTask 返回某个 RunTask 下的全部 Assignment（按创建顺序）。
+func (s *AssignmentStore) ListByRunTask(_ context.Context, runTaskID string) ([]*domain.Assignment, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*domain.Assignment, 0, len(s.seq))
+	for _, id := range s.seq {
+		a, ok := s.m[id]
+		if !ok || a.RunTaskID != runTaskID {
+			continue
+		}
+		cp := *a
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+// Update 覆盖保存一个 Assignment。
+func (s *AssignmentStore) Update(_ context.Context, a *domain.Assignment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[a.ID]; !ok {
+		return storage.ErrNotFound
+	}
+	cp := *a
+	s.m[a.ID] = &cp
+	return nil
+}
+
+// ─── WorkStore ──────────────────────────────────────────────────────────────
+
+// Create 保存一个 Work。
+func (s *WorkStore) Create(_ context.Context, w *domain.Work) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[w.ID]; ok {
+		return fmt.Errorf("storage: work %q already exists", w.ID)
+	}
+	cp := cloneWork(w)
+	s.m[w.ID] = cp
+	s.seq = append(s.seq, w.ID)
+	return nil
+}
+
+// Get 返回指定 Work 的副本。
+func (s *WorkStore) Get(_ context.Context, id string) (*domain.Work, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	w, ok := s.m[id]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	return cloneWork(w), nil
+}
+
+// ListByRunTask 返回某个 RunTask 下的全部 Work（按创建顺序）。
+func (s *WorkStore) ListByRunTask(_ context.Context, runTaskID string) ([]*domain.Work, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*domain.Work, 0, len(s.seq))
+	for _, id := range s.seq {
+		w, ok := s.m[id]
+		if !ok || w.RunTaskID != runTaskID {
+			continue
+		}
+		out = append(out, cloneWork(w))
+	}
+	return out, nil
+}
+
+// Update 覆盖保存一个 Work。
+func (s *WorkStore) Update(_ context.Context, w *domain.Work) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[w.ID]; !ok {
+		return storage.ErrNotFound
+	}
+	s.m[w.ID] = cloneWork(w)
+	return nil
+}
+
+// cloneWork 复制 Work（Work 内含互斥锁，不能直接按值复制后使用其锁）。
+func cloneWork(w *domain.Work) *domain.Work {
+	cp := *w
+	cp.Constraint = nil
+	if w.Constraint != nil {
+		c := *w.Constraint
+		c.ToolAllowed = append([]string(nil), w.Constraint.ToolAllowed...)
+		cp.Constraint = &c
+	}
+	return &cp
 }

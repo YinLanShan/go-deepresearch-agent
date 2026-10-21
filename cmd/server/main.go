@@ -21,10 +21,13 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm"
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/resultagg"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/scheduler"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage/memory"
 	agenttool "github.com/YinLanShan/go-deepresearch-agent.git/internal/tool"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/workpool"
 )
 
 func main() {
@@ -46,21 +49,45 @@ func main() {
 	taskStore := memory.NewTaskStore()
 	runTaskStore := memory.NewRunTaskStore()
 	stateStore := stateMemory.NewStore()
+	assignmentStore := memory.NewAssignmentStore()
+	workStore := memory.NewWorkStore()
 	bus := event.NewBus()
-
-	// 注册模拟依赖组件（Supervisor / Scheduler / WorkPool 的占位）。
-	// Runtime 发起生命周期协商时，由它们回执"同意"；后续替换为真实实现。
-	runtime.RegisterMockCoordinators(bus, "supervisor", "scheduler", "workpool")
 
 	// 装配工具：MCP Server（可选）+ 内置演示搜索工具，以及中断用 Checkpoint 存储。
 	toolRegistry, checkPointStore := setupTools(cfg)
 	// 退出时释放 MCP 会话（关闭 stdio 子进程）。
 	defer func() { _ = toolRegistry.Close() }()
 
+	// ─── 受 Runtime 管理的三个独立执行实体 ───────────────────────────────
+	// 依赖方向：Scheduler → WorkPool / ResultAggregator → ResearchState。
+	// ResultAggregator 通过 SchedulerNotifier 回调 Scheduler 完成回收确认。
+	// 它们都参与 Runtime 的协商握手（订阅 CoordinationRequested）。
+	aggregator := resultagg.New(resultagg.Config{
+		States: stateStore,
+		Bus:    bus,
+	})
+	workPool := workpool.New(workpool.Config{
+		Works:   workStore,
+		Bus:     bus,
+		Worker:  workpool.NewMockWorker(120 * time.Millisecond),
+		Workers: cfg.Execution.Workers,
+	})
+	sched := scheduler.New(scheduler.Config{
+		Assignments:    assignmentStore,
+		Works:          workStore,
+		Pool:           workPool,
+		Slots:          aggregator,
+		Bus:            bus,
+		MaxConcurrency: cfg.Execution.MaxConcurrency,
+	})
+	// 提交确认回传给 Scheduler（Commit 成功后 Scheduler 才回收 Assignment）。
+	aggregator.SetSchedulerNotifier(sched)
+
 	// Runtime 是维护 RunTask 生命周期的独立实体，单独注册并启动。
 	// 它在 RunTask 启动时初始化 ResearchState 与 SupervisorLoop。
 	rt := runtime.New(runTaskStore, taskStore, stateStore, model, bus)
 	rt.SetTools(toolRegistry, checkPointStore)
+	rt.SetExecution(assignmentStore, workStore, sched, workPool, aggregator)
 	rt.Start()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -79,6 +106,8 @@ func main() {
 		runService,
 		service.NewConfigService(model),
 	)
+	// 后台任务（Assignment/Work）查询接口的数据来源。
+	a.SetExecutionStores(assignmentStore, workStore)
 
 	h := server.Default(
 		server.WithHostPorts(cfg.HTTPAddr),

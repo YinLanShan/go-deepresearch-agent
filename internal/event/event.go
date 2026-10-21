@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 )
 
 // 事件类型常量。
@@ -50,6 +52,17 @@ const (
 	EventToolApprovalRequired = "tool_approval_required"
 	// EventToolApprovalCancelled 表示待审批的工具调用因任务中止而作废。
 	EventToolApprovalCancelled = "tool_approval_cancelled"
+
+	// EventAssignmentSubmitted 表示 Supervisor 提交了一个新的 Assignment。
+	EventAssignmentSubmitted = "assignment_submitted"
+	// EventAssignmentUpdated 表示 Assignment 的调度/执行状态发生变化。
+	EventAssignmentUpdated = "assignment_updated"
+	// EventWorkCreated 表示 WorkPool 为某个 Assignment 创建了一次执行实例。
+	EventWorkCreated = "work_created"
+	// EventWorkUpdated 表示 Work 的状态/阶段发生变化（前端实时展示）。
+	EventWorkUpdated = "work_updated"
+	// EventWorkResultReady 表示 Work 产出了最终 Result，待 ResultAggregator 提交。
+	EventWorkResultReady = "work_result_ready"
 )
 
 // 协调动作（Runtime 发起的生命周期协商）。
@@ -376,3 +389,77 @@ type ToolApprovalCancelledEvent struct {
 
 // EventType 实现 Event 接口。
 func (ToolApprovalCancelledEvent) EventType() string { return EventToolApprovalCancelled }
+
+// AssignmentSubmittedEvent 表示 Supervisor 提交了一批新的 Assignment。
+type AssignmentSubmittedEvent struct {
+	SessionID string
+	TaskID    string
+	RunTaskID string
+	// Assignments 是本次提交的 Assignment（已由调用方构造完整字段）。
+	Assignments []*domain.Assignment
+}
+
+// EventType 实现 Event 接口。
+func (AssignmentSubmittedEvent) EventType() string { return EventAssignmentSubmitted }
+
+// AssignmentUpdatedEvent 表示某个 Assignment 的状态发生变化。
+type AssignmentUpdatedEvent struct {
+	SessionID    string
+	TaskID       string
+	RunTaskID    string
+	AssignmentID string
+	Status       domain.AssignmentStatus
+	Result       string
+	Err          string
+}
+
+// EventType 实现 Event 接口。
+func (AssignmentUpdatedEvent) EventType() string { return EventAssignmentUpdated }
+
+// WorkCreatedEvent 表示 WorkPool 创建了一次 Work 执行实例。
+type WorkCreatedEvent struct {
+	SessionID    string
+	TaskID       string
+	RunTaskID    string
+	AssignmentID string
+	WorkID       string
+	WorkerID     string
+	Goal         string
+}
+
+// EventType 实现 Event 接口。
+func (WorkCreatedEvent) EventType() string { return EventWorkCreated }
+
+// WorkUpdatedEvent 表示 Work 的状态或执行阶段发生变化，用于前端实时展示。
+type WorkUpdatedEvent struct {
+	SessionID    string
+	TaskID       string
+	RunTaskID    string
+	AssignmentID string
+	WorkID       string
+	WorkerID     string
+	Goal         string
+	Status       domain.WorkStatus
+	Stage        string
+	Detail       string
+	Attempt      int
+	Err          string
+	StartedAt    time.Time
+	FinishedAt   time.Time
+}
+
+// EventType 实现 Event 接口。
+func (WorkUpdatedEvent) EventType() string { return EventWorkUpdated }
+
+// WorkResultReadyEvent 表示 Work 产出了最终 Result，等待 ResultAggregator 提交。
+type WorkResultReadyEvent struct {
+	SessionID    string
+	TaskID       string
+	RunTaskID    string
+	AssignmentID string
+	WorkID       string
+	Result       string
+}
+
+// EventType 实现 Event 接口。
+func (WorkResultReadyEvent) EventType() string { return EventWorkResultReady }

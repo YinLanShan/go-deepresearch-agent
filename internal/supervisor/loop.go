@@ -57,6 +57,21 @@ type Config struct {
 	Policy agenttool.Policy
 	// CheckPoints 用于中断时序列化 Checkpoint；为 nil 时不支持审批恢复。
 	CheckPoints adk.CheckPointStore
+	// Proposer 用于在轮次结束后提交 Assignment；为 nil 时不派发。
+	Proposer AssignmentProposer
+}
+
+// AssignmentProposer 由 Runtime 实现：Supervisor 每轮结束后可提交新的研究目标。
+//
+// 对应 docs/Architecture.md 5.6 的边界：Supervisor 决定"研究什么"，
+// Scheduler 决定"什么时候执行"；Supervisor 不关心调度细节。
+//
+// 返回 dispatched 表示本轮是否派发了新的 Assignment；
+// 若有 Assignment 仍在执行，本轮不得宣告"研究完成"。
+type AssignmentProposer interface {
+	ProposeAssignments(ctx context.Context, taskID, runTaskID, requirement string) (dispatched bool, err error)
+	// HasPendingAssignments 判断该 RunTask 是否仍有未完成的 Assignment。
+	HasPendingAssignments(ctx context.Context, runTaskID string) bool
 }
 
 // Loop 是 SupervisorLoop。
@@ -71,6 +86,9 @@ type Loop struct {
 	tools       []tool.BaseTool
 	policy      agenttool.Policy
 	checkPoints adk.CheckPointStore
+	proposer    AssignmentProposer
+	// proposed 保证每个 Loop 只在首轮派发一次 Assignment（最小链路，避免无限扩增）。
+	proposed bool
 
 	mu sync.Mutex
 	// loop 是当前 TurnLoop 实例。审批恢复需要新的实例（Eino 的 Run 只能生效一次）。
@@ -105,6 +123,7 @@ func New(cfg Config) *Loop {
 		tools:       cfg.Tools,
 		policy:      cfg.Policy,
 		checkPoints: cfg.CheckPoints,
+		proposer:    cfg.Proposer,
 		resumeData:  make(map[string]agenttool.ApprovalResult),
 	}
 	l.loop = l.newTurnLoop()
@@ -440,8 +459,13 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 
 	err := l.commitFinding(ctx, answer)
 	l.recordAssistantMessage(answer)
+	// 派发后续 Assignment；若仍有 Assignment 未完成，本轮不宣告"研究完成"，
+	// 等结果提交后由 ResearchStateCommitted 事件抢占并开启新一轮决策。
+	l.proposeAssignments(ctx)
 	l.publishOutputDone()
-	l.publishResearchFinished()
+	if !l.hasPendingAssignments(ctx) {
+		l.publishResearchFinished()
+	}
 	return err
 }
 
@@ -551,6 +575,39 @@ func (l *Loop) publishResearchFinished() {
 			RunTaskID: l.runTaskID,
 		},
 	})
+}
+
+// proposeAssignments 在轮次结束后向 Runtime 提交新的研究目标（Assignment）。
+//
+// 本阶段为最小链路：每个 Loop 只在首轮派发一次，避免形成无限扩增。
+// Supervisor 只负责"研究什么"，调度由 Scheduler 决定。
+func (l *Loop) proposeAssignments(ctx context.Context) {
+	if l.proposer == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.proposed {
+		l.mu.Unlock()
+		return
+	}
+	l.proposed = true
+	l.mu.Unlock()
+
+	requirement := ""
+	if st, err := l.states.Get(ctx, l.taskID); err == nil {
+		requirement = st.Requirement
+	}
+	if _, err := l.proposer.ProposeAssignments(ctx, l.taskID, l.runTaskID, requirement); err != nil {
+		slog.Error("propose assignments failed", "task", l.taskID, "err", err)
+	}
+}
+
+// hasPendingAssignments 判断当前 RunTask 是否仍有未完成的 Assignment。
+func (l *Loop) hasPendingAssignments(ctx context.Context) bool {
+	if l.proposer == nil {
+		return false
+	}
+	return l.proposer.HasPendingAssignments(ctx, l.runTaskID)
 }
 
 // commitFinding 把模型回答作为 Finding Commit 到 ResearchState。

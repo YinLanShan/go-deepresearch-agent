@@ -1,0 +1,379 @@
+// Package workpool 实现 WorkPool：为 Assignment 的执行实例（Work）提供执行资源。
+//
+// 边界（对应 docs/Architecture.md 5.5/5.6）：
+//
+//	Assignment = What to do（Supervisor 决定）
+//	Work       = One execution of that work（Scheduler 创建，WorkPool 执行）
+//
+// WorkPool 是受 Runtime 管理的独立生命周期实体：拥有固定数量的 Worker，
+// 通过内部队列接收 Work，执行完成后把状态与最终 Result 交回。
+//
+// 本阶段实现（最小链路）：Work 内部运行 MockWorker，不接入真实模型。
+// 暂不实现：超时中断、Retry、工具调用、真实 SubAgent。
+package workpool
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
+)
+
+// Worker 是执行 Work 的能力抽象。本阶段由 MockWorker 实现。
+type Worker interface {
+	// Run 执行一次 Work；执行过程中通过 progress 上报阶段变化。
+	Run(ctx context.Context, w *domain.Work, progress func(stage, detail string)) (string, error)
+	// ID 返回 Worker 标识。
+	ID() string
+}
+
+// Config 是 WorkPool 的配置。
+type Config struct {
+	Works   storage.WorkStore
+	Bus     *event.Bus
+	Worker  Worker
+	Workers int
+	Now     func() time.Time
+}
+
+// WorkPool 是 Work 的执行资源池。
+type WorkPool struct {
+	works   storage.WorkStore
+	bus     *event.Bus
+	worker  Worker
+	workers int
+	now     func() time.Time
+
+	mu      sync.Mutex
+	queue   []*domain.Work
+	cancels map[string]context.CancelFunc // workID -> cancel
+	byRun   map[string]map[string]struct{}
+	closed  bool
+
+	wake     chan struct{}
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	wg       sync.WaitGroup
+	stopOnce sync.Once
+}
+
+// 编译期断言：WorkPool 参与 Runtime 的协商握手。
+var (
+	_ event.EventSender     = (*WorkPool)(nil)
+	_ event.SyncEventSender = (*WorkPool)(nil)
+)
+
+// New 构造一个 WorkPool。Workers <= 0 时默认 2。
+func New(cfg Config) *WorkPool {
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = 2
+	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+	p := &WorkPool{
+		works:   cfg.Works,
+		bus:     cfg.Bus,
+		worker:  cfg.Worker,
+		workers: workers,
+		now:     now,
+		cancels: make(map[string]context.CancelFunc),
+		byRun:   make(map[string]map[string]struct{}),
+		wake:    make(chan struct{}, 1),
+		stopCh:  make(chan struct{}),
+		doneCh:  make(chan struct{}),
+	}
+	if cfg.Bus != nil {
+		cfg.Bus.Subscribe(event.EventCoordinationRequested, p)
+	}
+	return p
+}
+
+// Start 启动 Worker goroutine（非阻塞）。
+func (p *WorkPool) Start() {
+	for i := 0; i < p.workers; i++ {
+		p.wg.Add(1)
+		go p.workerLoop()
+	}
+	go func() {
+		p.wg.Wait()
+		close(p.doneCh)
+	}()
+}
+
+// Shutdown 停止接收新 Work，并等待正在执行的 Work 结束。
+func (p *WorkPool) Shutdown(ctx context.Context) error {
+	p.stopOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+		close(p.stopCh)
+	})
+	select {
+	case <-p.doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Submit 把 Work 放入执行队列。
+func (p *WorkPool) Submit(_ context.Context, w *domain.Work) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errors.New("workpool: closed")
+	}
+	p.queue = append(p.queue, w)
+	if _, ok := p.byRun[w.RunTaskID]; !ok {
+		p.byRun[w.RunTaskID] = make(map[string]struct{})
+	}
+	p.byRun[w.RunTaskID][w.ID] = struct{}{}
+	p.mu.Unlock()
+
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// Cancel 取消某个 RunTask 下的全部 Work（仅状态标记，不做真实执行中断）。
+//
+// 返回被标记取消的 Work 数量。
+func (p *WorkPool) Cancel(runTaskID string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if runTaskID == "" {
+		return 0
+	}
+	ids, ok := p.byRun[runTaskID]
+	if !ok {
+		return 0
+	}
+
+	// 队列中尚未开始的 Work：直接丢弃并标记取消。
+	kept := make([]*domain.Work, 0, len(p.queue))
+	var dropped []*domain.Work
+	for _, w := range p.queue {
+		if w.RunTaskID == runTaskID {
+			dropped = append(dropped, w)
+			continue
+		}
+		kept = append(kept, w)
+	}
+	p.queue = kept
+
+	// 正在执行的 Work：仅标记，不中断（本阶段要求）。
+	var running []*domain.Work
+	for id := range ids {
+		cancel, ok := p.cancels[id]
+		if !ok {
+			continue
+		}
+		cancel() // 传给 Worker 的 ctx，MockWorker 会尽快退出
+		if w, err := p.works.Get(context.Background(), id); err == nil && !w.Status.IsTerminal() {
+			running = append(running, w)
+		}
+	}
+
+	go func() {
+		for _, w := range dropped {
+			p.markCancelled(w)
+		}
+		for _, w := range running {
+			p.markCancelled(w)
+		}
+	}()
+	return len(dropped) + len(running)
+}
+
+// markCancelled 把 Work 置为 cancelled 并广播。
+func (p *WorkPool) markCancelled(w *domain.Work) {
+	now := p.now()
+	w.Status = domain.WorkCancelled
+	w.UpdatedAt = now
+	w.FinishedAt = now
+	if err := p.works.Update(context.Background(), w); err != nil {
+		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	}
+	p.publishWork(w)
+}
+
+// workerLoop 是单个 Worker 的取任务循环。
+func (p *WorkPool) workerLoop() {
+	defer p.wg.Done()
+	for {
+		w := p.pop()
+		if w == nil {
+			select {
+			case <-p.stopCh:
+				return
+			case <-p.wake:
+				continue
+			}
+		}
+		p.run(w)
+	}
+}
+
+// pop 取出队首 Work。
+func (p *WorkPool) pop() *domain.Work {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.queue) == 0 {
+		return nil
+	}
+	w := p.queue[0]
+	p.queue = p.queue[1:]
+	return w
+}
+
+// run 执行一次 Work 并回写状态。
+func (p *WorkPool) run(w *domain.Work) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p.mu.Lock()
+	p.cancels[w.ID] = cancel
+	p.mu.Unlock()
+	defer func() {
+		cancel()
+		p.mu.Lock()
+		delete(p.cancels, w.ID)
+		if set, ok := p.byRun[w.RunTaskID]; ok {
+			delete(set, w.ID)
+			if len(set) == 0 {
+				delete(p.byRun, w.RunTaskID)
+			}
+		}
+		p.mu.Unlock()
+	}()
+
+	// 已被取消（入队后、开始前）则不再执行。
+	current, err := p.works.Get(context.Background(), w.ID)
+	if err == nil && current.Status.IsTerminal() {
+		return
+	}
+
+	now := p.now()
+	w.Status = domain.WorkRunning
+	w.WorkerID = p.worker.ID()
+	w.StartedAt = now
+	w.UpdatedAt = now
+	w.Stage = "starting"
+	if err := p.works.Update(context.Background(), w); err != nil {
+		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	}
+	p.publishWork(w)
+
+	result, runErr := p.worker.Run(ctx, w, func(stage, detail string) {
+		w.Stage = stage
+		w.Detail = detail
+		w.UpdatedAt = p.now()
+		if err := p.works.Update(context.Background(), w); err != nil {
+			slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+		}
+		p.publishWork(w)
+	})
+
+	finish := p.now()
+	w.FinishedAt = finish
+	w.UpdatedAt = finish
+	w.Stage = "finished"
+
+	if runErr != nil {
+		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			w.Status = domain.WorkCancelled
+		} else {
+			w.Status = domain.WorkFailed
+			w.Err = runErr.Error()
+		}
+		if err := p.works.Update(context.Background(), w); err != nil {
+			slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+		}
+		p.publishWork(w)
+		return
+	}
+
+	w.Status = domain.WorkSucceeded
+	w.Result = result
+	if err := p.works.Update(context.Background(), w); err != nil {
+		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	}
+	p.publishWork(w)
+
+	// 结果交给 ResultAggregator 提交。
+	p.publish(event.WorkResultReadyEvent{
+		SessionID:    w.SessionID,
+		TaskID:       w.TaskID,
+		RunTaskID:    w.RunTaskID,
+		AssignmentID: w.AssignmentID,
+		WorkID:       w.ID,
+		Result:       result,
+	})
+}
+
+// publishWork 广播 Work 状态变化（前端实时展示）。
+func (p *WorkPool) publishWork(w *domain.Work) {
+	p.publish(event.WorkUpdatedEvent{
+		SessionID:    w.SessionID,
+		TaskID:       w.TaskID,
+		RunTaskID:    w.RunTaskID,
+		AssignmentID: w.AssignmentID,
+		WorkID:       w.ID,
+		WorkerID:     w.WorkerID,
+		Goal:         w.Goal,
+		Status:       w.Status,
+		Stage:        w.Stage,
+		Detail:       w.Detail,
+		Attempt:      w.Attempt,
+		Err:          w.Err,
+		StartedAt:    w.StartedAt,
+		FinishedAt:   w.FinishedAt,
+	})
+}
+
+// publish 发布事件。
+func (p *WorkPool) publish(data event.Event) {
+	if p.bus == nil || data == nil {
+		return
+	}
+	_ = p.bus.Publish(context.Background(), event.EventEnvelope{Data: data})
+}
+
+// Send 处理异步事件（当前无需要）。
+func (p *WorkPool) Send(_ context.Context, _ event.EventEnvelope) error { return nil }
+
+// SendSync 参与 Runtime 的协商：全局中止时标记并停止该 RunTask 的 Work。
+//
+// 非协商事件委托给 Send，保证 PublishSync 投递的事件不会丢失。
+func (p *WorkPool) SendSync(ctx context.Context, e event.EventEnvelope, h *event.Handshake) error {
+	req, ok := e.Data.(event.CoordinationRequestedEvent)
+	if !ok {
+		err := p.Send(ctx, e)
+		h.Reply(err)
+		return nil
+	}
+	if req.Action == event.ActionStop {
+		n := p.Cancel(req.RunTaskID)
+		if n > 0 {
+			slog.Info("workpool: cancelled works on stop", "run_task", req.RunTaskID, "count", n)
+		}
+	}
+	h.Reply(nil)
+	return nil
+}
+
+// Status 返回当前排队与执行中的 Work 数量（用于诊断与测试）。
+func (p *WorkPool) Status() (queued, running int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.queue), len(p.cancels)
+}

@@ -48,12 +48,22 @@ type API struct {
 	runs     *service.RunService
 	config   *service.ConfigService
 	now      func() time.Time
+
+	// 后台任务（Assignment / Work）的数据来源，由 main 装配注入。
+	assignments storage.AssignmentStore
+	works       storage.WorkStore
 }
 
 // New 构造一个 API 实例。
 func New(chat *service.ChatService, sessions storage.SessionStore, tasks storage.TaskStore,
 	runs *service.RunService, cfg *service.ConfigService) *API {
 	return &API{chat: chat, sessions: sessions, tasks: tasks, runs: runs, config: cfg, now: time.Now}
+}
+
+// SetExecutionStores 注入后台任务（Assignment / Work）存储。
+func (a *API) SetExecutionStores(assignments storage.AssignmentStore, works storage.WorkStore) {
+	a.assignments = assignments
+	a.works = works
 }
 
 // Register 在路由上注册全部 HTTP 接口。
@@ -75,6 +85,8 @@ func (a *API) Register(r route.IRouter) {
 	v1.POST("/sessions/:id/stop", a.handleStop)
 	v1.POST("/sessions/:id/approve", a.handleApprove)
 	v1.POST("/sessions/:id/research", a.handleResearchStream)
+	// 后台任务（Assignment + Work）：侧边栏实时展示子 Agent 执行情况。
+	v1.GET("/sessions/:id/background-tasks", a.handleBackgroundTasks)
 	v1.GET("/config", a.handleGetConfig)
 	v1.PUT("/config", a.handleUpdateConfig)
 }
@@ -498,6 +510,10 @@ func (a *API) handleResearchStream(ctx context.Context, c *app.RequestContext) {
 	bus.Subscribe(event.EventToolResult, sub)
 	bus.Subscribe(event.EventToolApprovalRequired, sub)
 	bus.Subscribe(event.EventToolApprovalCancelled, sub)
+	// 后台任务（Assignment / Work）的状态变化同样经 SSE 实时推送。
+	bus.Subscribe(event.EventAssignmentUpdated, sub)
+	bus.Subscribe(event.EventWorkCreated, sub)
+	bus.Subscribe(event.EventWorkUpdated, sub)
 
 	if err := a.runs.SendUserMessage(ctx, sessionID, req.Message); err != nil {
 		_ = w.WriteEvent("", "error", []byte(err.Error()))
@@ -583,6 +599,162 @@ func (s *streamSubscriber) Send(_ context.Context, e event.EventEnvelope) error 
 		if err == nil {
 			_ = s.w.WriteEvent("", "approval_cancelled", payload)
 		}
+	case event.WorkCreatedEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(workUpdatePayload{
+			WorkID:       ev.WorkID,
+			AssignmentID: ev.AssignmentID,
+			WorkerID:     ev.WorkerID,
+			Goal:         ev.Goal,
+			Status:       string(domain.WorkPending),
+			Stage:        "queued",
+			Attempt:      1,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "work_updated", payload)
+		}
+	case event.WorkUpdatedEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(workUpdatePayload{
+			WorkID:       ev.WorkID,
+			AssignmentID: ev.AssignmentID,
+			WorkerID:     ev.WorkerID,
+			Goal:         ev.Goal,
+			Status:       string(ev.Status),
+			Stage:        ev.Stage,
+			Detail:       ev.Detail,
+			Attempt:      ev.Attempt,
+			Err:          ev.Err,
+			StartedAt:    ev.StartedAt,
+			FinishedAt:   ev.FinishedAt,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "work_updated", payload)
+		}
+	case event.AssignmentUpdatedEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"assignment_id": ev.AssignmentID,
+			"status":        string(ev.Status),
+			"result":        ev.Result,
+			"error":         ev.Err,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "assignment_updated", payload)
+		}
 	}
 	return nil
+}
+
+// workUpdatePayload 是推送给前端的后台任务（子 Agent）状态。
+type workUpdatePayload struct {
+	WorkID       string    `json:"work_id"`
+	AssignmentID string    `json:"assignment_id"`
+	WorkerID     string    `json:"worker_id,omitempty"`
+	Goal         string    `json:"goal,omitempty"`
+	Status       string    `json:"status"`
+	Stage        string    `json:"stage,omitempty"`
+	Detail       string    `json:"detail,omitempty"`
+	Attempt      int       `json:"attempt,omitempty"`
+	Err          string    `json:"error,omitempty"`
+	StartedAt    time.Time `json:"started_at,omitempty"`
+	FinishedAt   time.Time `json:"finished_at,omitempty"`
+}
+
+// backgroundTaskView 是后台任务面板的一行（Assignment 及其 Work 执行实例）。
+type backgroundTaskView struct {
+	AssignmentID string `json:"assignment_id"`
+	Goal         string `json:"goal"`
+	Status       string `json:"status"`
+	Result       string `json:"result,omitempty"`
+	Err          string `json:"error,omitempty"`
+
+	WorkID     string    `json:"work_id,omitempty"`
+	WorkerID   string    `json:"worker_id,omitempty"`
+	WorkStatus string    `json:"work_status,omitempty"`
+	Stage      string    `json:"stage,omitempty"`
+	Detail     string    `json:"detail,omitempty"`
+	Attempt    int       `json:"attempt,omitempty"`
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+}
+
+// handleBackgroundTasks 返回某个 Session 当前 RunTask 下的后台任务列表。
+//
+// 数据来源：AssignmentStore（调度状态） + WorkStore（执行实例与阶段）。
+func (a *API) handleBackgroundTasks(ctx context.Context, c *app.RequestContext) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return
+	}
+	if a.assignments == nil || a.works == nil {
+		c.JSON(http.StatusOK, map[string]any{"tasks": []backgroundTaskView{}})
+		return
+	}
+
+	rt, err := a.runs.CurrentRunTask(ctx, sessionID)
+	if err != nil || rt == nil {
+		c.JSON(http.StatusOK, map[string]any{"tasks": []backgroundTaskView{}})
+		return
+	}
+
+	assignments, err := a.assignments.ListByRunTask(ctx, rt.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	works, err := a.works.ListByRunTask(ctx, rt.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// 每个 Assignment 取最新的 Work 作为展示对象。
+	latestWork := make(map[string]*domain.Work, len(works))
+	for _, w := range works {
+		if w == nil {
+			continue
+		}
+		if prev, ok := latestWork[w.AssignmentID]; !ok || w.CreatedAt.After(prev.CreatedAt) {
+			latestWork[w.AssignmentID] = w
+		}
+	}
+
+	tasks := make([]backgroundTaskView, 0, len(assignments))
+	for _, as := range assignments {
+		view := backgroundTaskView{
+			AssignmentID: as.ID,
+			Goal:         as.Goal,
+			Status:       string(as.Status),
+			Result:       as.Result,
+			Err:          as.Err,
+			Attempt:      as.Attempt,
+		}
+		if w, ok := latestWork[as.ID]; ok {
+			view.WorkID = w.ID
+			view.WorkerID = w.WorkerID
+			view.WorkStatus = string(w.Status)
+			view.Stage = w.Stage
+			view.Detail = w.Detail
+			view.Attempt = w.Attempt
+			view.StartedAt = w.StartedAt
+			view.FinishedAt = w.FinishedAt
+			if view.Goal == "" {
+				view.Goal = w.Goal
+			}
+		}
+		tasks = append(tasks, view)
+	}
+
+	c.JSON(http.StatusOK, map[string]any{
+		"run_task_id": rt.ID,
+		"tasks":       tasks,
+	})
 }

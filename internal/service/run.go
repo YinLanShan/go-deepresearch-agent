@@ -174,6 +174,17 @@ func (s *RunService) RequestStop(ctx context.Context, sessionID string) error {
 	})
 }
 
+// CurrentRunTask 返回指定 Session 当前 Task 对应的 RunTask；不存在时返回 (nil, nil)。
+//
+// 供后台任务面板等只读接口使用。
+func (s *RunService) CurrentRunTask(ctx context.Context, sessionID string) (*domain.RunTask, error) {
+	_, rt, err := s.currentResearch(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return rt, nil
+}
+
 // currentResearch 返回指定 Session 当前（最近创建的）Task 及其 RunTask。
 // 无 Task 时返回 (nil, nil, nil)。
 func (s *RunService) currentResearch(ctx context.Context, sessionID string) (*domain.Task, *domain.RunTask, error) {
