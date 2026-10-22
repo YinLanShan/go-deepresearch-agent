@@ -66,12 +66,10 @@ type Config struct {
 // 对应 docs/Architecture.md 5.6 的边界：Supervisor 决定"研究什么"，
 // Scheduler 决定"什么时候执行"；Supervisor 不关心调度细节。
 //
-// 返回 dispatched 表示本轮是否派发了新的 Assignment；
-// 若有 Assignment 仍在执行，本轮不得宣告"研究完成"。
+// 注意：派发是异步的，Supervisor 不会等待 Assignment 完成，
+// 本轮可以正常结束；结果提交后由 ResearchStateCommitted 事件唤醒下一轮。
 type AssignmentProposer interface {
 	ProposeAssignments(ctx context.Context, taskID, runTaskID, requirement string) (dispatched bool, err error)
-	// HasPendingAssignments 判断该 RunTask 是否仍有未完成的 Assignment。
-	HasPendingAssignments(ctx context.Context, runTaskID string) bool
 }
 
 // Loop 是 SupervisorLoop。
@@ -89,6 +87,10 @@ type Loop struct {
 	proposer    AssignmentProposer
 	// proposed 保证每个 Loop 只在首轮派发一次 Assignment（最小链路，避免无限扩增）。
 	proposed bool
+	// finishing / finishConclusion 记录模型通过 finish_research 表达的终结意图。
+	// 一旦置位不可撤销（不允许模型"反悔"）。
+	finishing        bool
+	finishConclusion string
 
 	mu sync.Mutex
 	// loop 是当前 TurnLoop 实例。审批恢复需要新的实例（Eino 的 Run 只能生效一次）。
@@ -102,11 +104,36 @@ type Loop struct {
 	stopped  bool
 }
 
-// 编译期断言：实现事件订阅与工具动作上报接口。
+// 编译期断言：实现事件订阅、工具动作上报与"结束研究"接收接口。
 var (
 	_ event.EventSender  = (*Loop)(nil)
 	_ agenttool.Recorder = (*Loop)(nil)
+	_ agenttool.Finisher = (*Loop)(nil)
 )
+
+// RequestFinish 实现 agenttool.Finisher：模型调用 finish_research 时记录终结意图。
+//
+// 只置位、不立刻执行终止流程——终止必须在本轮收尾（onAgentEvents）里统一处理，
+// 这样"模型声明结束"与"本轮实际结束"顺序确定，且调用后不会被新一轮推理推翻。
+func (l *Loop) RequestFinish(conclusion string) {
+	l.mu.Lock()
+	if l.finishing {
+		l.mu.Unlock()
+		return
+	}
+	l.finishing = true
+	l.finishConclusion = strings.TrimSpace(conclusion)
+	l.mu.Unlock()
+
+	slog.Info("supervisor: model requested finish", "task", l.taskID)
+}
+
+// finishingRequested 返回模型是否已声明研究结束。
+func (l *Loop) finishingRequested() (bool, string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.finishing, l.finishConclusion
+}
 
 // checkpointID 返回该 Task 的 checkpoint 键。
 func (l *Loop) checkpointID() string { return "task:" + l.taskID }
@@ -272,6 +299,11 @@ func (l *Loop) Send(_ context.Context, e event.EventEnvelope) error {
 // push 向当前 TurnLoop 投递输入。
 func (l *Loop) push(item Input, opts ...adk.PushOption[Input, *schema.Message]) {
 	l.mu.Lock()
+	if l.finishing {
+		// 模型已声明研究结束：不再接受任何新的推理输入（不可撤销）。
+		l.mu.Unlock()
+		return
+	}
 	loop := l.loop
 	l.mu.Unlock()
 	loop.Push(item, opts...)
@@ -317,6 +349,11 @@ func (l *Loop) genResume(_ context.Context, _ *adk.TurnLoop[Input, *schema.Messa
 // prepareAgent 每轮根据最新 ResearchState 构建系统提示词并创建 Agent。
 //
 // Supervisor 本质是一个 ReAct Agent：工具与治理中间件都在这里注入。
+// prepareAgent 每轮根据最新 ResearchState 构建系统提示词并创建 Agent。
+//
+// Supervisor 本质是一个 ReAct Agent：工具与治理中间件都在这里注入。
+// 除共享工具外，还会注入一个绑定当前 Loop 的 finish_research 工具——
+// 它让模型显式声明"研究结束"，是本阶段唯一的终结入口。
 func (l *Loop) prepareAgent(ctx context.Context, _ *adk.TurnLoop[Input, *schema.Message],
 	_ []Input) (adk.Agent, error) {
 	cfg := &adk.ChatModelAgentConfig{
@@ -331,9 +368,17 @@ func (l *Loop) prepareAgent(ctx context.Context, _ *adk.TurnLoop[Input, *schema.
 			agenttool.NewEventMiddleware(l),
 		},
 	}
-	if len(l.tools) > 0 {
+
+	tools := make([]tool.BaseTool, 0, len(l.tools)+1)
+	tools = append(tools, l.tools...)
+	if finishTool, err := agenttool.NewFinishResearchTool(l); err != nil {
+		slog.Error("create finish_research tool failed", "task", l.taskID, "err", err)
+	} else {
+		tools = append(tools, finishTool)
+	}
+	if len(tools) > 0 {
 		cfg.ToolsConfig = adk.ToolsConfig{
-			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: l.tools},
+			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools},
 		}
 	}
 	return adk.NewChatModelAgent(ctx, cfg)
@@ -457,15 +502,28 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 		answer = streamed.String()
 	}
 
+	// 模型是否已通过 finish_research 声明研究结束（不可撤销）。
+	finishing, conclusion := l.finishingRequested()
+	if finishing && strings.TrimSpace(conclusion) != "" {
+		// 模型显式给出的结论优先作为本轮 Finding。
+		answer = conclusion
+	}
+
 	err := l.commitFinding(ctx, answer)
 	l.recordAssistantMessage(answer)
-	// 派发后续 Assignment；若仍有 Assignment 未完成，本轮不宣告"研究完成"，
-	// 等结果提交后由 ResearchStateCommitted 事件抢占并开启新一轮决策。
+
+	if finishing {
+		// 研究终结流程：取消所有后台任务（运行中/等待提交）、关闭提交门控、
+		// 由 Runtime 置 RunTask 为 finished。此后不再接受新的推理输入。
+		l.publishOutputDone()
+		l.publishResearchFinished()
+		return err
+	}
+
+	// 本轮结束（非终结）：派发后续 Assignment 后立即结束本轮，不等它们完成。
+	// RunTask 保持 running，Loop 保留；结果提交后由 ResearchStateCommitted 唤醒下一轮。
 	l.proposeAssignments(ctx)
 	l.publishOutputDone()
-	if !l.hasPendingAssignments(ctx) {
-		l.publishResearchFinished()
-	}
 	return err
 }
 
@@ -600,14 +658,6 @@ func (l *Loop) proposeAssignments(ctx context.Context) {
 	if _, err := l.proposer.ProposeAssignments(ctx, l.taskID, l.runTaskID, requirement); err != nil {
 		slog.Error("propose assignments failed", "task", l.taskID, "err", err)
 	}
-}
-
-// hasPendingAssignments 判断当前 RunTask 是否仍有未完成的 Assignment。
-func (l *Loop) hasPendingAssignments(ctx context.Context) bool {
-	if l.proposer == nil {
-		return false
-	}
-	return l.proposer.HasPendingAssignments(ctx, l.runTaskID)
 }
 
 // commitFinding 把模型回答作为 Finding Commit 到 ResearchState。

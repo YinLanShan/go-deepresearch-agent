@@ -26,7 +26,13 @@ func NewPolicy(names []string) Policy {
 }
 
 // NeedsApproval 判断某个工具是否需要审批。
+//
+// finish_research 永不审批：它只表达"研究结束"的决策，不产生外部副作用；
+// 若对它做中断审批，终结流程反而会被卡住。
 func (p Policy) NeedsApproval(name string) bool {
+	if name == FinishToolName {
+		return false
+	}
 	for _, candidate := range p.RequireApproval {
 		if candidate == "*" || strings.EqualFold(candidate, name) {
 			return true

@@ -129,8 +129,13 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/approve `
 > - **用户主动中止 = 状态置 `stopped`（终态）**：作废待审批项（发布 `approval_cancelled`）、
 >   删除 Checkpoint、停止 SupervisorLoop；`InterruptedContext` 保留为该节点的历史记录；
 >   不关闭提交门控，属于该 Task 的迟到 Result 仍可提交。"继续"不会复活。
-> - **模型完成研究 = 状态置 `finished`**：终止态。此后用户再发消息，会在该 Session 下
+> - **模型主动结束研究 = 状态置 `finished`（终态）**：唯一入口是模型调用
+>   `finish_research` 工具。调用后不可撤销，且无论是否仍有 Assignment 在运行或
+>   等待提交，一律取消（走 ActionStop 协商）。此后用户再发消息，会在该 Session 下
 >   自动新建 Task 与新 ResearchState（前序节点完整继承）并继续研究。
+> - **"本轮结束" ≠ "研究结束"**：模型派发 Assignment 后即可结束本轮（RunTask 仍为
+>   `running`，SupervisorLoop 保留），不阻塞等待子任务；结果提交后由
+>   `ResearchStateCommitted` 唤醒下一轮。本轮内用户再发消息仍属同一 Task。
 > - **SupervisorLoop** 外层订阅用户消息事件（按 RunTaskID 路由），内层用 Eino 的
 >   TurnLoop 驱动模型产出研究结论，写回该 Task 的 ResearchState；流式输出经
 >   ModelOutput 事件发布为 SSE。
@@ -175,6 +180,16 @@ Supervisor 决定研究什么  →  Scheduler 决定什么时候执行  →  Wor
 **全局中止语义**：Scheduler 把未完成 Assignment 标记 `cancelled`、
 WorkPool 把未完成 Work 标记 `cancelled`、ResultAggregator 丢弃待提交结果。
 当前阶段**只做状态标记，不做真实执行中断**。
+
+**研究终结语义**：只有两种方式能让研究结束——
+
+| 方式 | 触发 | 结果 |
+|---|---|---|
+| 模型主动宣布 | 调用 `finish_research` 工具 | `finished`；同时取消全部后台任务 |
+| 用户中止 | `POST /sessions/:id/stop` | `stopped`；同时取消全部后台任务 |
+
+模型宣布结束后**不可撤销**：Loop 拒绝新的推理输入，Runtime 停止 SupervisorLoop
+并关闭提交门控。`finish_research` 不参与审批（它只是决策，无外部副作用）。
 
 **配置**：
 

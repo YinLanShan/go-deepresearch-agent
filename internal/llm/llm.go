@@ -80,7 +80,10 @@ func New(ctx context.Context, cfg Config) (ChatModel, error) {
 	case "mock":
 		return mock.New(), nil
 	case "mock-tool":
-		return mock.NewToolModel(), nil
+		// 演示完整链路：检索 → 结论 → 调用 finish_research 宣布研究结束。
+		m := mock.NewToolModel()
+		m.CallFinish = true
+		return m, nil
 	case "openai":
 		return newOpenAI(ctx, cfg)
 	default:

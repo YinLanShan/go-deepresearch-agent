@@ -39,13 +39,21 @@ type harness struct {
 }
 
 func newHarness() *harness {
+	return newHarnessWith("mock")
+}
+
+// newHarnessWith 以指定模型提供方装配 harness。
+//
+// "mock" 模型不调用任何工具，因此不会触发 finish_research，研究不会终结；
+// 需要验证"模型宣布结束"的生命周期测试应使用 "mock-tool"。
+func newHarnessWith(provider string) *harness {
 	sessions := memory.NewSessionStore()
 	tasks := memory.NewTaskStore()
 	runs := memory.NewRunTaskStore()
 	states := stateMemory.NewStore()
 	bus := event.NewBus()
 	runtime.RegisterMockCoordinators(bus, "supervisor", "scheduler", "workpool")
-	mdl, err := llm.NewSwappable(context.Background(), llm.Config{Provider: "mock"})
+	mdl, err := llm.NewSwappable(context.Background(), llm.Config{Provider: provider})
 	if err != nil {
 		panic(err)
 	}
@@ -434,7 +442,9 @@ func TestEnableCreatesRunTaskWhenMissing(t *testing.T) {
 // 启用 Task -> 发消息 -> 研究完成后 RunTask 置 Finished -> 再发消息自动新建 Task 与
 // 新 ResearchState（继承上一份结论为 RelatedFinding）。
 func TestResearchLifecycleFlow(t *testing.T) {
-	h := newHarness()
+	// 用 mock-tool：它会调用 finish_research 宣布研究结束，
+	// 从而验证"模型主动终结 → Finished → 下条消息新建 Task"的完整生命周期。
+	h := newHarnessWith("mock-tool")
 	defer h.stop(t)
 	router := h.router(t)
 
@@ -486,7 +496,8 @@ func TestResearchLifecycleFlow(t *testing.T) {
 	if st.Requirement != "请分析" {
 		t.Fatalf("requirement should be the first user message, got %q", st.Requirement)
 	}
-	if len(st.Findings) != 1 || st.Findings[0].Content != "mock reply to: 请分析" {
+	// 模型通过 finish_research 给出的结论作为本轮 Finding。
+	if len(st.Findings) != 1 || st.Findings[0].Content == "" {
 		t.Fatalf("findings = %+v", st.Findings)
 	}
 	// 对话历史应记录 user + assistant 两条
@@ -527,8 +538,7 @@ func TestResearchLifecycleFlow(t *testing.T) {
 	if latest.Ordinal != 2 {
 		t.Fatalf("new state ordinal should be 2, got %d", latest.Ordinal)
 	}
-	if len(prevNode.Findings) == 0 ||
-		!strings.Contains(prevNode.Findings[0].Content, "mock reply to: 请分析") {
+	if len(prevNode.Findings) == 0 || prevNode.Findings[0].Content == "" {
 		t.Fatalf("related node should carry previous finding, got %+v", prevNode.Findings)
 	}
 	if latest.Requirement != "继续深入" {

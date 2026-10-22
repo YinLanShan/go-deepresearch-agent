@@ -4,6 +4,7 @@ package mock
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
@@ -52,6 +53,8 @@ type ToolModel struct {
 	PreferTools []string
 	// Arguments 是工具调用参数（JSON）；默认 {"query":"框架执行模型"}。
 	Arguments string
+	// CallFinish 为 true 时，出结论后会调用 finish_research 宣布研究结束。
+	CallFinish bool
 }
 
 // defaultPreferTools 是默认的工具优先级列表：
@@ -105,35 +108,57 @@ func argsFor(toolName, fallback string) string {
 		return `{"text":"hello from mock model"}`
 	case "add":
 		return `{"a":17,"b":25}`
+	case finishToolName:
+		return `{"conclusion":"（mock）研究目标已达成，宣布结束。"}`
 	default:
 		return fallback
 	}
 }
 
-// Generate 首次发起工具调用，看到工具结果后输出最终回答。
+// Generate 按"检索 → 出结论 → 宣布结束"的顺序推进（CallFinish 为 true 时）。
 func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	var lastToolResult string
-	for _, msg := range input {
-		if msg != nil && msg.Role == schema.Tool {
-			lastToolResult = msg.Content
-		}
-	}
-	if lastToolResult != "" {
-		return schema.AssistantMessage(
-			"根据检索结果，可以得出结论："+lastToolResult, nil), nil
-	}
-	for _, msg := range input {
-		if msg != nil && msg.Role == schema.Tool {
-			return schema.AssistantMessage(
-				"根据检索结果，可以得出结论：该框架采用 DAG 执行模型，适合确定性 Workflow。", nil), nil
-		}
-	}
-
 	cfg := model.GetCommonOptions(&model.Options{}, opts...)
 	var available []*schema.ToolInfo
 	if cfg != nil {
 		available = cfg.Tools
 	}
+
+	// 已看到过工具结果：判断是否已经完成过一次检索、是否已调用过 finish_research。
+	var lastToolResult string
+	sawFinishResult := false
+	for _, msg := range input {
+		if msg == nil || msg.Role != schema.Tool {
+			continue
+		}
+		lastToolResult = msg.Content
+		if msg.ToolName == finishToolName {
+			sawFinishResult = true
+		}
+	}
+
+	// 调用过 finish_research 之后：输出最终回答，不再发起工具调用。
+	if sawFinishResult {
+		return schema.AssistantMessage("研究已完成，以上为本次研究的最终结论。", nil), nil
+	}
+
+	// 已有检索结果：出结论；若配置了 CallFinish，则再调用一次 finish_research 宣布结束。
+	if lastToolResult != "" {
+		conclusion := "根据检索结果，可以得出结论：" + lastToolResult
+		if m.CallFinish && hasTool(available, finishToolName) {
+			msg := schema.AssistantMessage(conclusion+" 研究到此结束。", nil)
+			msg.ToolCalls = []schema.ToolCall{{
+				ID:   "call-finish",
+				Type: "function",
+				Function: schema.FunctionCall{
+					Name:      finishToolName,
+					Arguments: `{"conclusion":"` + escapeJSON(conclusion) + `"}`,
+				},
+			}}
+			return msg, nil
+		}
+		return schema.AssistantMessage(conclusion, nil), nil
+	}
+
 	name, args := m.selectTool(available)
 	msg := schema.AssistantMessage("我需要先检索相关资料。", nil)
 	msg.ToolCalls = []schema.ToolCall{{
@@ -145,6 +170,27 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 		},
 	}}
 	return msg, nil
+}
+
+// finishToolName 与 internal/tool.FinishToolName 保持一致（避免反向依赖）。
+const finishToolName = "finish_research"
+
+// hasTool 判断模型可见工具里是否包含指定名称。
+func hasTool(available []*schema.ToolInfo, name string) bool {
+	for _, info := range available {
+		if info != nil && info.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// escapeJSON 转义字符串中的双引号与换行，便于拼装简单 JSON。
+func escapeJSON(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	return s
 }
 
 // Stream 以单块流返回与 Generate 相同的内容。

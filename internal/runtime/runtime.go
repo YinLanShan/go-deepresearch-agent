@@ -464,7 +464,13 @@ func (r *Runtime) onStop(ctx context.Context, taskID string) error {
 	return r.globalStop(ctx, taskID, domain.RunStatusStopped)
 }
 
-// onResearchFinished 处理模型完成研究：Running -> Finished（终止态）。
+// onResearchFinished 处理模型主动宣布研究结束：Running -> Finished（终态）。
+//
+// 与"本轮结束"严格区分：本轮结束不改变 RunTask 状态，也不停止 SupervisorLoop；
+// 只有模型调用 finish_research 才会走到这里。
+//
+// 终止时无论是否仍有 Assignment 在运行或等待提交，一律取消：
+// 通过 ActionStop 协商，由 Scheduler / WorkPool / ResultAggregator 共同完成。
 func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 	rt, err := r.runs.GetByTask(ctx, taskID)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -476,8 +482,14 @@ func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 	if rt.Status != domain.RunStatusRunning {
 		return nil // 非运行态，幂等
 	}
-	r.stopSupervisor(taskID)
+
+	// 先取消全部后台任务（运行中 / 排队 / 等待提交），再终结研究。
+	if err := r.coordinate(ctx, taskID, rt.ID, event.ActionStop); err != nil {
+		return err
+	}
+	r.terminateSupervisor(taskID)
 	_ = r.states.StopCommits(ctx, taskID)
+
 	rt.Status = domain.RunStatusFinished
 	rt.UpdatedAt = r.now()
 	if err := r.runs.Update(ctx, rt); err != nil {
