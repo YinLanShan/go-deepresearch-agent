@@ -71,20 +71,20 @@ func TestTaskEnableDisableInteraction(t *testing.T) {
 		t.Fatalf("want running, got %s", got)
 	}
 
-	// 2) 失能
+	// 2) 失能 = 用户中止：RunTask 置 Stopped（终态）
 	if _, err := svc.SetTaskEnabled(ctx, "t1", false); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
-	if got := getRunTaskStatus(t, runs, "t1"); got != domain.RunStatusPaused {
-		t.Fatalf("want paused, got %s", got)
+	if got := getRunTaskStatus(t, runs, "t1"); got != domain.RunStatusStopped {
+		t.Fatalf("want stopped, got %s", got)
 	}
 
-	// 3) 再次使能
+	// 3) 再次使能不能复活终态
 	if _, err := svc.SetTaskEnabled(ctx, "t1", true); err != nil {
 		t.Fatalf("re-enable: %v", err)
 	}
-	if got := getRunTaskStatus(t, runs, "t1"); got != domain.RunStatusRunning {
-		t.Fatalf("want running, got %s", got)
+	if got := getRunTaskStatus(t, runs, "t1"); got != domain.RunStatusStopped {
+		t.Fatalf("stopped run task must not be resurrected, got %s", got)
 	}
 }
 

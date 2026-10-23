@@ -13,7 +13,6 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
-	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
@@ -124,10 +123,11 @@ func (s *RunService) RequestDeleteRunTask(ctx context.Context, taskID string) er
 // SendUserMessage 向指定 Session 的研究提交一条用户消息。
 //
 // 语义（对应研究生命周期）：
-//   - 当前任务 Running：直接投递给其 SupervisorLoop；
-//   - 当前任务 Finished / Stopped（终止态）：新建一个 Task（研究需求=本条消息），
-//     新建一份 ResearchState（继承上一份的结论为 RelatedFinding）并启用，再投递消息；
-//   - 当前任务 Paused：需先经"继续"恢复，返回错误。
+//   - 当前任务 Running / Waiting：直接投递给其 SupervisorLoop（同一 Task、同一 ResearchState）；
+//   - 当前任务 Finished / Stopped（终态）：新建一个 Task（研究需求=本条消息），
+//     新建一份 ResearchState（继承前序节点）并启用，再投递消息。
+//
+// 不存在"暂停"状态：用户只有"中止"，中止即终态。
 func (s *RunService) SendUserMessage(ctx context.Context, sessionID, message string) error {
 	task, rt, err := s.currentResearch(ctx, sessionID)
 	if err != nil {
@@ -145,9 +145,6 @@ func (s *RunService) SendUserMessage(ctx context.Context, sessionID, message str
 	switch rt.Status {
 	case domain.RunStatusFinished, domain.RunStatusStopped:
 		return s.startNextResearch(ctx, sessionID, message)
-	case domain.RunStatusPaused:
-		return fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
-			"research is paused; continue it first")
 	default:
 		return s.publishMessage(ctx, sessionID, task.ID, rt.ID, message)
 	}

@@ -72,7 +72,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/tasks
 # 删除 Session（会级联删除其名下的 Task 与 RunTask）
 Invoke-WebRequest -Uri http://127.0.0.1:8080/api/v1/sessions/{id} -Method Delete
 
-# 启用/禁用 Task（经事件驱动 Runtime 创建/暂停 RunTask）
+# 启用/禁用 Task（启用=创建/恢复 RunTask；禁用=等价于中止，终态）
 Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/tasks/{id} `
   -Method Patch -ContentType "application/json" -Body '{"enabled":true}'
 
@@ -116,16 +116,17 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/approve `
 
 > 约束：
 > - **一个 Session 可对应多个 Task**；一个 Task 对应一个 RunTask。
-> - **同一时间全局只有一个 RunTask 处于 Running**；被挤掉的 RunTask 置 `waiting`
->   （不是 `paused`），Task 置不可用，Checkpoint 与待审批项保留，可随时"继续"切回。
+> - **同一时间全局只有一个 RunTask 处于 Running**；被挤掉的 RunTask 置 `waiting`，
+>   Task 置不可用，Checkpoint 与待审批项保留，可随时"继续"切回。
 > - **Task 只能启用/禁用，无直接删除路径**；新建的 Task 默认禁用。
 > - **RunTask 由独立实体 Runtime 经事件订阅维护**：启用/禁用/删除都先由 Runtime
->   向依赖组件（Supervisor/Scheduler/WorkPool，当前为 Mock）发起协商，协商通过后才原子落地。
+>   向依赖组件（Supervisor/Scheduler/WorkPool）发起协商，协商通过后才原子落地。
 > - **使能时若 RunTask 不存在，Runtime 先协商创建（再新建 RunTask**，
 >   同时初始化该 Task 的 ResearchState 并启动 SupervisorLoop；该 Session 下
 >   所有已结束节点以完整快照写入 `RelatedNodes`（用于上下文展开）。
-> - **失能 = 用户主动暂停 + 状态置 `paused`**：停止 SupervisorLoop、关闭提交门控；
->   再次使能（"继续"）由 `paused` 置回 `running` 并重新打开门控。
+> - **失能 = 用户中止 + 状态置 `stopped`（终态）**：停止 SupervisorLoop、作废待审批项、
+>   删除 Checkpoint；再次使能不能复活，用户继续研究会在新 Task 上进行。
+> - **不存在"暂停后继续"**：用户只有"中止"这一个选择，中止即终态。
 > - **用户主动中止 = 状态置 `stopped`（终态）**：作废待审批项（发布 `approval_cancelled`）、
 >   删除 Checkpoint、停止 SupervisorLoop；`InterruptedContext` 保留为该节点的历史记录；
 >   不关闭提交门控，属于该 Task 的迟到 Result 仍可提交。"继续"不会复活。
@@ -139,7 +140,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/approve `
 > - **SupervisorLoop** 外层订阅用户消息事件（按 RunTaskID 路由），内层用 Eino 的
 >   TurnLoop 驱动模型产出研究结论，写回该 Task 的 ResearchState；流式输出经
 >   ModelOutput 事件发布为 SSE。
-> - **ResearchState Commit 门控**：暂停/等待时停止接收新 Commit（返回 ErrNotAccepting），
+> - **ResearchState Commit 门控**：等待（被挤掉）时停止接收新 Commit（返回 ErrNotAccepting），
 >   正在进行的 Commit 继续完成。
 > - **模型可热切换**：`main` 持有 `llm.Swappable`，`PUT /api/v1/config` 只替换内部模型实例，
 >   Runtime / SupervisorLoop / ChatService 无需重建。
@@ -331,10 +332,10 @@ go test -count=1 ./... -short                 # 跳过 MCP 集成测试，仅跑
 - 右侧上：**后台任务面板**（子 Agent 实时信息）——状态圆点、目标、阶段标签、
   Worker 标识、尝试次数、耗时；由 SSE `work_updated` 增量刷新，轮询兜底
 - 右侧下：ResearchState 面板（需求 / 节点序号 / 版本 / Finding / Result / 中断上下文 / 前序节点）
-- 头部：RunTask 状态徽章（研究中 / 已暂停 / **等待中** / 已中止 / 已完成），每 800ms 轮询刷新
+- 头部：RunTask 状态徽章（研究中 / **等待中** / 已中止 / 已完成），每 800ms 轮询刷新
 - 底部：输入框 + 主按钮 + 中止。主按钮随状态切换：
   - `running` → 发送
-  - `paused` / `waiting` → **继续**（切回运行，会把其他会话挤成 `waiting`）
+  - `waiting` → **继续**（切回运行，会把其他会话挤成 `waiting`）
   - `finished` / `stopped` → 发送（发送后自动新建 Task 与新 ResearchState）
 
 交互细节：

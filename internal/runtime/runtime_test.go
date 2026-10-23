@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -95,8 +94,10 @@ func TestStopFlow(t *testing.T) {
 	}
 }
 
-// TestDisableFlow 验证失能 = 全局中止但状态置 Paused；再次使能（继续）由 Paused 置 Running，
-// 并且提交门控从关闭恢复为可提交。
+// TestDisableFlow 验证失能 = 用户中止：RunTask 置 Stopped（终态），
+// 再次使能不能复活（用户继续研究会在新 Task 上进行）。
+//
+// 注意：不存在"暂停后继续"的语义——用户只有"中止"这一个选择。
 func TestDisableFlow(t *testing.T) {
 	_, tasks, runs, states, bus := newRuntime(t)
 	ctx := context.Background()
@@ -108,7 +109,7 @@ func TestDisableFlow(t *testing.T) {
 	waitStatus(t, runs, "t1", domain.RunStatusRunning)
 
 	disable(t, bus, "t1")
-	waitStatus(t, runs, "t1", domain.RunStatusPaused)
+	waitStatus(t, runs, "t1", domain.RunStatusStopped)
 
 	// 失能后 Task 本身也应被置为不可用
 	task, err := tasks.Get(ctx, "t1")
@@ -119,18 +120,17 @@ func TestDisableFlow(t *testing.T) {
 		t.Fatalf("task should be disabled after disable")
 	}
 
-	// 暂停期间 ResearchState 停止接收新的 Commit
-	if err := states.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "x", FindingContent: "y"}); !errors.Is(err, researchstate.ErrNotAccepting) {
-		t.Fatalf("commit while paused should be ErrNotAccepting, got %v", err)
-	}
-
-	// 继续（再次使能）→ Running，门控重新打开
+	// 中止为终态：再次使能不会复活为 Running。
 	enable(t, bus, "t1")
-	waitStatus(t, runs, "t1", domain.RunStatusRunning)
-
-	if err := states.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "证据", FindingContent: "结论"}); err != nil {
-		t.Fatalf("commit after continue should succeed, got %v", err)
+	time.Sleep(100 * time.Millisecond)
+	rt, err := runs.GetByTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get run task: %v", err)
 	}
+	if rt.Status != domain.RunStatusStopped {
+		t.Fatalf("stopped task must not be resurrected, got %q", rt.Status)
+	}
+	_ = states
 }
 
 // TestGlobalSingleRunning 验证全局单例运行：使能新 Session 时，

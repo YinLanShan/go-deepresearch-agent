@@ -405,8 +405,8 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 		return err
 	}
 
-	// 已存在：协商恢复（继续），由 Paused 置 Running。
-	// 注意：Finished / Stopped 为终止态，不可经"继续"复活；仅 Paused（及 Created）可恢复。
+	// 已存在：协商恢复（继续）。仅 waiting（被挤掉）可恢复为 running。
+	// 注意：Finished / Stopped 为终态，不可经"继续"复活。
 	if rt.Status == domain.RunStatusFinished || rt.Status == domain.RunStatusStopped {
 		if task.Enabled {
 			// 保持终止态一致：Task 不应处于可运行标记。
@@ -434,7 +434,10 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 	return nil
 }
 
-// onTaskDisabled 处理 Task 失能：执行全局中止，但状态置为 Paused（可经"继续"恢复）。
+// onTaskDisabled 处理 Task 失能：等价于用户中止，RunTask 置为 Stopped（终态）。
+//
+// 用户只有"中止"一个选择，因此不存在"暂停后继续"的语义：
+// 失能后该 Task 不会因再次使能而复活，用户继续研究会在新 Task 上进行。
 func (r *Runtime) onTaskDisabled(ctx context.Context, taskID string) error {
 	rt, err := r.runs.GetByTask(ctx, taskID)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -444,9 +447,9 @@ func (r *Runtime) onTaskDisabled(ctx context.Context, taskID string) error {
 		return err
 	}
 	if rt.Status != domain.RunStatusRunning {
-		return nil // 已暂停/已完成/已中止，无需处理
+		return nil // 已结束/已中止，无需处理
 	}
-	return r.globalStop(ctx, taskID, domain.RunStatusPaused)
+	return r.globalStop(ctx, taskID, domain.RunStatusStopped)
 }
 
 // onStop 处理用户主动中止：执行全局中止，状态置为 Stopped（终止态）。

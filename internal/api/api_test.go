@@ -365,15 +365,15 @@ func TestEnableDisableRunTaskFlow(t *testing.T) {
 		t.Fatalf("unmarshal run task: %v", err)
 	}
 
-	// 禁用 -> paused
+	// 禁用 = 用户中止 -> stopped（终态）
 	w = ut.PerformRequest(router, "PATCH", "/api/v1/tasks/"+taskID,
 		jsonBody(t, map[string]bool{"enabled": false}), jsonHeader())
 	if resp = w.Result(); resp.StatusCode() != 200 {
 		t.Fatalf("disable: want 200, got %d, body=%s", resp.StatusCode(), resp.Body())
 	}
-	waitRunTask(t, h.runs, taskID, domain.RunStatusPaused)
+	waitRunTask(t, h.runs, taskID, domain.RunStatusStopped)
 
-	// 按 RunTaskID 查询，状态应为 paused
+	// 按 RunTaskID 查询，状态应为 stopped
 	w = ut.PerformRequest(router, "GET", "/api/v1/run-tasks/"+rt.ID, nil)
 	if resp = w.Result(); resp.StatusCode() != 200 {
 		t.Fatalf("get run by id: want 200, got %d", resp.StatusCode())
@@ -384,8 +384,8 @@ func TestEnableDisableRunTaskFlow(t *testing.T) {
 	if err := json.Unmarshal(resp.Body(), &rt2); err != nil {
 		t.Fatalf("unmarshal run task: %v", err)
 	}
-	if rt2.Status != string(domain.RunStatusPaused) {
-		t.Fatalf("want paused, got %s", rt2.Status)
+	if rt2.Status != string(domain.RunStatusStopped) {
+		t.Fatalf("want stopped, got %s", rt2.Status)
 	}
 }
 

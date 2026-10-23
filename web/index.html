@@ -75,7 +75,6 @@
   }
   .badge.running { background: #d1fae5; color: #065f46; }
   .badge.stopped { background: #fee2e2; color: #991b1b; }
-  .badge.paused  { background: #fef3c7; color: #92400e; }
   .badge.waiting { background: #ede9fe; color: #5b21b6; }
   .badge.finished { background: #dbeafe; color: #1e40af; }
   .badge.unknown { background: #e5e7eb; color: #6b7280; }
@@ -621,7 +620,7 @@ async function selectSession(id) {
   }
   renderChatHeader();
   startPolling();
-  if (state.taskId && state.runStatus !== 'paused') $('msg-input').focus();
+  if (state.taskId) $('msg-input').focus();
 }
 
 async function refreshRunStatus() {
@@ -678,9 +677,9 @@ function renderChatHeader() {
   const s = state.sessions.find(x => x.id === state.sessionId);
   const title = s ? (s.title || s.id.slice(0, 8)) : '—';
   const status = state.runStatus || 'unknown';
-  const badgeCls = ['running','stopped','paused','waiting','finished'].includes(status) ? status : 'unknown';
+  const badgeCls = ['running','stopped','waiting','finished'].includes(status) ? status : 'unknown';
   const statusText = {
-    running: '研究中', paused: '已暂停', waiting: '等待中', stopped: '已中止', finished: '已完成',
+    running: '研究中', waiting: '等待中', stopped: '已中止', finished: '已完成',
   }[status] || status;
   $('chat-header').innerHTML = `
     <div class="inner-header">
@@ -694,7 +693,8 @@ function renderChatHeader() {
 }
 
 // 根据 RunTask 状态调整输入区。
-// Paused（用户暂停）与 Waiting（被其他会话挤掉）都提供"继续"：点击后抢占运行权。
+// 只有 Waiting（被其他会话挤掉）提供"继续"：点击后抢占运行权。
+// 不存在"暂停"状态：用户只有"中止"，中止即终态。
 function updateComposerState() {
   const input = $('msg-input');
   const sendBtn = $('send-btn');
@@ -703,9 +703,8 @@ function updateComposerState() {
   const status = state.runStatus;
 
   const hasTask = !!state.taskId;
-  const paused = status === 'paused';
   const waiting = status === 'waiting';
-  const resumable = paused || waiting;
+  const resumable = waiting;
   const finished = status === 'finished';
   const stopped = status === 'stopped';
 
@@ -714,10 +713,7 @@ function updateComposerState() {
   sendBtn.textContent = resumable ? '继续' : '发送';
   sendBtn.classList.toggle('continue', resumable);
 
-  if (paused) {
-    input.placeholder = '研究已暂停，点击"继续"恢复';
-    if (hint) hint.textContent = '已暂停——点击“继续”恢复研究';
-  } else if (waiting) {
+  if (waiting) {
     input.placeholder = '等待其他研究会话，点击"继续"切回';
     if (hint) hint.textContent = '等待中——当前有其它会话在运行，点击“继续”抢占';
   } else if (finished) {
@@ -988,8 +984,8 @@ function addApprovalCard(payload) {
 
 // ─── 发送消息（SSE 流式） ────────────────────────────────────────────────────
 async function sendMessage() {
-  // 暂停/等待态：按钮语义为"继续"（抢占运行权）
-  if (state.runStatus === 'paused' || state.runStatus === 'waiting') {
+  // 等待态：按钮语义为"继续"（抢占运行权）
+  if (state.runStatus === 'waiting') {
     await continueResearch();
     return;
   }
@@ -1159,12 +1155,12 @@ async function stopResearch() {
   await refreshState();
 }
 
-// ─── 继续（Paused -> Running） ────────────────────────────────────────────────
+// ─── 继续（Waiting -> Running，被其他会话挤掉后切回） ─────────────────────────
 async function continueResearch() {
   if (!state.sessionId || !state.taskId) return;
   try {
     await api('PATCH', `/tasks/${state.taskId}`, {enabled: true});
-    addCard('状态', '已继续研究（Paused → Running）。', {raw: true});
+    addCard('状态', '已继续研究（Waiting → Running）。', {raw: true});
   } catch (e) {
     addCard('error', '继续失败：' + e.message, {raw: true});
   }
@@ -1207,7 +1203,7 @@ async function createResearch() {
     chatInner().innerHTML =
       '<div class="empty-state">研究已创建并启用。<br/>发送第一条消息即可开始研究，该消息将成为本次研究需求。</div>';
     startPolling();
-    if (state.runStatus !== 'paused') $('msg-input').focus();
+    $('msg-input').focus();
     await refreshState();
   } catch (e) {
     newStatus('失败：' + e.message, true);

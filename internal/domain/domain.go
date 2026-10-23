@@ -35,12 +35,19 @@ type Task struct {
 }
 
 // RunStatus 表示 RunTask 的生命周期状态。
+//
+// 状态语义：
+//   - running  ：研究进行中（可能正在推理，也可能在等子任务结果）；
+//   - waiting  ：被其他会话挤掉，可经"继续"切回；
+//   - stopped  ：用户中止（终态，不可复活）；
+//   - finished ：模型调用 finish_research 宣布研究结束（终态，不可复活）。
+//
+// 不存在"用户暂停"状态：用户只有"中止"这一个选择，中止即终态。
 type RunStatus string
 
 const (
 	RunStatusCreated   RunStatus = "created"
 	RunStatusRunning   RunStatus = "running"
-	RunStatusPaused    RunStatus = "paused"
 	RunStatusStopped   RunStatus = "stopped"
 	RunStatusFinished  RunStatus = "finished"
 	RunStatusWaiting   RunStatus = "waiting"
