@@ -66,6 +66,43 @@ func (a *API) SetExecutionStores(assignments storage.AssignmentStore, works stor
 	a.works = works
 }
 
+// ─── 请求前置校验 ────────────────────────────────────────────────────────────
+
+// requireSessionID 读取路径参数 :id（Session ID）。
+//
+// 参数为空时直接写出 400 响应并返回 ok=false，调用方应立即返回。
+func (a *API) requireSessionID(c *app.RequestContext) (string, bool) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+		return "", false
+	}
+	return sessionID, true
+}
+
+// requireSession 读取路径参数 :id 并确认该 Session 存在。
+//
+// 参数为空写出 400，Session 不存在写出 404，其他错误写出 500；
+// 任一失败返回 ok=false，调用方应立即返回。
+//
+// 用于需要"操作目标 Session"的接口（创建 Task、投递消息、SSE 订阅等）；
+// 仅按 ID 查询的接口（列出 Task、查询研究状态）使用 requireSessionID 即可。
+func (a *API) requireSession(ctx context.Context, c *app.RequestContext) (string, bool) {
+	sessionID, ok := a.requireSessionID(c)
+	if !ok {
+		return "", false
+	}
+	if _, err := a.sessions.Get(ctx, sessionID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
+			return "", false
+		}
+		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return "", false
+	}
+	return sessionID, true
+}
+
 // Register 在路由上注册全部 HTTP 接口。
 // 参数使用 route.IRouter，兼容生产环境 *server.Hertz 与测试环境 *route.Engine。
 func (a *API) Register(r route.IRouter) {
@@ -187,13 +224,8 @@ type taskRequest struct {
 }
 
 func (a *API) handleCreateTask(_ context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
-		return
-	}
-	if _, err := a.sessions.Get(context.Background(), sessionID); err != nil {
-		c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
+	sessionID, ok := a.requireSession(context.Background(), c)
+	if !ok {
 		return
 	}
 
@@ -220,9 +252,8 @@ func (a *API) handleCreateTask(_ context.Context, c *app.RequestContext) {
 }
 
 func (a *API) handleListTasks(_ context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+	sessionID, ok := a.requireSessionID(c)
+	if !ok {
 		return
 	}
 	tasks, err := a.tasks.ListBySession(context.Background(), sessionID)
@@ -235,17 +266,8 @@ func (a *API) handleListTasks(_ context.Context, c *app.RequestContext) {
 
 // handleDeleteSession 删除 Session，并级联删除其名下的 Task、RunTask 与 ResearchState。
 func (a *API) handleDeleteSession(ctx context.Context, c *app.RequestContext) {
-	id := c.Param("id")
-	if id == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
-		return
-	}
-	if _, err := a.sessions.Get(ctx, id); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	id, ok := a.requireSession(ctx, c)
+	if !ok {
 		return
 	}
 
@@ -371,18 +393,12 @@ type messageRequest struct {
 }
 
 // handleSendMessage 向指定 Session 的研究提交一条用户消息（异步，由 Supervisor 处理）。
+//
+// 与本文件中的 handleResearchStream 前置校验一致，区别只在于响应方式：
+// 该接口立即返回 202，不订阅事件流；需要实时输出时请使用 SSE 版本。
 func (a *API) handleSendMessage(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
-		return
-	}
-	if _, err := a.sessions.Get(ctx, sessionID); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	sessionID, ok := a.requireSession(ctx, c)
+	if !ok {
 		return
 	}
 
@@ -405,9 +421,8 @@ func (a *API) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 
 // handleGetResearchState 查询指定 Session 的研究状态。
 func (a *API) handleGetResearchState(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+	sessionID, ok := a.requireSessionID(c)
+	if !ok {
 		return
 	}
 	st, err := a.runs.GetResearchState(ctx, sessionID)
@@ -424,9 +439,8 @@ func (a *API) handleGetResearchState(ctx context.Context, c *app.RequestContext)
 
 // handleGetHistory 返回指定 Session 的对话历史（前端切换会话时回放）。
 func (a *API) handleGetHistory(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+	sessionID, ok := a.requireSessionID(c)
+	if !ok {
 		return
 	}
 	msgs, err := a.runs.GetConversationHistory(ctx, sessionID)
@@ -436,10 +450,11 @@ func (a *API) handleGetHistory(ctx context.Context, c *app.RequestContext) {
 	}
 	c.JSON(http.StatusOK, map[string]any{"messages": msgs})
 }
+
+// handleStop 处理用户主动中止请求（协作式、全局范围）。
 func (a *API) handleStop(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+	sessionID, ok := a.requireSessionID(c)
+	if !ok {
 		return
 	}
 	if err := a.runs.RequestStop(ctx, sessionID); err != nil {
@@ -457,9 +472,8 @@ type approvalRequest struct {
 
 // handleApprove 处理工具调用的人工审批。
 func (a *API) handleApprove(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+	sessionID, ok := a.requireSessionID(c)
+	if !ok {
 		return
 	}
 	var req approvalRequest
@@ -481,13 +495,8 @@ func (a *API) handleApprove(ctx context.Context, c *app.RequestContext) {
 // handleResearchStream 以 SSE 流式返回 Supervisor 的研究输出。
 // 借鉴 eino-examples a2ui 的事件消费方式：订阅流式输出事件，逐块写入 SSE。
 func (a *API) handleResearchStream(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
-		return
-	}
-	if _, err := a.sessions.Get(ctx, sessionID); err != nil {
-		c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
+	sessionID, ok := a.requireSession(ctx, c)
+	if !ok {
 		return
 	}
 	var req messageRequest
@@ -689,9 +698,8 @@ type backgroundTaskView struct {
 //
 // 数据来源：AssignmentStore（调度状态） + WorkStore（执行实例与阶段）。
 func (a *API) handleBackgroundTasks(ctx context.Context, c *app.RequestContext) {
-	sessionID := c.Param("id")
-	if sessionID == "" {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": "session id is required"})
+	sessionID, ok := a.requireSessionID(c)
+	if !ok {
 		return
 	}
 	if a.assignments == nil || a.works == nil {
