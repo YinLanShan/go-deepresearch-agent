@@ -154,12 +154,8 @@ func setupTools(cfg config.Config) (*agenttool.Registry, adk.CheckPointStore) {
 		}
 	}
 
-	var requireApproval []string
-	for _, p := range strings.Split(cfg.Tool.RequireApproval, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			requireApproval = append(requireApproval, p)
-		}
-	}
+	// 审批策略：支持 "-" / "none" 显式关闭；留空沿用默认（全部审批）。
+	requireApproval := cfg.Tool.ApprovalRequired()
 
 	reg := agenttool.NewRegistry(context.Background(), agenttool.RegistryConfig{
 		MCPServers:          servers,

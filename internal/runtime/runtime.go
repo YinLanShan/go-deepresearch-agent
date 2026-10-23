@@ -176,28 +176,28 @@ func (r *Runtime) ExecutionStatus() map[string]int {
 	return out
 }
 
-// ProposeAssignments 由 SupervisorLoop 调用：提交一批 Mock Assignment。
+// ProposeAssignments 由 SupervisorLoop 调用（源自模型调用的 submit_assignments 工具）：
+// 把模型给出的研究目标落库并交给 Scheduler 调度。
 //
-// 本阶段为最小链路实现——每个 RunTask 只在首轮产生一次 Assignment，
-// 目标由研究需求派生（不调用模型），避免形成无限扩增。
+// 是否派发、派发几个完全由模型决定，Runtime 不做轮次限流。
+// Assignment 归属 RunTask：RunTask 被删除时其下 Assignment 一并删除。
 //
-// 返回 dispatched 表示本次是否真的派发了 Assignment。
-func (r *Runtime) ProposeAssignments(ctx context.Context, taskID, runTaskID, requirement string) (bool, error) {
-	if r.assignments == nil || r.bus == nil {
-		return false, nil
-	}
-	if existing, err := r.assignments.ListByRunTask(ctx, runTaskID); err == nil && len(existing) > 0 {
-		return false, nil // 已有 Assignment，不重复派发
+// 返回 accepted 表示成功登记并交给 Scheduler 的数量。
+func (r *Runtime) ProposeAssignments(ctx context.Context, taskID, runTaskID string, goals []string) (int, error) {
+	if r.assignments == nil || r.bus == nil || len(goals) == 0 {
+		return 0, nil
 	}
 
 	task, err := r.tasks.Get(ctx, taskID)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	now := r.now()
-	goals := mockAssignmentGoals(requirement)
 	list := make([]*domain.Assignment, 0, len(goals))
 	for _, goal := range goals {
+		if strings.TrimSpace(goal) == "" {
+			continue
+		}
 		list = append(list, &domain.Assignment{
 			ID:        ids.New(),
 			SessionID: task.SessionID,
@@ -209,9 +209,12 @@ func (r *Runtime) ProposeAssignments(ctx context.Context, taskID, runTaskID, req
 			UpdatedAt: now,
 		})
 	}
+	if len(list) == 0 {
+		return 0, nil
+	}
 
-	slog.Info("runtime: proposing assignments", "task", taskID, "count", len(list))
-	// 同步发布，确保返回时 Scheduler 已完成登记，后续"是否仍有未完成 Assignment"判断可靠。
+	slog.Info("runtime: proposing assignments", "task", taskID, "run_task", runTaskID, "count", len(list))
+	// 同步发布，确保返回时 Scheduler 已完成登记与槽位预留。
 	if err := r.bus.PublishSync(ctx, event.EventEnvelope{
 		Data: event.AssignmentSubmittedEvent{
 			SessionID:   task.SessionID,
@@ -220,9 +223,9 @@ func (r *Runtime) ProposeAssignments(ctx context.Context, taskID, runTaskID, req
 			Assignments: list,
 		},
 	}); err != nil {
-		return false, err
+		return 0, err
 	}
-	return true, nil
+	return len(list), nil
 }
 
 // HasPendingAssignments 判断某个 RunTask 是否仍有未完成的 Assignment。
@@ -240,18 +243,6 @@ func (r *Runtime) HasPendingAssignments(ctx context.Context, runTaskID string) b
 		}
 	}
 	return false
-}
-
-// mockAssignmentGoals 从研究需求派生固定的 Mock 研究目标。
-func mockAssignmentGoals(requirement string) []string {
-	req := strings.TrimSpace(requirement)
-	if req == "" {
-		req = "当前研究主题"
-	}
-	return []string{
-		"收集与「" + req + "」相关的基础事实",
-		"分析「" + req + "」的关键权衡与约束",
-	}
 }
 
 // Approve 提交一次工具审批决定，触发对应 Task 的 SupervisorLoop 走 Eino 恢复流程。
@@ -508,6 +499,9 @@ func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 }
 
 // onRunTaskDelete 协商后原子删除指定 Task 的 RunTask。
+//
+// Assignment 归属 RunTask：RunTask 消失则其下 Assignment（及其 Work）一并删除，
+// 避免留下指向已删除 RunTask 的孤儿数据。
 // 无 RunTask 时视为幂等（返回 nil）。
 func (r *Runtime) onRunTaskDelete(ctx context.Context, taskID string) error {
 	rt, err := r.runs.GetByTask(ctx, taskID)
@@ -524,7 +518,33 @@ func (r *Runtime) onRunTaskDelete(ctx context.Context, taskID string) error {
 		return err
 	}
 	r.stopSupervisor(taskID)
+	// 级联删除该 RunTask 下的 Assignment（Work 由 Scheduler/WorkPool 侧同步清理）。
+	if err := r.purgeRunTaskExecution(ctx, rt.ID); err != nil {
+		slog.Warn("purge run task execution failed", "run_task", rt.ID, "err", err)
+	}
 	return nil
+}
+
+// purgeRunTaskExecution 删除某个 RunTask 下的全部 Assignment 与 Work。
+//
+// Assignment/Work 归属 RunTask：RunTask 消失后它们不再有意义，
+// 必须一并删除，避免前端后台任务面板读到孤儿数据。
+func (r *Runtime) purgeRunTaskExecution(ctx context.Context, runTaskID string) error {
+	if runTaskID == "" {
+		return nil
+	}
+	var firstErr error
+	if r.assignments != nil {
+		if err := r.assignments.DeleteByRunTask(ctx, runTaskID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if r.works != nil {
+		if err := r.works.DeleteByRunTask(ctx, runTaskID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // disableOtherRunningSessions 保证全局同一时间只有一个 RunTask 处于 Running。

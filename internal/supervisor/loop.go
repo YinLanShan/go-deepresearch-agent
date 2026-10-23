@@ -57,11 +57,11 @@ type Config struct {
 	Policy agenttool.Policy
 	// CheckPoints 用于中断时序列化 Checkpoint；为 nil 时不支持审批恢复。
 	CheckPoints adk.CheckPointStore
-	// Proposer 用于在轮次结束后提交 Assignment；为 nil 时不派发。
+	// Proposer 用于派发 Assignment（由 submit_assignments 工具触发）；为 nil 时不派发。
 	Proposer AssignmentProposer
 }
 
-// AssignmentProposer 由 Runtime 实现：Supervisor 每轮结束后可提交新的研究目标。
+// AssignmentProposer 由 Runtime 实现：接收模型通过 submit_assignments 提交的研究目标。
 //
 // 对应 docs/Architecture.md 5.6 的边界：Supervisor 决定"研究什么"，
 // Scheduler 决定"什么时候执行"；Supervisor 不关心调度细节。
@@ -69,7 +69,8 @@ type Config struct {
 // 注意：派发是异步的，Supervisor 不会等待 Assignment 完成，
 // 本轮可以正常结束；结果提交后由 ResearchStateCommitted 事件唤醒下一轮。
 type AssignmentProposer interface {
-	ProposeAssignments(ctx context.Context, taskID, runTaskID, requirement string) (dispatched bool, err error)
+	// ProposeAssignments 派发一批研究目标（goals 已由工具侧校验）。
+	ProposeAssignments(ctx context.Context, taskID, runTaskID string, goals []string) (accepted int, err error)
 }
 
 // Loop 是 SupervisorLoop。
@@ -85,8 +86,6 @@ type Loop struct {
 	policy      agenttool.Policy
 	checkPoints adk.CheckPointStore
 	proposer    AssignmentProposer
-	// proposed 保证每个 Loop 只在首轮派发一次 Assignment（最小链路，避免无限扩增）。
-	proposed bool
 	// finishing / finishConclusion 记录模型通过 finish_research 表达的终结意图。
 	// 一旦置位不可撤销（不允许模型"反悔"）。
 	finishing        bool
@@ -104,10 +103,11 @@ type Loop struct {
 	stopped  bool
 }
 
-// 编译期断言：实现事件订阅、工具动作上报与"结束研究"接收接口。
+// 编译期断言：实现事件订阅、工具动作上报、"派发子任务"与"结束研究"接收接口。
 var (
 	_ event.EventSender  = (*Loop)(nil)
 	_ agenttool.Recorder = (*Loop)(nil)
+	_ agenttool.Assigner = (*Loop)(nil)
 	_ agenttool.Finisher = (*Loop)(nil)
 )
 
@@ -369,8 +369,15 @@ func (l *Loop) prepareAgent(ctx context.Context, _ *adk.TurnLoop[Input, *schema.
 		},
 	}
 
-	tools := make([]tool.BaseTool, 0, len(l.tools)+1)
+	tools := make([]tool.BaseTool, 0, len(l.tools)+2)
 	tools = append(tools, l.tools...)
+	// 派发子任务：模型决定"研究什么"的唯一入口。
+	if assignTool, err := agenttool.NewSubmitAssignmentsTool(l); err != nil {
+		slog.Error("create submit_assignments tool failed", "task", l.taskID, "err", err)
+	} else {
+		tools = append(tools, assignTool)
+	}
+	// 宣布研究结束：研究进入终结态的唯一入口。
 	if finishTool, err := agenttool.NewFinishResearchTool(l); err != nil {
 		slog.Error("create finish_research tool failed", "task", l.taskID, "err", err)
 	} else {
@@ -520,9 +527,9 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 		return err
 	}
 
-	// 本轮结束（非终结）：派发后续 Assignment 后立即结束本轮，不等它们完成。
+	// 本轮结束（非终结）：Assignment 已由模型通过 submit_assignments 工具派发，
+	// 这里只需结束本轮即可，不等待子任务完成。
 	// RunTask 保持 running，Loop 保留；结果提交后由 ResearchStateCommitted 唤醒下一轮。
-	l.proposeAssignments(ctx)
 	l.publishOutputDone()
 	return err
 }
@@ -639,25 +646,27 @@ func (l *Loop) publishResearchFinished() {
 //
 // 本阶段为最小链路：每个 Loop 只在首轮派发一次，避免形成无限扩增。
 // Supervisor 只负责"研究什么"，调度由 Scheduler 决定。
-func (l *Loop) proposeAssignments(ctx context.Context) {
+// SubmitAssignments 实现 agenttool.Assigner：模型调用 submit_assignments 时派发子任务。
+//
+// 是否派发、派发几个、目标是什么，全部由模型决定；这里只做转交与计数。
+func (l *Loop) SubmitAssignments(ctx context.Context, goals []string) (int, []string, error) {
 	if l.proposer == nil {
-		return
+		return 0, nil, errors.New("assignments are not supported in this loop")
 	}
+	// 已进入终结流程时不再接受新的子任务。
 	l.mu.Lock()
-	if l.proposed {
-		l.mu.Unlock()
-		return
-	}
-	l.proposed = true
+	finishing := l.finishing
 	l.mu.Unlock()
+	if finishing {
+		return 0, []string{"研究已进入结束流程，不再派发新子任务"}, nil
+	}
 
-	requirement := ""
-	if st, err := l.states.Get(ctx, l.taskID); err == nil {
-		requirement = st.Requirement
+	accepted, err := l.proposer.ProposeAssignments(ctx, l.taskID, l.runTaskID, goals)
+	if err != nil {
+		return 0, nil, err
 	}
-	if _, err := l.proposer.ProposeAssignments(ctx, l.taskID, l.runTaskID, requirement); err != nil {
-		slog.Error("propose assignments failed", "task", l.taskID, "err", err)
-	}
+	slog.Info("supervisor: assignments submitted", "task", l.taskID, "accepted", accepted)
+	return accepted, nil, nil
 }
 
 // commitFinding 把模型回答作为 Finding Commit 到 ResearchState。

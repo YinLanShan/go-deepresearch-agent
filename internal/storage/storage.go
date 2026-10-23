@@ -58,22 +58,26 @@ type RunTaskStore interface {
 
 // AssignmentStore 定义 Assignment 的持久化能力。
 //
-// Assignment 归属某个 RunTask；Scheduler 依据其中的状态做排队与并发控制，
-// ResultAggregator 在同一条记录上写入最终 Result。
+// Assignment 归属某个 RunTask（RunTask 消失则 Assignment 消失）：
+// Scheduler 依据其中的状态做排队与并发控制，ResultAggregator 写入最终 Result。
 type AssignmentStore interface {
 	Create(ctx context.Context, a *domain.Assignment) error
 	Get(ctx context.Context, id string) (*domain.Assignment, error)
 	ListByRunTask(ctx context.Context, runTaskID string) ([]*domain.Assignment, error)
 	Update(ctx context.Context, a *domain.Assignment) error
+	// DeleteByRunTask 删除某个 RunTask 下的全部 Assignment（RunTask 被删除时级联）。
+	DeleteByRunTask(ctx context.Context, runTaskID string) error
 }
 
 // WorkStore 定义 Work 的持久化能力。
 //
 // Work 是 Assignment 的一次执行实例，由 WorkPool 创建并更新状态；
-// 前端"后台任务"面板直接读取该存储。
+// 前端"后台任务"面板直接读取该存储。Work 同样归属 RunTask。
 type WorkStore interface {
 	Create(ctx context.Context, w *domain.Work) error
 	Get(ctx context.Context, id string) (*domain.Work, error)
 	ListByRunTask(ctx context.Context, runTaskID string) ([]*domain.Work, error)
 	Update(ctx context.Context, w *domain.Work) error
+	// DeleteByRunTask 删除某个 RunTask 下的全部 Work（RunTask 被删除时级联）。
+	DeleteByRunTask(ctx context.Context, runTaskID string) error
 }

@@ -351,7 +351,9 @@ func (p *WorkPool) publish(data event.Event) {
 // Send 处理异步事件（当前无需要）。
 func (p *WorkPool) Send(_ context.Context, _ event.EventEnvelope) error { return nil }
 
-// SendSync 参与 Runtime 的协商：全局中止时标记并停止该 RunTask 的 Work。
+// SendSync 参与 Runtime 的协商：
+//   - ActionStop  ：全局中止时标记并停止该 RunTask 的 Work；
+//   - ActionDelete：RunTask 被删除时，丢弃其排队条目并取消执行中的 Work。
 //
 // 非协商事件委托给 Send，保证 PublishSync 投递的事件不会丢失。
 func (p *WorkPool) SendSync(ctx context.Context, e event.EventEnvelope, h *event.Handshake) error {
@@ -361,14 +363,44 @@ func (p *WorkPool) SendSync(ctx context.Context, e event.EventEnvelope, h *event
 		h.Reply(err)
 		return nil
 	}
-	if req.Action == event.ActionStop {
+	switch req.Action {
+	case event.ActionStop:
 		n := p.Cancel(req.RunTaskID)
 		if n > 0 {
 			slog.Info("workpool: cancelled works on stop", "run_task", req.RunTaskID, "count", n)
 		}
+	case event.ActionDelete:
+		p.forgetRunTask(req.RunTaskID)
 	}
 	h.Reply(nil)
 	return nil
+}
+
+// forgetRunTask 丢弃某个 RunTask 的排队条目，并取消其执行中的 Work。
+//
+// Work 数据由 Runtime 通过 WorkStore.DeleteByRunTask 级联删除；
+// 这里只保证删除后不再有新的执行被启动。
+func (p *WorkPool) forgetRunTask(runTaskID string) {
+	if runTaskID == "" {
+		return
+	}
+	p.mu.Lock()
+	kept := make([]*domain.Work, 0, len(p.queue))
+	for _, w := range p.queue {
+		if w.RunTaskID == runTaskID {
+			continue
+		}
+		kept = append(kept, w)
+	}
+	p.queue = kept
+	// 取消正在执行的 Work，避免删除后仍在后台写数据。
+	for id := range p.byRun[runTaskID] {
+		if cancel, ok := p.cancels[id]; ok {
+			cancel()
+		}
+	}
+	delete(p.byRun, runTaskID)
+	p.mu.Unlock()
 }
 
 // Status 返回当前排队与执行中的 Work 数量（用于诊断与测试）。

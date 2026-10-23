@@ -334,6 +334,26 @@ func (s *AssignmentStore) Update(_ context.Context, a *domain.Assignment) error 
 	return nil
 }
 
+// DeleteByRunTask 删除某个 RunTask 下的全部 Assignment（RunTask 被删除时级联）。
+func (s *AssignmentStore) DeleteByRunTask(_ context.Context, runTaskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.seq[:0]
+	for _, id := range s.seq {
+		a, ok := s.m[id]
+		if !ok {
+			continue
+		}
+		if a.RunTaskID == runTaskID {
+			delete(s.m, id)
+			continue
+		}
+		kept = append(kept, id)
+	}
+	s.seq = kept
+	return nil
+}
+
 // ─── WorkStore ──────────────────────────────────────────────────────────────
 
 // Create 保存一个 Work。
@@ -386,7 +406,27 @@ func (s *WorkStore) Update(_ context.Context, w *domain.Work) error {
 	return nil
 }
 
-// cloneWork 复制 Work（Work 内含互斥锁，不能直接按值复制后使用其锁）。
+// DeleteByRunTask 删除某个 RunTask 下的全部 Work（RunTask 被删除时级联）。
+func (s *WorkStore) DeleteByRunTask(_ context.Context, runTaskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.seq[:0]
+	for _, id := range s.seq {
+		w, ok := s.m[id]
+		if !ok {
+			continue
+		}
+		if w.RunTaskID == runTaskID {
+			delete(s.m, id)
+			continue
+		}
+		kept = append(kept, id)
+	}
+	s.seq = kept
+	return nil
+}
+
+// cloneWork 复制 Work。
 func cloneWork(w *domain.Work) *domain.Work {
 	cp := *w
 	cp.Constraint = nil

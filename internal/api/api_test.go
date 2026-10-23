@@ -22,10 +22,13 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/resultagg"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/scheduler"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage/memory"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/workpool"
 )
 
 // harness 装配 bus + Runtime + API，用于事件驱动的端到端测试。
@@ -44,23 +47,42 @@ func newHarness() *harness {
 
 // newHarnessWith 以指定模型提供方装配 harness。
 //
-// "mock" 模型不调用任何工具，因此不会触发 finish_research，研究不会终结；
-// 需要验证"模型宣布结束"的生命周期测试应使用 "mock-tool"。
+// 装配真实的执行平面（Scheduler / WorkPool / ResultAggregator），
+// 因为 Supervisor 通过 submit_assignments 派发的子任务需要它们执行与提交。
+//
+// "mock" 模型不调用任何工具，因此不会派发子任务、也不会调用 finish_research；
+// 需要验证完整生命周期（派发 → 执行 → 结束）的测试应使用 "mock-tool"。
 func newHarnessWith(provider string) *harness {
 	sessions := memory.NewSessionStore()
 	tasks := memory.NewTaskStore()
 	runs := memory.NewRunTaskStore()
 	states := stateMemory.NewStore()
+	assignments := memory.NewAssignmentStore()
+	works := memory.NewWorkStore()
 	bus := event.NewBus()
-	runtime.RegisterMockCoordinators(bus, "supervisor", "scheduler", "workpool")
+
+	agg := resultagg.New(resultagg.Config{States: states, Bus: bus})
+	pool := workpool.New(workpool.Config{
+		Works: works, Bus: bus,
+		Worker: workpool.NewMockWorker(5 * time.Millisecond), Workers: 2,
+	})
+	sched := scheduler.New(scheduler.Config{
+		Assignments: assignments, Works: works, Pool: pool, Slots: agg,
+		Bus: bus, MaxConcurrency: 2,
+	})
+	agg.SetSchedulerNotifier(sched)
+
 	mdl, err := llm.NewSwappable(context.Background(), llm.Config{Provider: provider})
 	if err != nil {
 		panic(err)
 	}
 	rt := runtime.New(runs, tasks, states, mdl, bus)
+	rt.SetExecution(assignments, works, sched, pool, agg)
 	rt.Start()
+
 	a := New(service.NewChatService(mdl), sessions, tasks,
 		service.NewRunService(tasks, runs, states, bus), service.NewConfigService(mdl))
+	a.SetExecutionStores(assignments, works)
 	return &harness{api: a, rt: rt, runs: runs, tasks: tasks, sessions: sessions, states: states}
 }
 
@@ -584,9 +606,13 @@ func waitResearchFindings(t *testing.T, states *stateMemory.Store, sessionID str
 	t.Fatalf("want %d findings, got %+v", want, st)
 }
 
+// waitRunStatus 等待 RunTask 进入目标状态。
+//
+// 超时放宽到 10s：mock-tool 的完整链路包含"派发子任务 → 子任务执行 →
+// 结果提交唤醒新一轮 → finish_research"，比纯 mock 更耗时。
 func waitRunStatus(t *testing.T, runs *memory.RunTaskStore, taskID string, want domain.RunStatus) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		rt, err := runs.GetByTask(context.Background(), taskID)
 		if err == nil && rt.Status == want {

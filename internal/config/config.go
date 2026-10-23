@@ -52,9 +52,46 @@ type ToolConfig struct {
 	// EnableBuiltinSearch 为 true 时注册内置演示搜索工具（无 MCP Server 也能跑通链路）。
 	EnableBuiltinSearch bool
 	// RequireApproval 是需要人工审批的工具名，逗号分隔；"*" 表示全部工具。
+	//
+	// 显式关闭审批：设为 "-" 或 "none"（不区分大小写），表示所有工具都不需要审批。
+	// 留空等同于默认值 "*"，即全部需要审批——请勿用空值表达"关闭"。
 	RequireApproval string
 	// ApprovalTimeoutSeconds 是审批等待超时秒数，<=0 时使用默认值。
 	ApprovalTimeoutSeconds int
+}
+
+// 审批开关的显式关闭标记。
+const (
+	// ApprovalOffDash 是"关闭审批"的简写标记。
+	ApprovalOffDash = "-"
+	// ApprovalOffNone 是"关闭审批"的语义化标记。
+	ApprovalOffNone = "none"
+)
+
+// ApprovalRequired 解析 RequireApproval 并返回需要审批的工具名列表。
+//
+// 返回 nil 表示所有工具都不需要审批。
+func (c ToolConfig) ApprovalRequired() []string {
+	raw := strings.TrimSpace(c.RequireApproval)
+	switch strings.ToLower(raw) {
+	case "", ApprovalOffDash, ApprovalOffNone:
+		if raw == "" {
+			// 留空沿用默认：全部需要审批（默认值由 Load 填入 "*"，这里只处理被显式清空的情况）
+			return []string{"*"}
+		}
+		return nil
+	}
+
+	out := make([]string, 0, 4)
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Load 从环境变量读取配置，缺失时使用默认值。

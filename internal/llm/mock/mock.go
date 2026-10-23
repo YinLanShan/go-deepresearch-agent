@@ -55,6 +55,10 @@ type ToolModel struct {
 	Arguments string
 	// CallFinish 为 true 时，出结论后会调用 finish_research 宣布研究结束。
 	CallFinish bool
+	// CallAssign 为 true 时，首步调用 submit_assignments 派发研究子任务。
+	CallAssign bool
+	// AssignGoals 是 CallAssign 时要派发的子任务目标；为空时按需求派生默认目标。
+	AssignGoals []string
 }
 
 // defaultPreferTools 是默认的工具优先级列表：
@@ -115,7 +119,11 @@ func argsFor(toolName, fallback string) string {
 	}
 }
 
-// Generate 按"检索 → 出结论 → 宣布结束"的顺序推进（CallFinish 为 true 时）。
+// Generate 按"派发子任务 → 检索 → 出结论 → 宣布结束"的顺序推进。
+//
+// 可配置能力（默认全部关闭，保持既有测试行为稳定）：
+//   - CallAssign：首步调用 submit_assignments 派发子任务；
+//   - CallFinish：出结论后调用 finish_research 宣布研究结束。
 func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 	cfg := model.GetCommonOptions(&model.Options{}, opts...)
 	var available []*schema.ToolInfo
@@ -123,22 +131,80 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 		available = cfg.Tools
 	}
 
-	// 已看到过工具结果：判断是否已经完成过一次检索、是否已调用过 finish_research。
+	// 统计已发生的工具调用，决定当前处于流程哪一步。
+	//
+	// 注意：Supervisor 被 résultat 唤醒时会以新输入开启一轮（历史里可能没有
+	// 上一轮的工具消息），因此还要扫描 assistant 消息里的 ToolCalls，
+	// 否则会重复派发同一批子任务，形成无限扩增。
 	var lastToolResult string
-	sawFinishResult := false
+	var sawAssignResult, sawFinishResult, assignedBefore bool
 	for _, msg := range input {
-		if msg == nil || msg.Role != schema.Tool {
+		if msg == nil {
+			continue
+		}
+		if msg.Role == schema.Assistant {
+			for _, tc := range msg.ToolCalls {
+				switch tc.Function.Name {
+				case submitAssignmentsToolName:
+					assignedBefore = true
+				case finishToolName:
+					sawFinishResult = true
+				}
+			}
+			continue
+		}
+		if msg.Role != schema.Tool {
 			continue
 		}
 		lastToolResult = msg.Content
-		if msg.ToolName == finishToolName {
+		switch msg.ToolName {
+		case submitAssignmentsToolName:
+			sawAssignResult = true
+		case finishToolName:
 			sawFinishResult = true
 		}
 	}
+	// 已经派发过子任务（无论工具结果是否还在历史里）就不再重复派发。
+	alreadyAssigned := sawAssignResult || assignedBefore
 
 	// 调用过 finish_research 之后：输出最终回答，不再发起工具调用。
 	if sawFinishResult {
 		return schema.AssistantMessage("研究已完成，以上为本次研究的最终结论。", nil), nil
+	}
+
+	// 首步：派发子任务（若配置且工具可用，且此前未派发过）。
+	if m.CallAssign && !alreadyAssigned && hasTool(available, submitAssignmentsToolName) {
+		msg := schema.AssistantMessage("我先拆分出需要并行推进的研究子任务。", nil)
+		msg.ToolCalls = []schema.ToolCall{{
+			ID:   "call-assign",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      submitAssignmentsToolName,
+				Arguments: m.assignArguments(),
+			},
+		}}
+		return msg, nil
+	}
+
+	// 已派发过子任务：不再检索，直接出结论；配置了 CallFinish 则顺便宣布结束。
+	if alreadyAssigned {
+		conclusion := "已把研究拆分给后台子任务并汇总其结论。"
+		if lastToolResult != "" {
+			conclusion = "根据检索结果，可以得出结论：" + lastToolResult
+		}
+		if m.CallFinish && hasTool(available, finishToolName) {
+			msg := schema.AssistantMessage(conclusion+" 研究到此结束。", nil)
+			msg.ToolCalls = []schema.ToolCall{{
+				ID:   "call-finish",
+				Type: "function",
+				Function: schema.FunctionCall{
+					Name:      finishToolName,
+					Arguments: `{"conclusion":"` + escapeJSON(conclusion) + `"}`,
+				},
+			}}
+			return msg, nil
+		}
+		return schema.AssistantMessage(conclusion, nil), nil
 	}
 
 	// 已有检索结果：出结论；若配置了 CallFinish，则再调用一次 finish_research 宣布结束。
@@ -174,6 +240,25 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 
 // finishToolName 与 internal/tool.FinishToolName 保持一致（避免反向依赖）。
 const finishToolName = "finish_research"
+
+// submitAssignmentsToolName 与 internal/tool.SubmitAssignmentsToolName 保持一致。
+const submitAssignmentsToolName = "submit_assignments"
+
+// assignArguments 构造 submit_assignments 的调用参数。
+func (m *ToolModel) assignArguments() string {
+	goals := m.AssignGoals
+	if len(goals) == 0 {
+		goals = []string{
+			"收集与该主题相关的基础事实",
+			"分析该主题的关键权衡与约束",
+		}
+	}
+	parts := make([]string, 0, len(goals))
+	for _, g := range goals {
+		parts = append(parts, `{"goal":"`+escapeJSON(g)+`"}`)
+	}
+	return `{"assignments":[` + strings.Join(parts, ",") + `]}`
+}
 
 // hasTool 判断模型可见工具里是否包含指定名称。
 func hasTool(available []*schema.ToolInfo, name string) bool {

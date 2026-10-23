@@ -300,7 +300,9 @@ func (s *Scheduler) Send(_ context.Context, e event.EventEnvelope) error {
 	return nil
 }
 
-// SendSync 参与 Runtime 的协商：全局中止时标记所有未完成 Assignment 为取消。
+// SendSync 参与 Runtime 的协商：
+//   - ActionStop  ：全局中止时标记所有未完成 Assignment 为取消；
+//   - ActionDelete：RunTask 被删除时，丢弃其排队条目并释放结果槽位。
 //
 // 注意：PublishSync 只会投递到 SyncEventSender，因此这里必须把
 // 非协商事件委托给 Send，否则同步发布的 AssignmentSubmittedEvent 会被丢弃。
@@ -313,11 +315,45 @@ func (s *Scheduler) SendSync(ctx context.Context, e event.EventEnvelope, h *even
 		h.Reply(err)
 		return nil
 	}
-	if req.Action == event.ActionStop {
+	switch req.Action {
+	case event.ActionStop:
 		s.cancelRunTask(req.RunTaskID)
+	case event.ActionDelete:
+		s.forgetRunTask(req.RunTaskID)
 	}
 	h.Reply(nil)
 	return nil
+}
+
+// forgetRunTask 丢弃某个 RunTask 的排队条目并释放对应的结果槽位。
+//
+// Assignment 数据本身由 Runtime 通过 AssignmentStore.DeleteByRunTask 级联删除；
+// 这里只清理 Scheduler 的内存状态，避免删除后仍被调度。
+func (s *Scheduler) forgetRunTask(runTaskID string) {
+	if runTaskID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	kept := make([]*domain.Assignment, 0, len(s.queue))
+	for _, a := range s.queue {
+		if a.RunTaskID == runTaskID {
+			continue
+		}
+		kept = append(kept, a)
+	}
+	s.queue = kept
+	s.mu.Unlock()
+
+	list, err := s.assignments.ListByRunTask(context.Background(), runTaskID)
+	if err != nil {
+		return
+	}
+	for _, a := range list {
+		if s.slots != nil {
+			s.slots.Cancel(a.ID)
+		}
+	}
 }
 
 // enqueue 登记并排队一批 Assignment。

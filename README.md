@@ -192,12 +192,30 @@ WorkPool 把未完成 Work 标记 `cancelled`、ResultAggregator 丢弃待提交
 模型宣布结束后**不可撤销**：Loop 拒绝新的推理输入，Runtime 停止 SupervisorLoop
 并关闭提交门控。`finish_research` 不参与审批（它只是决策，无外部副作用）。
 
+**委派语义**：模型通过 `submit_assignments` 工具决定"研究什么"——
+
+```json
+{"assignments":[
+  {"goal":"收集与该主题相关的基础事实"},
+  {"goal":"分析该主题的关键权衡与约束"}
+]}
+```
+
+- 派发几个、目标是什么**完全由模型决定**，Runtime 不做轮次限流；
+- 工具立即返回，子任务在后台异步执行，模型可立刻结束本轮；
+- 子任务结果提交后唤醒下一轮，模型据此继续决策或宣布结束；
+- 单次调用最多 8 个子任务、单个目标不超过 500 字符，超出部分会被拒绝并回告模型。
+
+**Assignment 归属 RunTask**：RunTask 消失则其下 Assignment 与 Work 一并删除
+（`DeleteByRunTask` 级联），不会留下孤儿数据。
+
 **配置**：
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `DRA_SCHEDULER_MAX_CONCURRENCY` | 2 | Scheduler 同时调度的 Assignment 上限 |
 | `DRA_WORKPOOL_WORKERS` | 2 | WorkPool 的 Worker 数量 |
+| `DRA_TOOL_REQUIRE_APPROVAL` | `*` | 需审批的工具名；`-` 或 `none` 显式关闭审批 |
 
 **查询接口**：`GET /api/v1/sessions/:id/background-tasks` 返回当前 RunTask 下的
 Assignment 与其最新 Work（状态、阶段、Worker、耗时）；SSE 同时推送
@@ -248,7 +266,7 @@ Supervisor 是 ReAct Agent。工具在 `prepareAgent` 时注入 `ChatModelAgentC
 |---|---|
 | `DRA_MCP_SERVERS` | MCP Server 列表的 JSON 数组；空则只用内置工具 |
 | `DRA_ENABLE_BUILTIN_SEARCH` | 默认 `true`，注册内置演示 `web_search`（返回确定性数据，便于无 MCP 时验证链路） |
-| `DRA_TOOL_REQUIRE_APPROVAL` | 需审批的工具名，逗号分隔；`*` 表示全部（默认） |
+| `DRA_TOOL_REQUIRE_APPROVAL` | 需审批的工具名，逗号分隔；`*` 表示全部（默认）；`-` 或 `none` 显式关闭 |
 
 `DRA_MCP_SERVERS` 示例：
 
