@@ -85,6 +85,13 @@ func New(ctx context.Context, cfg Config) (ChatModel, error) {
 		m.CallAssign = true
 		m.CallFinish = true
 		return m, nil
+	case "mock-cancel":
+		// 撤销链路演示：派发 → 结果提交 → 撤销一个已提交结果的子任务 → 结束。
+		m := mock.NewToolModel()
+		m.CallAssign = true
+		m.CallFinish = true
+		m.CancelCompleted = true
+		return m, nil
 	case "openai":
 		return newOpenAI(ctx, cfg)
 	default:

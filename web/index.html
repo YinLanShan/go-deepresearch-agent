@@ -743,6 +743,13 @@ const BG_STAGE_TEXT = {
   queued: '排队', starting: '启动', planning: '规划', retrieving: '检索',
   analyzing: '分析', summarizing: '归纳', finished: '完成',
 };
+// 提交历史中的操作类型（提交与撤销都是提交动作）
+const COMMIT_OP_TEXT = {
+  commit_result: '提交结果',
+  commit_finding: '提交过程',
+  revoke_result: '撤销结果',
+  set_conclusion: '写入结论',
+};
 
 function bgDotClass(task) {
   // 优先反映执行实例状态，其次反映调度状态
@@ -920,6 +927,26 @@ function renderState(st) {
   if (!findings.length) html += '<div class="state-empty">暂无</div>';
   for (const f of findings) {
     html += `<div class="state-item"><span class="turn">第 ${esc(f.turn)} 轮</span><br/>${esc(f.content || '')}</div>`;
+  }
+  html += `</div>`;
+
+  // 提交历史：提交与撤销都是提交动作，这里按序号倒序展示最近的操作。
+  const commitLog = st.commit_log || [];
+  html += `<div class="state-block"><h4>提交历史（${commitLog.length}）</h4>`;
+  if (!commitLog.length) html += '<div class="state-empty">暂无</div>';
+  for (const rec of commitLog.slice().reverse()) {
+    const op = COMMIT_OP_TEXT[rec.op] || rec.op;
+    const detail = rec.reason
+      ? `<br/><em>原因：${esc(rec.reason)}</em>`
+      : '';
+    const who = rec.assignment_id
+      ? `<br/><span class="k">子任务：</span>${esc(rec.assignment_id.slice(0, 8))}`
+      : '';
+    html += `<div class="state-item">`
+      + `<span class="turn">#${esc(rec.seq)} · v${esc(rec.version)}</span> `
+      + `<strong>${esc(op)}</strong>`
+      + who
+      + `<br/>${esc(rec.content || '')}${detail}</div>`;
   }
   html += `</div>`;
 

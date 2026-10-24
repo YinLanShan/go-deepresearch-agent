@@ -75,7 +75,13 @@ type State struct {
 	// 仅用于前端切换会话时回放，不进入 Supervisor 提示词。
 	History []Message `json:"history"`
 
-	// Version 是版本号，每次 Commit 自增。
+	// CommitLog 是该节点的提交历史（只追加，不修改）。
+	//
+	// 提交与撤销都是"提交动作"，都会在此留下记录，用于审计与排查：
+	// 每条记录包含操作类型、涉及的 Assignment / Result 以及原因。
+	CommitLog []CommitRecord `json:"commit_log"`
+
+	// Version 是版本号，每次提交动作（含撤销）自增。
 	Version int64 `json:"version"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -84,11 +90,48 @@ type State struct {
 
 // Result 是某一次具体执行产生的原始研究产物（证据）。
 type Result struct {
-	ID        string       `json:"id"`
-	Turn      int          `json:"turn"`
-	Content   string       `json:"content"`
-	Status    ResultStatus `json:"status"`
-	CreatedAt time.Time    `json:"created_at"`
+	ID string `json:"id"`
+	// AssignmentID 是产生该 Result 的 Assignment，用于撤销时精确定位。
+	AssignmentID string       `json:"assignment_id,omitempty"`
+	Turn         int          `json:"turn"`
+	Content      string       `json:"content"`
+	Status       ResultStatus `json:"status"`
+	CreatedAt    time.Time    `json:"created_at"`
+}
+
+// CommitOperation 是提交历史中的操作类型。
+type CommitOperation string
+
+const (
+	// OpCommitResult 表示提交一条研究产物。
+	OpCommitResult CommitOperation = "commit_result"
+	// OpCommitFinding 表示提交一条过程输出。
+	OpCommitFinding CommitOperation = "commit_finding"
+	// OpRevokeResult 表示撤销一条已提交的研究产物（不合法或被 Supervisor 撤回）。
+	OpRevokeResult CommitOperation = "revoke_result"
+	// OpSetConclusion 表示写入该节点的最终结论。
+	OpSetConclusion CommitOperation = "set_conclusion"
+)
+
+// CommitRecord 是提交历史中的一条记录。
+type CommitRecord struct {
+	// Seq 是单调递增的序号（从 1 开始）。
+	Seq int64 `json:"seq"`
+	// Op 是操作类型。
+	Op CommitOperation `json:"op"`
+	// Turn 是所属轮次。
+	Turn int `json:"turn,omitempty"`
+	// AssignmentID 是相关 Assignment（提交/撤销 Result 时有值）。
+	AssignmentID string `json:"assignment_id,omitempty"`
+	// ResultID 是相关 Result（撤销时指向被撤销的那条）。
+	ResultID string `json:"result_id,omitempty"`
+	// Content 是操作涉及的内容摘要（撤销时保留原文，避免审计信息丢失）。
+	Content string `json:"content,omitempty"`
+	// Reason 是撤销原因等补充说明。
+	Reason string `json:"reason,omitempty"`
+	// Version 是本次操作完成后的版本号。
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Finding 是模型的过程性输出（除工具调用外的全部 assistant 文本）。
@@ -131,12 +174,21 @@ type Message struct {
 	CreatedAt time.Time   `json:"created_at"`
 }
 
+// ResultInput 是一条待提交的研究产物。
+type ResultInput struct {
+	// AssignmentID 是产生该产物的 Assignment（撤销时按它定位）。
+	AssignmentID string
+	// Content 是研究产物正文。
+	Content string
+}
+
 // CommitInput 描述一次 ResearchState 提交。
 //
-// Commit 追加 Result 与 Finding，并把待合并的中断原文清空（已并入本轮 Finding）。
+// Commit 追加若干 Result 与至多一条 Finding，并把待合并的中断原文清空
+// （其内容已并入本次 Finding）。每条 Result 独立保存以便后续按 Assignment 撤销。
 type CommitInput struct {
-	// ResultContent 是研究产物（证据）。
-	ResultContent string
+	// Results 是本轮要提交的研究产物（可以为空）。
+	Results []ResultInput
 	// FindingContent 是模型本轮的过程性输出（已包含合并进来的中断原文）。
 	FindingContent string
 }
@@ -152,6 +204,7 @@ func New(id, taskID, sessionID string, ordinal int) *State {
 		Requirements: []string{},
 		Results:      []Result{},
 		Findings:     []Finding{},
+		CommitLog:    []CommitRecord{},
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -317,6 +370,14 @@ func (s *State) AddRequirement(requirement string) bool {
 	s.Requirements = append(s.Requirements, requirement)
 	s.UpdatedAt = time.Now()
 	return true
+}
+
+// AppendCommitRecord 追加一条提交历史记录（自动分配序号）。
+//
+// 调用方负责在此之前自增 Version，以便记录里带上本次操作完成后的版本号。
+func (s *State) AppendCommitRecord(rec CommitRecord) {
+	rec.Seq = int64(len(s.CommitLog)) + 1
+	s.CommitLog = append(s.CommitLog, rec)
 }
 
 // AddMessage 追加一条对话历史。

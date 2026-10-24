@@ -4,6 +4,7 @@ package mock
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -57,6 +58,8 @@ type ToolModel struct {
 	CallFinish bool
 	// CallAssign 为 true 时，首步调用 submit_assignments 派发研究子任务。
 	CallAssign bool
+	// CancelCompleted 为 true 时，会撤销一个已提交结果的子任务（撤销链路演示）。
+	CancelCompleted bool
 	// AssignGoals 是 CallAssign 时要派发的子任务目标；为空时按需求派生默认目标。
 	AssignGoals []string
 }
@@ -140,9 +143,14 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 	// lastSearchResult 只记录"业务工具"（如 web_search）的返回，
 	// 不把 submit_assignments / finish_research 的控制类返回当作研究证据。
 	var lastSearchResult string
-	var sawAssignResult, sawFinishResult, assignedBefore bool
+	var sawAssignResult, sawFinishResult, assignedBefore, cancelledBefore bool
+	var instruction string
 	for _, msg := range input {
 		if msg == nil {
+			continue
+		}
+		if msg.Role == schema.System {
+			instruction = msg.Content
 			continue
 		}
 		if msg.Role == schema.Assistant {
@@ -150,6 +158,8 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 				switch tc.Function.Name {
 				case submitAssignmentsToolName:
 					assignedBefore = true
+				case cancelAssignmentsToolName:
+					cancelledBefore = true
 				case finishToolName:
 					sawFinishResult = true
 				}
@@ -191,8 +201,31 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 		return msg, nil
 	}
 
-	// 已派发过子任务：不再检索，直接出结论；配置了 CallFinish 则顺便宣布结束。
+	// 已派发过子任务：可撤销一个已完成的子任务，然后出结论。
 	if alreadyAssigned {
+		// 撤销演示：从上下文的子任务清单里挑一个"已完成（结果已提交）"的 ID 撤销。
+		// 真实模型同样是从这段清单里读出 ID 的，因此这里模拟的是同一条路径。
+		if m.CancelCompleted && !cancelledBefore && hasTool(available, cancelAssignmentsToolName) {
+			if id := completedAssignmentID(instruction); id != "" {
+				msg := schema.AssistantMessage(
+					"有一个子任务的结果已经不需要了，我撤销它。", nil)
+				msg.ToolCalls = []schema.ToolCall{{
+					ID:   "call-cancel",
+					Type: "function",
+					Function: schema.FunctionCall{
+						Name:      cancelAssignmentsToolName,
+						Arguments: `{"assignment_ids":["` + id + `"],"reason":"mock: 结果与结论重复"}`,
+					},
+				}}
+				return msg, nil
+			}
+			// 还没有"已提交结果"的子任务：结束本轮，等结果提交后再唤醒。
+			if hasTool(available, finishToolName) {
+				return schema.AssistantMessage(
+					"子任务仍在后台执行，本轮先结束，等结果提交后继续。", nil), nil
+			}
+		}
+
 		conclusion := "已把研究拆分给后台子任务并汇总其结论。"
 		if lastSearchResult != "" {
 			conclusion = "根据检索结果，可以得出结论：" + lastSearchResult
@@ -248,6 +281,25 @@ const finishToolName = "finish_research"
 
 // submitAssignmentsToolName 与 internal/tool.SubmitAssignmentsToolName 保持一致。
 const submitAssignmentsToolName = "submit_assignments"
+
+// cancelAssignmentsToolName 与 internal/tool.CancelAssignmentsToolName 保持一致。
+const cancelAssignmentsToolName = "cancel_assignments"
+
+// completedAssignmentIDRe 匹配上下文中"已完成（结果已提交）"的子任务行。
+var completedAssignmentIDRe = regexp.MustCompile(`ID: (\S+) \| 状态: 已完成`)
+
+// completedAssignmentID 从上下文的子任务清单里取出一个已完成子任务的 ID。
+//
+// 上下文格式（由 SupervisorLoop.assignmentsSection 生成）：
+//
+//   - ID: <id> | 状态: 已完成（结果已提交） | 目标: ...
+func completedAssignmentID(instruction string) string {
+	m := completedAssignmentIDRe.FindStringSubmatch(instruction)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
 
 // assignArguments 构造 submit_assignments 的调用参数。
 func (m *ToolModel) assignArguments() string {

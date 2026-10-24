@@ -4,6 +4,7 @@ package memory
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,10 +85,10 @@ func (s *Store) ListBySession(_ context.Context, sessionID string) ([]*researchs
 	return out, nil
 }
 
-// Commit 追加一轮研究产物（Result）与过程输出（Finding），并自增版本号。
+// Commit 追加一批研究产物（Result）与至多一条过程输出（Finding），并自增版本号。
 //
 // InterruptedContext 是中间产物：其内容已由调用方并入本轮 Finding，
-// 因此这里在提交成功后清空该字段。
+// 因此这里在提交成功后清空该字段。每次提交都会写入 CommitLog。
 // 若提交门控已关闭（被挤掉的等待状态），返回 researchstate.ErrNotAccepting。
 func (s *Store) Commit(_ context.Context, taskID string, in researchstate.CommitInput) error {
 	s.mu.Lock()
@@ -101,24 +102,101 @@ func (s *Store) Commit(_ context.Context, taskID string, in researchstate.Commit
 	}
 	now := time.Now()
 	turn := len(st.Findings) + 1
+	st.Version++
 
-	st.Results = append(st.Results, researchstate.Result{
-		ID:        ids.New(),
-		Turn:      turn,
-		Content:   in.ResultContent,
-		Status:    researchstate.ResultCommitted,
-		CreatedAt: now,
-	})
-	st.Findings = append(st.Findings, researchstate.Finding{
-		Turn:      turn,
-		Content:   in.FindingContent,
-		CreatedAt: now,
-	})
+	// 逐条保存 Result，并记录提交历史（撤销时按 AssignmentID 定位）。
+	for _, item := range in.Results {
+		content := strings.TrimSpace(item.Content)
+		if content == "" {
+			continue
+		}
+		result := researchstate.Result{
+			ID:           ids.New(),
+			AssignmentID: item.AssignmentID,
+			Turn:         turn,
+			Content:      content,
+			Status:       researchstate.ResultCommitted,
+			CreatedAt:    now,
+		}
+		st.Results = append(st.Results, result)
+		st.AppendCommitRecord(researchstate.CommitRecord{
+			Op:           researchstate.OpCommitResult,
+			Turn:         turn,
+			AssignmentID: item.AssignmentID,
+			ResultID:     result.ID,
+			Content:      content,
+			Version:      st.Version,
+			CreatedAt:    now,
+		})
+	}
+
+	if finding := strings.TrimSpace(in.FindingContent); finding != "" {
+		st.Findings = append(st.Findings, researchstate.Finding{
+			Turn:      turn,
+			Content:   finding,
+			CreatedAt: now,
+		})
+		st.AppendCommitRecord(researchstate.CommitRecord{
+			Op:        researchstate.OpCommitFinding,
+			Turn:      turn,
+			Content:   finding,
+			Version:   st.Version,
+			CreatedAt: now,
+		})
+	}
+
 	// 中断原文已并入本轮 Finding，作为中间产物清空。
 	st.InterruptedContext = ""
-	st.Version++
 	st.UpdatedAt = now
 	return nil
+}
+
+// RevokeResult 撤销某个 Assignment 已提交的 Result。
+//
+// 撤销也是一个提交动作：从 Results 中物理移除对应条目（使其不再出现在
+// ResearchState 与上下文中），并把被撤销的内容写入 CommitLog 以便审计。
+// 不受提交门控限制——即使研究已结束，也允许撤销此前合法提交的结果。
+// 返回被撤销的 Result 数量。
+func (s *Store) RevokeResult(_ context.Context, taskID, assignmentID, reason string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[taskID]
+	if !ok {
+		return 0, researchstate.ErrNotFound
+	}
+	if assignmentID == "" {
+		return 0, nil
+	}
+
+	now := time.Now()
+	kept := make([]researchstate.Result, 0, len(st.Results))
+	var revoked []researchstate.Result
+	for _, r := range st.Results {
+		if r.AssignmentID == assignmentID {
+			revoked = append(revoked, r)
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if len(revoked) == 0 {
+		return 0, nil
+	}
+	st.Results = kept
+	st.Version++
+	for _, r := range revoked {
+		st.AppendCommitRecord(researchstate.CommitRecord{
+			Op:           researchstate.OpRevokeResult,
+			Turn:         r.Turn,
+			AssignmentID: assignmentID,
+			ResultID:     r.ID,
+			Content:      r.Content,
+			Reason:       reason,
+			Version:      st.Version,
+			CreatedAt:    now,
+		})
+	}
+	st.UpdatedAt = now
+	return len(revoked), nil
 }
 
 // SetConclusion 写入该研究节点的最终结论。
@@ -131,8 +209,16 @@ func (s *Store) SetConclusion(_ context.Context, taskID, conclusion string) erro
 	if !ok {
 		return researchstate.ErrNotFound
 	}
+	now := time.Now()
 	st.Conclusion = conclusion
-	st.UpdatedAt = time.Now()
+	st.Version++
+	st.AppendCommitRecord(researchstate.CommitRecord{
+		Op:        researchstate.OpSetConclusion,
+		Content:   conclusion,
+		Version:   st.Version,
+		CreatedAt: now,
+	})
+	st.UpdatedAt = now
 	return nil
 }
 
@@ -161,14 +247,32 @@ func (s *Store) AppendResult(_ context.Context, taskID string, in researchstate.
 		return researchstate.ErrNotFound
 	}
 	now := time.Now()
-	st.Results = append(st.Results, researchstate.Result{
-		ID:        ids.New(),
-		Turn:      len(st.Results) + 1,
-		Content:   in.ResultContent,
-		Status:    researchstate.ResultCommitted,
-		CreatedAt: now,
-	})
 	st.Version++
+	for _, item := range in.Results {
+		content := strings.TrimSpace(item.Content)
+		if content == "" {
+			continue
+		}
+		result := researchstate.Result{
+			ID:           ids.New(),
+			AssignmentID: item.AssignmentID,
+			Turn:         len(st.Results) + 1,
+			Content:      content,
+			Status:       researchstate.ResultCommitted,
+			CreatedAt:    now,
+		}
+		st.Results = append(st.Results, result)
+		st.AppendCommitRecord(researchstate.CommitRecord{
+			Op:           researchstate.OpCommitResult,
+			Turn:         result.Turn,
+			AssignmentID: item.AssignmentID,
+			ResultID:     result.ID,
+			Content:      content,
+			Reason:       "迟到产物",
+			Version:      st.Version,
+			CreatedAt:    now,
+		})
+	}
 	st.UpdatedAt = now
 	return nil
 }

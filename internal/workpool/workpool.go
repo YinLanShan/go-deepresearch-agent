@@ -145,6 +145,54 @@ func (p *WorkPool) Submit(_ context.Context, w *domain.Work) error {
 	return nil
 }
 
+// CancelByAssignment 取消某个 Assignment 关联的 Work。
+//
+// 排队中的 Work 直接标记取消；执行中的 Work 通过 cancel 让 Worker 尽快退出
+// （本阶段的 MockWorker 收到 ctx 取消后会停止推进）。
+// 返回受影响（排队 + 执行中）的 Work 数量。
+func (p *WorkPool) CancelByAssignment(runTaskID, assignmentID string) int {
+	if assignmentID == "" {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 队列中尚未开始的 Work。
+	kept := make([]*domain.Work, 0, len(p.queue))
+	var dropped []*domain.Work
+	for _, w := range p.queue {
+		if w.AssignmentID == assignmentID && (runTaskID == "" || w.RunTaskID == runTaskID) {
+			dropped = append(dropped, w)
+			continue
+		}
+		kept = append(kept, w)
+	}
+	p.queue = kept
+
+	// 执行中的 Work：取消其 ctx。
+	running := 0
+	for workID := range p.cancels {
+		w, err := p.works.Get(context.Background(), workID)
+		if err != nil || w.AssignmentID != assignmentID {
+			continue
+		}
+		if runTaskID != "" && w.RunTaskID != runTaskID {
+			continue
+		}
+		p.cancels[workID]()
+		running++
+	}
+
+	for _, w := range dropped {
+		go p.markCancelled(w)
+	}
+	if len(dropped)+running > 0 {
+		slog.Info("workpool: cancelled works for assignment",
+			"assignment", assignmentID, "queued", len(dropped), "running", running)
+	}
+	return len(dropped) + running
+}
+
 // Cancel 取消某个 RunTask 下的全部 Work（仅状态标记，不做真实执行中断）。
 //
 // 返回被标记取消的 Work 数量。

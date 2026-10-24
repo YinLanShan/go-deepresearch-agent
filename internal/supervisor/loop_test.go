@@ -165,8 +165,9 @@ func TestPreemptCapturesInterruptedContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get state: %v", err)
 	}
-	if len(st.Results) != 1 {
-		t.Fatalf("want 1 committed result, got %+v", st.Results)
+	// Supervisor 自身的输出只记 Finding；Result 只来自子任务。
+	if len(st.Results) != 0 {
+		t.Fatalf("supervisor turn should not produce results, got %+v", st.Results)
 	}
 	if !strings.Contains(st.Findings[0].Content, "mock reply to:") {
 		t.Fatalf("finding should contain model answer, got %q", st.Findings[0].Content)

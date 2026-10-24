@@ -19,6 +19,7 @@ var ErrNotAccepting = errors.New("researchstate: not accepting commits")
 //
 // Commit 追加 Result（证据）与 Finding（过程输出）并自增版本号，
 // 同时清空已并入本轮 Finding 的 InterruptedContext。
+// 每次提交动作（含撤销）都会写入 CommitLog。
 // Conclusion 只由 finish_research 通过 SetConclusion 写入。
 type Store interface {
 	Create(ctx context.Context, s *State) error
@@ -27,8 +28,14 @@ type Store interface {
 	GetLatestBySession(ctx context.Context, sessionID string) (*State, error)
 	// ListBySession 返回指定 Session 下全部 ResearchState，按序号升序。
 	ListBySession(ctx context.Context, sessionID string) ([]*State, error)
-	// Commit 追加一轮 Result + Finding，并清空 InterruptedContext。
+	// Commit 追加一批 Result + 一条 Finding，并清空 InterruptedContext。
 	Commit(ctx context.Context, taskID string, in CommitInput) error
+	// RevokeResult 撤销某个 Assignment 已提交的 Result。
+	//
+	// 撤销也是一个提交动作：从 Results 中移除对应条目、写入 CommitmentLog、
+	// 自增版本号。即使该 Result 已经合法提交，也允许被撤销。
+	// 返回被撤销的 Result 数量（0 表示该 Assignment 没有已提交的结果）。
+	RevokeResult(ctx context.Context, taskID, assignmentID, reason string) (int, error)
 	// AppendResult 仅追加一条 Result（用于任务中止后到达的迟到产物），
 	// 不产生 Finding、不触碰 InterruptedContext。
 	AppendResult(ctx context.Context, taskID string, in CommitInput) error

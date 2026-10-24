@@ -228,6 +228,31 @@ func (r *Runtime) ProposeAssignments(ctx context.Context, taskID, runTaskID stri
 	return len(list), nil
 }
 
+// CancelAssignments 由 SupervisorLoop 调用（源自模型调用的 cancel_assignments 工具）：
+// 撤销一批已派发的 Assignment。
+//
+// 允许范围：研究结束（finish_research）之前，模型可随时撤销自己派发的子任务。
+// 处理按 Assignment 的当前状态分别收尾（先标记状态，再按状态处置）：
+//   - 刚入队   ：从调度队列移除；
+//   - 正在执行 ：取消对应 Work；
+//   - 等待提交 ：结果被提交门控拦下，不会进入 ResearchState；
+//   - 已提交   ：从 ResearchState 中撤回（撤销同样是一次提交动作）。
+//
+// 返回成功撤销的数量，以及从 ResearchState 中撤回的已提交结果条数。
+func (r *Runtime) CancelAssignments(ctx context.Context, taskID, runTaskID string, assignmentIDs []string, reason string) (int, int, error) {
+	if r.scheduler == nil || len(assignmentIDs) == 0 {
+		return 0, 0, nil
+	}
+	cancelled, revoked, err := r.scheduler.CancelAssignments(runTaskID, assignmentIDs, reason)
+	if err != nil {
+		return 0, 0, err
+	}
+	slog.Info("runtime: assignments cancelled",
+		"task", taskID, "run_task", runTaskID,
+		"count", cancelled, "revoked_results", revoked, "reason", reason)
+	return cancelled, revoked, nil
+}
+
 // HasPendingAssignments 判断某个 RunTask 是否仍有未完成的 Assignment。
 func (r *Runtime) HasPendingAssignments(ctx context.Context, runTaskID string) bool {
 	if r.assignments == nil || runTaskID == "" {
@@ -701,6 +726,8 @@ func (r *Runtime) ensureSupervisor(taskID, sessionID, runTaskID string) {
 		Policy:      r.tools.Policy(),
 		CheckPoints: r.checkPoints,
 		Proposer:    r,
+		Canceller:   r,
+		Assignments: r.assignments,
 	})
 	l.Start()
 	r.supervisors[taskID] = l

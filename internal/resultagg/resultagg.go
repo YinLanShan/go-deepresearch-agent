@@ -29,12 +29,16 @@ import (
 type Committer interface {
 	Commit(ctx context.Context, taskID string, in researchstate.CommitInput) error
 	AppendResult(ctx context.Context, taskID string, in researchstate.CommitInput) error
+	// RevokeResult 撤销某个 Assignment 已提交的 Result（返回撤销条数）。
+	RevokeResult(ctx context.Context, taskID, assignmentID, reason string) (int, error)
 }
 
 // SchedulerNotifier 是 ResultAggregator 通知 Scheduler 的最小接口。
 type SchedulerNotifier interface {
 	OnResultCommitted(assignmentID, result string)
 	OnResultRejected(assignmentID string, cause error)
+	// OnResultRevoked 在结果被撤销（未提交即取消，或已提交后被撤回）后通知 Scheduler。
+	OnResultRevoked(assignmentID, reason string)
 }
 
 // ErrSlotNotFound 表示结果对应的槽位不存在（未预留或已取消）。
@@ -52,11 +56,17 @@ type pendingResult struct {
 }
 
 // slot 是某个 Assignment 的结果接收槽位。
+//
+// 槽位生命周期与 Assignment 的撤销状态绑定：
+//   - 撤销发生在提交前 → slot 标记 revoked，其后的结果一律被门控拦下；
+//   - 撤销发生在提交后 → 通过 Committer.RevokeResult 从 ResearchState 中撤回。
 type slot struct {
 	Assignment *domain.Assignment
 	Received   *pendingResult
-	Cancelled  bool
-	Committed  bool
+	// Revoked 为 true 表示该 Assignment 已被撤销，不再接受任何结果。
+	Revoked bool
+	// Committed 为 true 表示该 Assignment 的结果已成功提交。
+	Committed bool
 }
 
 // Config 是 ResultAggregator 的配置。
@@ -74,11 +84,16 @@ type Aggregator struct {
 	scheduler SchedulerNotifier
 	now       func() time.Time
 
-	mu     sync.Mutex
-	slots  map[string]*slot // assignmentID -> slot
-	inbox  []*pendingResult
-	wake   chan struct{}
-	closed bool
+	mu    sync.Mutex
+	slots map[string]*slot // assignmentID -> slot
+	// revokedRunTask 是"撤销门控"的二级索引：runTaskID -> 被撤销的 assignmentID 集合。
+	//
+	// 即使槽位已因提交而删除，也要能拦住该 Assignment 的重复/迟到结果，
+	// 因此撤销状态按 RunTask 维度单独索引，并在 RunTask 结束时整体清理。
+	revokedRunTask map[string]map[string]string // runTaskID -> assignmentID -> reason
+	inbox          []*pendingResult
+	wake           chan struct{}
+	closed         bool
 
 	stopCh   chan struct{}
 	doneCh   chan struct{}
@@ -98,14 +113,15 @@ func New(cfg Config) *Aggregator {
 		now = time.Now
 	}
 	a := &Aggregator{
-		states:    cfg.States,
-		bus:       cfg.Bus,
-		scheduler: cfg.Scheduler,
-		now:       now,
-		slots:     make(map[string]*slot),
-		wake:      make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
+		states:         cfg.States,
+		bus:            cfg.Bus,
+		scheduler:      cfg.Scheduler,
+		now:            now,
+		slots:          make(map[string]*slot),
+		revokedRunTask: make(map[string]map[string]string),
+		wake:           make(chan struct{}, 1),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
 	}
 	if cfg.Bus != nil {
 		cfg.Bus.Subscribe(event.EventWorkResultReady, a)
@@ -161,8 +177,89 @@ func (a *Aggregator) Cancel(assignmentID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if s, ok := a.slots[assignmentID]; ok {
-		s.Cancelled = true
+		s.Revoked = true
 		delete(a.slots, assignmentID)
+	}
+}
+
+// Revoke 撤销一批 Assignment 的结果接收资格。
+//
+// 语义要点（与"先标记、后拦截"一致）：
+//  1. 先在锁内标记撤销状态（二级索引 runTaskID -> assignmentID），
+//     提交侧据此拦截，此后到达的结果一律不被接受；
+//  2. 清理尚未提交的待处理结果（inbox）与槽位；
+//  3. 若该 Assignment 的结果此前已经合法提交，则从 ResearchState 中撤回
+//     （撤销同样是一次提交动作，会写入提交历史）。
+//
+// 返回已被撤回的已提交结果条数。
+func (a *Aggregator) Revoke(runTaskID string, assignmentIDs []string, reason string) int {
+	if len(assignmentIDs) == 0 {
+		return 0
+	}
+	now := a.now()
+
+	// 1) 先标记状态（无论后续能否定位到槽位，都要记住"已撤销"）。
+	a.mu.Lock()
+	set, ok := a.revokedRunTask[runTaskID]
+	if !ok {
+		set = make(map[string]string)
+		a.revokedRunTask[runTaskID] = set
+	}
+	committedTasks := make(map[string][]string) // taskID -> assignmentIDs（已提交，需要撤回）
+	for _, id := range assignmentIDs {
+		set[id] = reason
+		if s, ok := a.slots[id]; ok {
+			if s.Committed && s.Assignment != nil {
+				committedTasks[s.Assignment.TaskID] = append(committedTasks[s.Assignment.TaskID], id)
+			}
+			s.Revoked = true
+			delete(a.slots, id)
+		}
+	}
+	// 2) 丢弃 inbox 中属于这些 Assignment 的待提交结果。
+	if len(a.inbox) > 0 {
+		kept := make([]*pendingResult, 0, len(a.inbox))
+		for _, p := range a.inbox {
+			if _, revoked := set[p.AssignmentID]; revoked {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		a.inbox = kept
+	}
+	a.mu.Unlock()
+
+	// 3) 已提交的结果从 ResearchState 中撤回。
+	revokedCount := 0
+	for taskID, ids := range committedTasks {
+		for _, id := range ids {
+			n, err := a.states.RevokeResult(context.Background(), taskID, id, reason)
+			if err != nil {
+				slog.Error("resultagg: revoke committed result failed",
+					"task", taskID, "assignment", id, "err", err)
+				continue
+			}
+			revokedCount += n
+			if a.scheduler != nil {
+				a.scheduler.OnResultRevoked(id, reason)
+			}
+			_ = now
+		}
+	}
+	slog.Info("resultagg: assignments revoked",
+		"run_task", runTaskID, "count", len(assignmentIDs), "committed_revoked", revokedCount)
+	return revokedCount
+}
+
+// ForgotRunTask 清理某个 RunTask 的撤销索引与提交墓碑（RunTask 删除时调用）。
+func (a *Aggregator) ForgotRunTask(runTaskID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.revokedRunTask, runTaskID)
+	for id, s := range a.slots {
+		if s.Assignment != nil && s.Assignment.RunTaskID == runTaskID {
+			delete(a.slots, id)
+		}
 	}
 }
 
@@ -261,7 +358,7 @@ func (a *Aggregator) takeBatch() (batch []*pendingResult, _ bool) {
 	valid := make([]*pendingResult, 0, len(batch))
 	for _, p := range batch {
 		s, ok := a.slots[p.AssignmentID]
-		if !ok || s.Cancelled || s.Committed {
+		if !ok || s.Revoked || s.Committed {
 			continue
 		}
 		if s.Received != nil && s.Received.WorkID == p.WorkID {
@@ -301,7 +398,13 @@ func (a *Aggregator) process(batch []*pendingResult) {
 	}
 }
 
-// commitGroup 把同一 Task 的多个结果合并为一次 ResearchState Commit。
+// commitGroup 把同一 Task 的多个结果作为独立单元提交到 ResearchState。
+//
+// 注意：多条 Result 各自作为 Result 切片的一个元素保存（不拼接成一个字符串），
+// 这样才能按 Assignment 精确撤销。
+//
+// 提交前在锁内再次检查撤销门控：撤销优先标记状态，提交侧据此拦截，
+// 保证"先标记、后拦截"的顺序语义。
 func (a *Aggregator) commitGroup(taskID string, group []*pendingResult) error {
 	if a.states == nil {
 		return errors.New("resultagg: states not configured")
@@ -310,30 +413,73 @@ func (a *Aggregator) commitGroup(taskID string, group []*pendingResult) error {
 		return nil
 	}
 
-	// 归一：去掉首尾空白并串联为一段可提交的研究产物。
-	parts := make([]string, 0, len(group))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	items := make([]researchstate.ResultInput, 0, len(group))
+	empty, gated := 0, 0
 	for _, p := range group {
-		if s := strings.TrimSpace(p.Result); s != "" {
-			parts = append(parts, s)
+		content := strings.TrimSpace(p.Result)
+		if content == "" {
+			empty++
+			continue
 		}
+		// 撤销门控：已撤销的 Assignment 不允许再进入 ResearchState。
+		if a.isRevokedLocked(p.RunTaskID, p.AssignmentID) {
+			gated++
+			continue
+		}
+		items = append(items, researchstate.ResultInput{
+			AssignmentID: p.AssignmentID,
+			Content:      content,
+		})
 	}
-	if len(parts) == 0 {
+	if len(items) == 0 {
+		if gated > 0 {
+			// 全部被撤销门控拦下：这是预期行为，不是失败。
+			return nil
+		}
 		return fmt.Errorf("resultagg: empty result for task %s", taskID)
 	}
-	combined := strings.Join(parts, "\n")
+
+	// Finding 取本轮各结果的简要拼接，仅用于过程记录；Result 本身保持独立。
+	finding := strings.Join(collectContents(items), "\n")
 
 	return a.states.Commit(context.Background(), taskID, researchstate.CommitInput{
-		ResultContent:  combined,
-		FindingContent: combined,
+		Results:        items,
+		FindingContent: finding,
 	})
 }
 
+// collectContents 提取结果正文（仅用于生成 Finding 摘要）。
+func collectContents(items []researchstate.ResultInput) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.Content)
+	}
+	return out
+}
+
+// isRevokedLocked 判断某个 Assignment 是否已被撤销（调用方需持有 a.mu）。
+func (a *Aggregator) isRevokedLocked(runTaskID, assignmentID string) bool {
+	set, ok := a.revokedRunTask[runTaskID]
+	if !ok {
+		return false
+	}
+	_, revoked := set[assignmentID]
+	return revoked
+}
+
 // markCommitted 标记槽位已提交并通知 Scheduler 回收。
+//
+// 注意：槽位不立即删除，而是保留为"墓碑"（Committed=true），
+// 以便随后可能到来的撤销仍能定位到 TaskID 与 Assignment 信息。
+// 墓碑在 RunTask 结束（dropRunTask / ForgotRunTask）或撤销时清理。
 func (a *Aggregator) markCommitted(p *pendingResult) {
 	a.mu.Lock()
 	if s, ok := a.slots[p.AssignmentID]; ok {
 		s.Committed = true
-		delete(a.slots, p.AssignmentID)
+		s.Received = nil
 	}
 	a.mu.Unlock()
 

@@ -34,6 +34,8 @@ import (
 type WorkRunner interface {
 	Submit(ctx context.Context, w *domain.Work) error
 	Cancel(runTaskID string) int
+	// CancelByAssignment 取消某个 Assignment 正在执行的 Work（若有）。
+	CancelByAssignment(runTaskID, assignmentID string) int
 }
 
 // ResultSlots 是 Scheduler 对 ResultAggregator 的最小依赖：
@@ -41,6 +43,8 @@ type WorkRunner interface {
 type ResultSlots interface {
 	Reserve(assignment *domain.Assignment) error
 	Cancel(assignmentID string)
+	// Revoke 撤销一批 Assignment 的结果接收资格，并撤回已提交的结果。
+	Revoke(runTaskID string, assignmentIDs []string, reason string) int
 }
 
 // Config 是 Scheduler 的配置。
@@ -514,6 +518,155 @@ func (s *Scheduler) OnResultRejected(assignmentID string, cause error) {
 		Status:       a.Status,
 		Err:          a.Err,
 	})
+}
+
+// OnResultRevoked 由 ResultAggregator 在结果被撤销后调用：把 Assignment 置为 cancelled。
+func (s *Scheduler) OnResultRevoked(assignmentID, reason string) {
+	a, err := s.assignments.Get(context.Background(), assignmentID)
+	if err != nil {
+		return
+	}
+	if a.Status == domain.AssignmentCancelled {
+		return // 幂等
+	}
+	now := s.now()
+	a.Status = domain.AssignmentCancelled
+	a.Result = ""
+	if reason != "" {
+		a.Err = reason
+	}
+	a.UpdatedAt = now
+	a.FinishedAt = now
+	if err := s.assignments.Update(context.Background(), a); err != nil {
+		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
+	}
+	s.publish(event.AssignmentUpdatedEvent{
+		SessionID:    a.SessionID,
+		TaskID:       a.TaskID,
+		RunTaskID:    a.RunTaskID,
+		AssignmentID: a.ID,
+		Status:       a.Status,
+		Err:          a.Err,
+	})
+}
+
+// CancelAssignments 按 ID 撤销一批 Assignment。
+//
+// 处理顺序遵循"先标记状态、再按状态处置"：
+//  1. 先把 Assignment 标记为 cancelled（这是唯一的权威状态）；
+//  2. 通知 ResultAggregator 撤销接收资格（二级索引），此后到达的结果一律被拦截；
+//  3. 按撤销前的状态分别收尾：
+//     - scheduled/pending（刚入队）：从调度队列移除；
+//     - running（已调度/正在执行）：取消对应 Work；
+//     - awaiting_result（等待提交）：结果被门控拦下，不会再进入 ResearchState；
+//     - completed（已提交）：由 ResultAggregator 从 ResearchState 中撤回。
+//
+// 返回成功标记为 cancelled 的数量，以及从 ResearchState 中撤回的已提交结果条数。
+func (s *Scheduler) CancelAssignments(runTaskID string, assignmentIDs []string, reason string) (cancelled int, revoked int, err error) {
+	if runTaskID == "" || len(assignmentIDs) == 0 {
+		return 0, 0, nil
+	}
+
+	target := make(map[string]struct{}, len(assignmentIDs))
+	for _, id := range assignmentIDs {
+		if id != "" {
+			target[id] = struct{}{}
+		}
+	}
+	if len(target) == 0 {
+		return 0, 0, nil
+	}
+
+	// 1) 先标记状态：逐个加载、置 cancelled、写回。
+	type previous struct {
+		assignment *domain.Assignment
+		status     domain.AssignmentStatus
+	}
+	prev := make([]previous, 0, len(target))
+	now := s.now()
+	for id := range target {
+		a, err := s.assignments.Get(context.Background(), id)
+		if err != nil {
+			slog.Warn("scheduler: cancel unknown assignment", "assignment", id, "err", err)
+			continue
+		}
+		if a.RunTaskID != runTaskID {
+			slog.Warn("scheduler: assignment does not belong to run task",
+				"assignment", id, "run_task", runTaskID, "actual", a.RunTaskID)
+			continue
+		}
+		if a.Status == domain.AssignmentCancelled {
+			continue // 幂等
+		}
+		prev = append(prev, previous{assignment: a, status: a.Status})
+
+		a.Status = domain.AssignmentCancelled
+		a.Result = ""
+		if reason != "" {
+			a.Err = reason
+		}
+		a.UpdatedAt = now
+		a.FinishedAt = now
+		if err := s.assignments.Update(context.Background(), a); err != nil {
+			slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
+		}
+		s.publish(event.AssignmentUpdatedEvent{
+			SessionID:    a.SessionID,
+			TaskID:       a.TaskID,
+			RunTaskID:    a.RunTaskID,
+			AssignmentID: a.ID,
+			Status:       a.Status,
+			Err:          a.Err,
+		})
+	}
+
+	if len(prev) == 0 {
+		return 0, 0, nil
+	}
+
+	// 2) 通知结果聚合器撤销接收资格（先标记，后续结果被门控拦截）。
+	ids := make([]string, 0, len(prev))
+	for _, p := range prev {
+		ids = append(ids, p.assignment.ID)
+	}
+	if s.slots != nil {
+		revoked = s.slots.Revoke(runTaskID, ids, reason)
+	}
+
+	// 3) 按撤销前的状态收尾。
+	needQueueClean := false
+	for _, p := range prev {
+		switch p.status {
+		case domain.AssignmentScheduled, domain.AssignmentPending:
+			needQueueClean = true // 刚入队：从调度队列移除
+		case domain.AssignmentRunning:
+			// 已调度/正在执行：取消 Work
+			if s.pool != nil {
+				s.pool.CancelByAssignment(runTaskID, p.assignment.ID)
+			}
+		case domain.AssignmentAwaitingResult:
+			// 等待提交：结果已被门控拦截，无需额外动作
+		case domain.AssignmentCompleted:
+			// 已提交：由 ResultAggregator 从 ResearchState 撤回
+		}
+	}
+
+	if needQueueClean {
+		s.mu.Lock()
+		kept := make([]*domain.Assignment, 0, len(s.queue))
+		for _, a := range s.queue {
+			if _, revoked := target[a.ID]; revoked {
+				continue
+			}
+			kept = append(kept, a)
+		}
+		s.queue = kept
+		s.mu.Unlock()
+	}
+
+	slog.Info("scheduler: assignments cancelled",
+		"run_task", runTaskID, "count", len(prev), "revoked_results", revoked, "reason", reason)
+	return len(prev), revoked, nil
 }
 
 // cancelRunTask 把某个 RunTask 下所有未完成 Assignment 标记为取消。

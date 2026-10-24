@@ -206,6 +206,29 @@ WorkPool 把未完成 Work 标记 `cancelled`、ResultAggregator 丢弃待提交
 - 子任务结果提交后唤醒下一轮，模型据此继续决策或宣布结束；
 - 单次调用最多 8 个子任务、单个目标不超过 500 字符，超出部分会被拒绝并回告模型。
 
+**撤销语义**：研究结束前，模型可用 `cancel_assignments` 纠正自己的派发决定——
+
+```json
+{"assignment_ids":["<id>"],"reason":"与另一个子任务重复"}
+```
+
+子任务清单（含 Assignment ID 与状态）会随上下文注入，模型据此引用 ID。
+撤销按当前状态分别收尾：
+
+| 撤销时的状态 | 处理 |
+|---|---|
+| 待调度 / 已入队 | 从调度队列移除 |
+| 执行中 | 取消对应 Work |
+| 等待提交 | 结果被提交门控拦下，不进入 ResearchState |
+| 已完成（已提交） | 从 ResearchState 中撤回 |
+
+门控是**按 Assignment 粒度**的（二级索引 `runTaskID → assignmentID`），
+先标记撤销状态、再由提交侧拦截，即使槽位已删除也能拦住重复/迟到结果。
+
+**提交历史**：提交与撤销都是"提交动作"，全部记录在 `ResearchState.CommitLog`
+（只追加，含序号、操作类型、Assignment/Result、原因与版本号），
+前端 ResearchState 面板可查看，接口为 `GET /sessions/:id/research-state`。
+
 **Assignment 归属 RunTask**：RunTask 消失则其下 Assignment 与 Work 一并删除
 （`DeleteByRunTask` 级联），不会留下孤儿数据。
 
@@ -368,7 +391,7 @@ go test -count=1 ./... -short                 # 跳过 MCP 集成测试，仅跑
 2. **以文件方式打开**：浏览器打开 `web/index.html`（`file://`），
    在「API 配置 → 服务地址」填写 `http://127.0.0.1:8080`（服务端已开启 CORS）。
 
-「API 配置」支持设置服务地址、模型提供方（mock / mock-tool / openai）、Base URL、
+「API 配置」支持设置服务地址、模型提供方（mock / mock-tool / mock-cancel / openai）、Base URL、
 模型名称与 API Key；保存后立即生效。密钥留空表示沿用已保存的密钥，界面只展示脱敏提示。
 
 **配置不全不会导致模型不可用**：

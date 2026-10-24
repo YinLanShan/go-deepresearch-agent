@@ -27,10 +27,10 @@ func TestStoreCRUD(t *testing.T) {
 	}
 
 	// Commit 两轮研究（Result + Finding）
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "证据1", FindingContent: "结论1"}); err != nil {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "证据1"}}, FindingContent: "结论1"}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "证据2", FindingContent: "结论2"}); err != nil {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "证据2"}}, FindingContent: "结论2"}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	got, _ = s.Get(ctx, "t1")
@@ -60,7 +60,7 @@ func TestStoreCRUD(t *testing.T) {
 	if _, err := s.Get(ctx, "t1"); !errors.Is(err, researchstate.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "x", FindingContent: "y"}); !errors.Is(err, researchstate.ErrNotFound) {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "x"}}, FindingContent: "y"}); !errors.Is(err, researchstate.ErrNotFound) {
 		t.Fatalf("commit on missing should return ErrNotFound, got %v", err)
 	}
 }
@@ -94,7 +94,7 @@ func TestCommitGate(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "证据", FindingContent: "结论"}); err != nil {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "证据"}}, FindingContent: "结论"}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
@@ -102,7 +102,7 @@ func TestCommitGate(t *testing.T) {
 	if err := s.StopCommits(ctx, "t1"); err != nil {
 		t.Fatalf("StopCommits: %v", err)
 	}
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "x", FindingContent: "y"}); !errors.Is(err, researchstate.ErrNotAccepting) {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "x"}}, FindingContent: "y"}); !errors.Is(err, researchstate.ErrNotAccepting) {
 		t.Fatalf("want ErrNotAccepting, got %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestCommitGate(t *testing.T) {
 	if err := s.ResumeCommits(ctx, "t1"); err != nil {
 		t.Fatalf("ResumeCommits: %v", err)
 	}
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "证据2", FindingContent: "结论2"}); err != nil {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "证据2"}}, FindingContent: "结论2"}); err != nil {
 		t.Fatalf("Commit after resume: %v", err)
 	}
 }
@@ -174,8 +174,7 @@ func TestInterruptedContextClearedByCommit(t *testing.T) {
 	if err := s.AccumulateInterruptedContext(ctx, "t1", "中断前的推理原文"); err != nil {
 		t.Fatalf("AccumulateInterruptedContext: %v", err)
 	}
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{
-		ResultContent: "中断前的推理原文\n本轮输出", FindingContent: "中断前的推理原文\n本轮输出"}); err != nil {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "中断前的推理原文\n本轮输出"}}, FindingContent: "中断前的推理原文\n本轮输出"}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
@@ -205,8 +204,7 @@ func TestSetConclusion(t *testing.T) {
 		t.Fatalf("conclusion should be empty before finish, got %q", st.Conclusion)
 	}
 
-	if err := s.Commit(ctx, "t1", researchstate.CommitInput{
-		ResultContent: "过程证据", FindingContent: "过程输出"}); err != nil {
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "过程证据"}}, FindingContent: "过程输出"}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	st, _ = s.Get(ctx, "t1")
@@ -244,7 +242,7 @@ func TestAppendResultOnly(t *testing.T) {
 	}
 
 	// 迟到产物仍可追加，且不产生 Finding
-	if err := s.AppendResult(ctx, "t1", researchstate.CommitInput{ResultContent: "迟到的证据"}); err != nil {
+	if err := s.AppendResult(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "迟到的证据"}}}); err != nil {
 		t.Fatalf("AppendResult: %v", err)
 	}
 

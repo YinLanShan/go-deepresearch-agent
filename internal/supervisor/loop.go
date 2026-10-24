@@ -25,8 +25,10 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	agenttool "github.com/YinLanShan/go-deepresearch-agent.git/internal/tool"
 )
 
@@ -59,6 +61,11 @@ type Config struct {
 	CheckPoints adk.CheckPointStore
 	// Proposer 用于派发 Assignment（由 submit_assignments 工具触发）；为 nil 时不派发。
 	Proposer AssignmentProposer
+	// Canceller 用于撤销已派发的 Assignment（由 cancel_assignments 工具触发）；
+	// 为 nil 时不支持撤销。
+	Canceller AssignmentCanceller
+	// Assignments 用于校验撤销请求中的 Assignment ID 归属；为 nil 时跳过归属校验。
+	Assignments storage.AssignmentStore
 }
 
 // AssignmentProposer 由 Runtime 实现：接收模型通过 submit_assignments 提交的研究目标。
@@ -71,6 +78,15 @@ type Config struct {
 type AssignmentProposer interface {
 	// ProposeAssignments 派发一批研究目标（goals 已由工具侧校验）。
 	ProposeAssignments(ctx context.Context, taskID, runTaskID string, goals []string) (accepted int, err error)
+}
+
+// AssignmentCanceller 由 Runtime 实现：撤销模型此前派发的子任务。
+//
+// 允许范围是研究结束之前；撤销后槽位与 Work 立刻失效，
+// 已提交的结果会从 ResearchState 中撤回（撤销同样是一次提交动作）。
+type AssignmentCanceller interface {
+	// CancelAssignments 撤销一批子任务，返回撤销数量与撤回的已提交结果条数。
+	CancelAssignments(ctx context.Context, taskID, runTaskID string, assignmentIDs []string, reason string) (cancelled int, revoked int, err error)
 }
 
 // Loop 是 SupervisorLoop。
@@ -86,6 +102,8 @@ type Loop struct {
 	policy      agenttool.Policy
 	checkPoints adk.CheckPointStore
 	proposer    AssignmentProposer
+	canceller   AssignmentCanceller
+	assignments storage.AssignmentStore
 	// finishing / finishConclusion 记录模型通过 finish_research 表达的终结意图。
 	// 一旦置位不可撤销（不允许模型"反悔"）。
 	finishing        bool
@@ -151,6 +169,8 @@ func New(cfg Config) *Loop {
 		policy:      cfg.Policy,
 		checkPoints: cfg.CheckPoints,
 		proposer:    cfg.Proposer,
+		canceller:   cfg.Canceller,
+		assignments: cfg.Assignments,
 		resumeData:  make(map[string]agenttool.ApprovalResult),
 	}
 	l.loop = l.newTurnLoop()
@@ -369,13 +389,19 @@ func (l *Loop) prepareAgent(ctx context.Context, _ *adk.TurnLoop[Input, *schema.
 		},
 	}
 
-	tools := make([]tool.BaseTool, 0, len(l.tools)+2)
+	tools := make([]tool.BaseTool, 0, len(l.tools)+3)
 	tools = append(tools, l.tools...)
 	// 派发子任务：模型决定"研究什么"的唯一入口。
 	if assignTool, err := agenttool.NewSubmitAssignmentsTool(l); err != nil {
 		slog.Error("create submit_assignments tool failed", "task", l.taskID, "err", err)
 	} else {
 		tools = append(tools, assignTool)
+	}
+	// 撤销子任务：研究结束前，模型可以纠正自己的派发决定。
+	if cancelTool, err := agenttool.NewCancelAssignmentsTool(l); err != nil {
+		slog.Error("create cancel_assignments tool failed", "task", l.taskID, "err", err)
+	} else {
+		tools = append(tools, cancelTool)
 	}
 	// 宣布研究结束：研究进入终结态的唯一入口。
 	if finishTool, err := agenttool.NewFinishResearchTool(l); err != nil {
@@ -392,12 +418,66 @@ func (l *Loop) prepareAgent(ctx context.Context, _ *adk.TurnLoop[Input, *schema.
 }
 
 // buildInstruction 读取最新 ResearchState 并构建系统提示词。
+//
+// 除研究状态外，还会附上本 RunTask 的子任务清单（含 Assignment ID），
+// 因为模型需要一个稳定的 ID 才能在 cancel_assignments 中精确撤销。
 func (l *Loop) buildInstruction(ctx context.Context) string {
 	st, err := l.states.Get(ctx, l.taskID)
 	if err != nil {
 		return ""
 	}
-	return st.BuildContext()
+	return st.BuildContext() + l.assignmentsSection(ctx)
+}
+
+// assignmentsSection 渲染本 RunTask 的子任务清单（供模型决定是否撤销）。
+func (l *Loop) assignmentsSection(ctx context.Context) string {
+	if l.assignments == nil || l.runTaskID == "" {
+		return ""
+	}
+	list, err := l.assignments.ListByRunTask(ctx, l.runTaskID)
+	if err != nil || len(list) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n# 子任务清单（Assignment）\n\n")
+	b.WriteString("下面是本次运行已派发的子任务及其当前状态。\n")
+	b.WriteString("若某个子任务不再需要、目标写错或与其他子任务重复，" +
+		"可调用 cancel_assignments 用其 ID 撤销（研究结束前有效）。\n\n")
+	for _, a := range list {
+		fmt.Fprintf(&b, "- ID: %s | 状态: %s | 目标: %s\n",
+			a.ID, assignmentStatusText(a.Status), oneLine(a.Goal))
+	}
+	return b.String()
+}
+
+// assignmentStatusText 把 Assignment 状态翻译为面向模型的中文说明。
+func assignmentStatusText(s domain.AssignmentStatus) string {
+	switch s {
+	case domain.AssignmentPending:
+		return "待调度"
+	case domain.AssignmentScheduled:
+		return "已入队"
+	case domain.AssignmentRunning:
+		return "执行中"
+	case domain.AssignmentAwaitingResult:
+		return "等待提交"
+	case domain.AssignmentCompleted:
+		return "已完成（结果已提交）"
+	case domain.AssignmentFailed:
+		return "失败"
+	case domain.AssignmentCancelled:
+		return "已撤销"
+	default:
+		return string(s)
+	}
+}
+
+// oneLine 把多行文本压成一行（避免子任务目标撑坏清单结构）。
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.TrimSpace(s)
 }
 
 // ─── agenttool.Recorder 实现：把工具动作上报为事件 ───────────────────────────
@@ -663,17 +743,75 @@ func (l *Loop) SubmitAssignments(ctx context.Context, goals []string) (int, []st
 	return accepted, nil, nil
 }
 
+// CancelAssignments 实现 agenttool.Canceller：撤销模型此前派发的子任务。
+//
+// 允许范围：研究结束（finish_research）之前。进入结束流程后拒绝新的撤销请求，
+// 因为此时所有子任务已在终结流程中被统一取消。
+func (l *Loop) CancelAssignments(ctx context.Context, assignmentIDs []string,
+	reason string) (cancelled int, revoked int, rejected []string, err error) {
+	if l.canceller == nil {
+		return 0, 0, nil, errors.New("cancel assignments is not supported in this loop")
+	}
+	l.mu.Lock()
+	finishing := l.finishing
+	l.mu.Unlock()
+	if finishing {
+		return 0, 0, []string{"研究已进入结束流程，所有子任务已被取消"}, nil
+	}
+	if len(assignmentIDs) == 0 {
+		return 0, 0, nil, nil
+	}
+
+	// 只允许撤销本 RunTask 下、仍属于该 Task 的 Assignment。
+	owned := make(map[string]*domain.Assignment)
+	if l.assignments != nil {
+		list, err := l.assignments.ListByRunTask(ctx, l.runTaskID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return 0, 0, nil, err
+		}
+		for _, a := range list {
+			owned[a.ID] = a
+		}
+	}
+
+	valid := make([]string, 0, len(assignmentIDs))
+	for _, id := range assignmentIDs {
+		a, ok := owned[id]
+		if !ok {
+			rejected = append(rejected, fmt.Sprintf("未找到属于当前运行的子任务 %q", id))
+			continue
+		}
+		if a.Status == domain.AssignmentCancelled {
+			continue // 已经是撤销态，幂等
+		}
+		valid = append(valid, id)
+	}
+	if len(valid) == 0 {
+		return 0, 0, rejected, nil
+	}
+
+	cancelled, revoked, err = l.canceller.CancelAssignments(ctx, l.taskID, l.runTaskID, valid, reason)
+	if err != nil {
+		return 0, 0, rejected, err
+	}
+	slog.Info("supervisor: assignments cancelled",
+		"task", l.taskID, "cancelled", cancelled, "revoked_results", revoked, "reason", reason)
+	return cancelled, revoked, rejected, nil
+}
+
 // commitFinding 把模型本轮的过程输出作为 Finding Commit 到 ResearchState。
 //
 // Finding 的语义是"除工具调用外的全部模型输出"；若上一轮被新提交打断，
 // 被打断的原文会拼在本轮 Finding 之前（即"重写被打断的 Finding"）。
 // Commit 成功后，Store 会清空 InterruptedContext（中间产物）。
+//
+// 注意：这里不产生 Result —— Result 是子任务（Assignment）产出的证据，
+// Supervisor 自身的输出只属于过程记录（Finding）。
 func (l *Loop) commitFinding(ctx context.Context, content string) error {
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
 	return l.states.Commit(ctx, l.taskID, researchstate.CommitInput{
-		ResultContent:  content,
 		FindingContent: content,
 	})
 }

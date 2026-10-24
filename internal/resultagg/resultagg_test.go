@@ -13,11 +13,12 @@ import (
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 )
 
-// fakeScheduler 记录提交确认与拒绝。
+// fakeScheduler 记录提交确认、拒绝与撤销。
 type fakeScheduler struct {
 	mu        sync.Mutex
 	committed []string
 	rejected  []string
+	revoked   []string
 }
 
 func (f *fakeScheduler) OnResultCommitted(assignmentID, _ string) {
@@ -30,6 +31,18 @@ func (f *fakeScheduler) OnResultRejected(assignmentID string, _ error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rejected = append(f.rejected, assignmentID)
+}
+
+func (f *fakeScheduler) OnResultRevoked(assignmentID, _ string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, assignmentID)
+}
+
+func (f *fakeScheduler) revokedSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.revoked...)
 }
 
 func (f *fakeScheduler) snapshot() (committed, rejected []string) {

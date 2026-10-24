@@ -14,10 +14,11 @@ import (
 
 // fakePool 记录被提交的 Work，并可控制其何时"完成"。
 type fakePool struct {
-	mu        sync.Mutex
-	submitted []*domain.Work
-	cancelN   int
-	failWith  error
+	mu                   sync.Mutex
+	submitted            []*domain.Work
+	cancelN              int
+	cancelledAssignments []string
+	failWith             error
 }
 
 func (f *fakePool) Submit(_ context.Context, w *domain.Work) error {
@@ -38,6 +39,13 @@ func (f *fakePool) Cancel(string) int {
 	return 0
 }
 
+func (f *fakePool) CancelByAssignment(_, assignmentID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelledAssignments = append(f.cancelledAssignments, assignmentID)
+	return 1
+}
+
 func (f *fakePool) submittedWorks() []*domain.Work {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -48,10 +56,12 @@ func (f *fakePool) submittedWorks() []*domain.Work {
 
 // fakeSlots 记录槽位预留与释放。
 type fakeSlots struct {
-	mu        sync.Mutex
-	reserved  []string
-	cancelled []string
-	failWith  error
+	mu            sync.Mutex
+	reserved      []string
+	cancelled     []string
+	revoked       []string
+	revokeReasons []string
+	failWith      error
 }
 
 func (f *fakeSlots) Reserve(a *domain.Assignment) error {
@@ -68,6 +78,15 @@ func (f *fakeSlots) Cancel(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cancelled = append(f.cancelled, id)
+}
+
+// Revoke 记录被撤销的 Assignment（门控标记 + 已提交结果撤回）。
+func (f *fakeSlots) Revoke(_ string, ids []string, reason string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, ids...)
+	f.revokeReasons = append(f.revokeReasons, reason)
+	return 0
 }
 
 func (f *fakeSlots) snapshot() (reserved, cancelled []string) {

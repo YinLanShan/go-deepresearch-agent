@@ -71,7 +71,7 @@ func TestStopFlow(t *testing.T) {
 	waitStatus(t, runs, "t1", domain.RunStatusStopped)
 
 	// 中止后，属于该 Task 的迟到 Result 仍可提交（不被门控拒绝）
-	if err := states.Commit(ctx, "t1", researchstate.CommitInput{ResultContent: "迟到结果", FindingContent: "迟到结果"}); err != nil {
+	if err := states.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "迟到结果"}}, FindingContent: "迟到结果"}); err != nil {
 		t.Fatalf("late result commit after stop should be accepted, got %v", err)
 	}
 	st, err := states.Get(ctx, "t1")
