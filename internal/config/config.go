@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"strings"
+	"time"
 )
 
 // Config 是服务的运行时配置。
@@ -31,6 +32,9 @@ type ExecutionConfig struct {
 	MaxConcurrency int
 	// Workers 是 WorkPool 的 Worker 数量（并发执行 Work 的能力）。
 	Workers int
+	// WorkTimeout 是单个 Work（子 Agent 一次执行）的超时。
+	// 超时后 WorkPool 会取消该子 Agent 的 ctx，使其立刻停止。
+	WorkTimeout time.Duration
 }
 
 // ModelConfig 描述模型提供方及其连接参数。
@@ -114,6 +118,7 @@ func Load() Config {
 		Execution: ExecutionConfig{
 			MaxConcurrency: getenvInt("DRA_SCHEDULER_MAX_CONCURRENCY", 2),
 			Workers:        getenvInt("DRA_WORKPOOL_WORKERS", 2),
+			WorkTimeout:    getenvSeconds("DRA_WORK_TIMEOUT", 5*time.Minute),
 		},
 	}
 }
@@ -138,4 +143,13 @@ func getenvInt(key string, def int) int {
 		n = n*10 + int(r-'0')
 	}
 	return n
+}
+
+// getenvSeconds 读取以秒为单位的时长（正整数），解析失败时使用默认值。
+func getenvSeconds(key string, def time.Duration) time.Duration {
+	n := getenvInt(key, -1)
+	if n <= 0 {
+		return def
+	}
+	return time.Duration(n) * time.Second
 }

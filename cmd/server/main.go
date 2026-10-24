@@ -66,11 +66,17 @@ func main() {
 		States: stateStore,
 		Bus:    bus,
 	})
+	// Worker 用工厂：每个 Work 创建独立的子 Agent（与 Supervisor 共用模型）。
+	// 子 Agent 只拿到业务工具，控制类工具（submit/cancel/finish）被过滤掉。
 	workPool := workpool.New(workpool.Config{
-		Works:   workStore,
-		Bus:     bus,
-		Worker:  workpool.NewMockWorker(120 * time.Millisecond),
-		Workers: cfg.Execution.Workers,
+		Works: workStore,
+		Bus:   bus,
+		Factory: workpool.NewSubAgentFactory(workpool.SubAgentConfig{
+			Model: model,
+			Tools: toolRegistry.Tools(),
+		}),
+		Workers:     cfg.Execution.Workers,
+		WorkTimeout: cfg.Execution.WorkTimeout,
 	})
 	sched := scheduler.New(scheduler.Config{
 		Assignments:    assignmentStore,

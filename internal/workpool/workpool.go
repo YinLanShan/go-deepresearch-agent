@@ -15,6 +15,7 @@ package workpool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -24,7 +25,10 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 )
 
-// Worker 是执行 Work 的能力抽象。本阶段由 MockWorker 实现。
+// Worker 是执行 Work 的能力抽象。每个 Work 都应当获得独立实例。
+//
+// 注意：Worker 实例不是并发安全的，必须一个 Work 一个实例
+// （子 Agent 内部持有自己的 AsyncIterator 与消息流）。
 type Worker interface {
 	// Run 执行一次 Work；执行过程中通过 progress 上报阶段变化。
 	Run(ctx context.Context, w *domain.Work, progress func(stage, detail string)) (string, error)
@@ -32,22 +36,52 @@ type Worker interface {
 	ID() string
 }
 
+// WorkerFactory 为每个 Work 创建独立的 Worker 实例。
+//
+// 采用工厂而非共享实例：子 Agent 的 Run 不可并发复用，
+// 共享实例会让多个 Work 的 AsyncIterator 互相污染。
+type WorkerFactory interface {
+	// NewWorker 为一个 Work 创建执行器；w 已包含目标（Goal）等信息。
+	NewWorker(ctx context.Context, w *domain.Work) (Worker, error)
+}
+
+// workerFunc 把函数适配为 WorkerFactory。
+type workerFunc func(ctx context.Context, w *domain.Work) (Worker, error)
+
+func (f workerFunc) NewWorker(ctx context.Context, w *domain.Work) (Worker, error) {
+	return f(ctx, w)
+}
+
 // Config 是 WorkPool 的配置。
 type Config struct {
-	Works   storage.WorkStore
-	Bus     *event.Bus
+	Works storage.WorkStore
+	Bus   *event.Bus
+	// Factory 为每个 Work 创建独立 Worker；Factory 与 Worker 二选一。
+	Factory WorkerFactory
+	// Worker 是固定 Worker（仅用于测试/单执行器场景）。
+	// 设置后所有 Work 共享该实例，并发执行时不安全，生产环境请用 Factory。
 	Worker  Worker
 	Workers int
-	Now     func() time.Time
+	// WorkTimeout 是单个 Work 的执行超时；<=0 时使用 DefaultWorkTimeout。
+	WorkTimeout time.Duration
+	Now         func() time.Time
 }
+
+// DefaultWorkTimeout 是 Work 的默认执行超时。
+const DefaultWorkTimeout = 5 * time.Minute
+
+// ErrWorkTimeout 表示 Work 执行超时（超时后子 Agent 已被取消）。
+var ErrWorkTimeout = errors.New("workpool: work timed out")
 
 // WorkPool 是 Work 的执行资源池。
 type WorkPool struct {
-	works   storage.WorkStore
-	bus     *event.Bus
-	worker  Worker
-	workers int
-	now     func() time.Time
+	works       storage.WorkStore
+	bus         *event.Bus
+	factory     WorkerFactory
+	worker      Worker
+	workers     int
+	workTimeout time.Duration
+	now         func() time.Time
 
 	mu      sync.Mutex
 	queue   []*domain.Work
@@ -78,17 +112,31 @@ func New(cfg Config) *WorkPool {
 	if now == nil {
 		now = time.Now
 	}
+	timeout := cfg.WorkTimeout
+	if timeout <= 0 {
+		timeout = DefaultWorkTimeout
+	}
+	// 只给了固定 Worker 时，包装成工厂，保持单执行器语义。
+	factory := cfg.Factory
+	if factory == nil && cfg.Worker != nil {
+		w := cfg.Worker
+		factory = workerFunc(func(context.Context, *domain.Work) (Worker, error) {
+			return w, nil
+		})
+	}
 	p := &WorkPool{
-		works:   cfg.Works,
-		bus:     cfg.Bus,
-		worker:  cfg.Worker,
-		workers: workers,
-		now:     now,
-		cancels: make(map[string]context.CancelFunc),
-		byRun:   make(map[string]map[string]struct{}),
-		wake:    make(chan struct{}, 1),
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan struct{}),
+		works:       cfg.Works,
+		bus:         cfg.Bus,
+		factory:     factory,
+		worker:      cfg.Worker,
+		workers:     workers,
+		workTimeout: timeout,
+		now:         now,
+		cancels:     make(map[string]context.CancelFunc),
+		byRun:       make(map[string]map[string]struct{}),
+		wake:        make(chan struct{}, 1),
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
 	}
 	if cfg.Bus != nil {
 		cfg.Bus.Subscribe(event.EventCoordinationRequested, p)
@@ -286,8 +334,14 @@ func (p *WorkPool) pop() *domain.Work {
 }
 
 // run 执行一次 Work 并回写状态。
+//
+// 并发语义：每次执行都通过 factory 取一个独立 Worker 实例，
+// 因此多个 Work 可以真正并行（各自持有独立的 Agent 与事件流）。
+//
+// 超时语义：为本次执行建立独立的 deadline ctx；超时后 cancel 该 ctx，
+// 子 Agent 的模型调用与事件流会被一并中断（仅停止消费 Next() 不会让它停下）。
 func (p *WorkPool) run(w *domain.Work) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), p.workTimeout)
 	p.mu.Lock()
 	p.cancels[w.ID] = cancel
 	p.mu.Unlock()
@@ -310,9 +364,16 @@ func (p *WorkPool) run(w *domain.Work) {
 		return
 	}
 
+	// 为本次执行创建独立 Worker。
+	worker, err := p.newWorker(ctx, w)
+	if err != nil {
+		p.finishFailure(w, err)
+		return
+	}
+
 	now := p.now()
 	w.Status = domain.WorkRunning
-	w.WorkerID = p.worker.ID()
+	w.WorkerID = worker.ID()
 	w.StartedAt = now
 	w.UpdatedAt = now
 	w.Stage = "starting"
@@ -321,7 +382,7 @@ func (p *WorkPool) run(w *domain.Work) {
 	}
 	p.publishWork(w)
 
-	result, runErr := p.worker.Run(ctx, w, func(stage, detail string) {
+	result, runErr := worker.Run(ctx, w, func(stage, detail string) {
 		w.Stage = stage
 		w.Detail = detail
 		w.UpdatedAt = p.now()
@@ -337,7 +398,11 @@ func (p *WorkPool) run(w *domain.Work) {
 	w.Stage = "finished"
 
 	if runErr != nil {
-		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+		// 超时与取消都归为 cancelled；超时额外标注原因，便于排查。
+		if errors.Is(runErr, context.DeadlineExceeded) {
+			w.Status = domain.WorkTimedOut
+			w.Err = ErrWorkTimeout.Error()
+		} else if errors.Is(runErr, context.Canceled) {
 			w.Status = domain.WorkCancelled
 		} else {
 			w.Status = domain.WorkFailed
@@ -366,6 +431,35 @@ func (p *WorkPool) run(w *domain.Work) {
 		WorkID:       w.ID,
 		Result:       result,
 	})
+}
+
+// newWorker 为一次 Work 执行创建独立 Worker。
+func (p *WorkPool) newWorker(ctx context.Context, w *domain.Work) (Worker, error) {
+	if p.factory == nil {
+		return nil, errors.New("workpool: worker factory is not configured")
+	}
+	worker, err := p.factory.NewWorker(ctx, w)
+	if err != nil {
+		return nil, fmt.Errorf("workpool: create worker: %w", err)
+	}
+	if worker == nil {
+		return nil, errors.New("workpool: worker factory returned nil")
+	}
+	return worker, nil
+}
+
+// finishFailure 在无法创建 Worker 等前置失败时收尾。
+func (p *WorkPool) finishFailure(w *domain.Work, cause error) {
+	now := p.now()
+	w.Status = domain.WorkFailed
+	w.Err = cause.Error()
+	w.Stage = "finished"
+	w.FinishedAt = now
+	w.UpdatedAt = now
+	if err := p.works.Update(context.Background(), w); err != nil {
+		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	}
+	p.publishWork(w)
 }
 
 // publishWork 广播 Work 状态变化（前端实时展示）。

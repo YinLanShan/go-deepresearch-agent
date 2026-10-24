@@ -180,7 +180,11 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 		}
 	}
 	// 已经派发过子任务（无论工具结果是否还在历史里）就不再重复派发。
-	alreadyAssigned := sawAssignResult || assignedBefore
+	//
+	// 注意：Supervisor 被结果唤醒时会以新输入开启一轮，此时 messages 里既没有
+	// 上一轮的工具结果、也没有 assistant 的 ToolCalls。若不看上下文里的子任务清单，
+	// 就会每轮重复派发，造成 Assignment 与 Result 无限膨胀。
+	alreadyAssigned := sawAssignResult || assignedBefore || hasAssignmentList(instruction)
 
 	// 调用过 finish_research 之后：输出最终回答，不再发起工具调用。
 	if sawFinishResult {
@@ -287,6 +291,14 @@ const cancelAssignmentsToolName = "cancel_assignments"
 
 // completedAssignmentIDRe 匹配上下文中"已完成（结果已提交）"的子任务行。
 var completedAssignmentIDRe = regexp.MustCompile(`ID: (\S+) \| 状态: 已完成`)
+
+// assignmentListMark 是上下文里子任务清单的分区标题（由 SupervisorLoop 生成）。
+const assignmentListMark = "# 子任务清单（Assignment）"
+
+// hasAssignmentList 判断上下文是否已经列出子任务清单（即此前已派发过）。
+func hasAssignmentList(instruction string) bool {
+	return strings.Contains(instruction, assignmentListMark)
+}
 
 // completedAssignmentID 从上下文的子任务清单里取出一个已完成子任务的 ID。
 //

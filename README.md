@@ -242,8 +242,20 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `DRA_SCHEDULER_MAX_CONCURRENCY` | 2 | Scheduler 同时调度的 Assignment 上限 |
-| `DRA_WORKPOOL_WORKERS` | 2 | WorkPool 的 Worker 数量 |
+| `DRA_WORKPOOL_WORKERS` | 2 | WorkPool 的 Worker 数量（真正并行的子 Agent 数） |
+| `DRA_WORK_TIMEOUT` | 300 | 单个 Work（子 Agent 一次执行）的超时秒数 |
 | `DRA_TOOL_REQUIRE_APPROVAL` | `*` | 需审批的工具名；`-` 或 `none` 显式关闭审批 |
+
+**子 Agent 执行模型**：每个 Work 由 `SubAgentFactory` 创建**独立的** `ChatModelAgent`
+（单次任务型，不用 TurnLoop），与 Supervisor 共用同一个模型实例。
+
+- Instruction 按 Work 的 Goal 生成，子 Agent 只围绕自己的目标工作；
+- 工具白名单排除 `submit_assignments` / `cancel_assignments` / `finish_research`，
+  子 Agent 不能派发子任务、撤销或结束研究；
+- 子 Agent 的全部 assistant 输出累积为待提交的 Result；
+- 超时与取消都会**显式 cancel** 子 Agent 的 ctx（只停止消费事件流不会让它停下）；
+  超时标记 Work 为 `timedout`，取消标记为 `cancelled`；
+- 子 Agent 不接入审批：遇到工具审批中断直接中止，并把原因回告 Supervisor。
 
 **查询接口**：`GET /api/v1/sessions/:id/background-tasks` 返回当前 RunTask 下的
 Assignment 与其最新 Work（状态、阶段、Worker、耗时）；SSE 同时推送
