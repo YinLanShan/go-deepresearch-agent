@@ -162,8 +162,48 @@ func TestRequirementAndHistory(t *testing.T) {
 	}
 }
 
+// TestInterruptedContextRenderedBeforeCommit 验证被打断的原文在提交前必须被渲染：
+// 否则模型重入时看不到中断前写到哪，等于丢失实际上下文。
+func TestInterruptedContextRenderedBeforeCommit(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore()
+	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// 初始无中断：不应出现该分区
+	if strings.Contains(s.mustGet(t, ctx).BuildContext(), "上一轮被中断的输出") {
+		t.Fatal("empty interrupted context should not render a section")
+	}
+
+	if err := s.AccumulateInterruptedContext(ctx, "t1", "我正在分析框架 A 的执行模型，"); err != nil {
+		t.Fatalf("AccumulateInterruptedContext: %v", err)
+	}
+	if err := s.AccumulateInterruptedContext(ctx, "t1", "但还没得出结论"); err != nil {
+		t.Fatalf("AccumulateInterruptedContext: %v", err)
+	}
+
+	built := s.mustGet(t, ctx).BuildContext()
+	if !strings.Contains(built, "上一轮被中断的输出") {
+		t.Fatalf("interrupted context should be rendered:\n%s", built)
+	}
+	if !strings.Contains(built, "我正在分析框架 A 的执行模型，但还没得出结论") {
+		t.Fatalf("interrupted text should appear verbatim:\n%s", built)
+	}
+}
+
+// mustGet 读取状态，失败即终止测试。
+func (s *Store) mustGet(t *testing.T, ctx context.Context) *researchstate.State {
+	t.Helper()
+	st, err := s.Get(ctx, "t1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	return st
+}
+
 // TestInterruptedContextClearedByCommit 验证 InterruptedContext 是中间产物：
-// 其内容已由调用方并入本轮 Finding，Commit 成功后应被清空。
+// 其内容已由调用方并入本轮 Finding，Commit 成功后应被清空且不再渲染。
 func TestInterruptedContextClearedByCommit(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore()
@@ -182,12 +222,13 @@ func TestInterruptedContextClearedByCommit(t *testing.T) {
 	if st.InterruptedContext != "" {
 		t.Fatalf("interrupted context should be cleared after commit, got %q", st.InterruptedContext)
 	}
-	// 原文已并入 Finding，可通过 Finding 追溯到
+	// 原文已并入 Finding，可通过 Finding 追溯
 	if !strings.Contains(st.Findings[0].Content, "中断前的推理原文") {
 		t.Fatalf("merged finding should contain interrupted text, got %q", st.Findings[0].Content)
 	}
-	if strings.Contains(st.BuildContext(), "被中断的上下文原文") {
-		t.Fatal("interrupted context must not render as a standalone section")
+	// 清空后不再是独立分区（原文仍在 Finding 里）
+	if strings.Contains(st.BuildContext(), "上一轮被中断的输出") {
+		t.Fatal("cleared interrupted context must not render a section")
 	}
 }
 

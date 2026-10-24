@@ -67,8 +67,13 @@ type State struct {
 	// RelatedNodes 是前序研究节点（已结束的 Task）的完整快照。
 	RelatedNodes []RelatedNode `json:"related_nodes"`
 
-	// InterruptedContext 是中间产物：本轮被新提交打断时暂存未完成的输出原文，
-	// 下一轮开始时会被并入该轮 Finding 后清空。它不作为独立分区进入上下文。
+	// InterruptedContext 是中间产物：本轮被新提交打断时暂存未完成的输出原文。
+	//
+	// 生命周期：
+	//  1. 被打断时 Accumulate 追加原文；
+	//  2. 只要该字段非空，BuildContext 就会渲染"上一轮被中断的输出"分区，
+	//     使模型在重入时能看到中断前的实际上下文；
+	//  3. Commit 时并入本轮 Finding，随后清空。
 	InterruptedContext string `json:"interrupted_context"`
 
 	// History 是本研究任务的对话历史（用户消息与 Supervisor 回复），
@@ -245,9 +250,8 @@ const pendingResultMark = "（该 Result 尚未返回结果）"
 // BuildContext 构建 Supervisor 的输入上下文。
 //
 // 结构分区（对应 docs/Architecture.md 7.3.6）：前序节点按序完整展开 → 当前节点 →
-// 当前任务与决策要求。每个节点内部按 需求 / Result / 最终结论 / 过程 Finding 分区。
-//
-// 注意：InterruptedContext 是中间产物，不在此作为独立分区渲染。
+// 当前任务与决策要求。每个节点内部按 需求 / Result / 最终结论 / 过程 Finding 分区，
+// 当前节点若存在被中断的原文，会额外渲染一个"上一轮被中断的输出"分区。
 func (s *State) BuildContext() string {
 	var b strings.Builder
 
@@ -279,6 +283,19 @@ func (s *State) BuildContext() string {
 	fmt.Fprintf(&b, "【过程输出 Finding（第 %d 个节点的推理过程）】\n", s.Ordinal)
 	b.WriteString(s.findingsSummary())
 	b.WriteString("\n\n")
+
+	// 被中断的原文：只要该字段有内容就必须渲染。
+	//
+	// 它是"上一轮被打断、尚未提交"的输出片段；如果不渲染，模型在重入时
+	// 就看不到自己中断前写到哪了，等于丢失了实际上下文。
+	// 该字段在 Commit 时并入本轮 Finding 后清空，因此渲染是临时的。
+	if strings.TrimSpace(s.InterruptedContext) != "" {
+		fmt.Fprintf(&b, "【上一轮被中断的输出（第 %d 个节点，未完成）】\n", s.Ordinal)
+		b.WriteString(s.InterruptedContext)
+		b.WriteString("\n\n")
+		b.WriteString("说明：以上是上一轮产出过程中被打断的片段，尚未提交为正式结论。\n")
+		b.WriteString("请在此基础上续写或重写，避免重复已写过的部分。\n\n")
+	}
 
 	b.WriteString("# 当前任务与决策要求\n")
 	b.WriteString("基于上述前序节点与当前节点，继续推进研究并输出本轮的工作内容。\n")

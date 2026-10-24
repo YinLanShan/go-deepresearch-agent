@@ -185,7 +185,8 @@ func TestPreemptCapturesInterruptedContext(t *testing.T) {
 	if st.InterruptedContext != "" {
 		t.Fatalf("interrupted context should be cleared after commit, got %q", st.InterruptedContext)
 	}
-	if strings.Contains(st.BuildContext(), "被中断的上下文原文") {
-		t.Fatal("interrupted context must not be a standalone section in built context")
+	// 清空后不再渲染该分区（原文已通过 Finding 保留）
+	if strings.Contains(st.BuildContext(), "上一轮被中断的输出") {
+		t.Fatal("cleared interrupted context must not render a section")
 	}
 }
