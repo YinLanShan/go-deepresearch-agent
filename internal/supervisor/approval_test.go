@@ -22,7 +22,7 @@ import (
 func TestToolApprovalInterruptResume(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 

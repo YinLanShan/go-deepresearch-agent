@@ -674,8 +674,8 @@ func (r *Runtime) initResearchRun(ctx context.Context, taskID, runTaskID string)
 		}
 	}
 
-	// 序号 = 已有节点数 + 1；需求初始为空，由首条用户消息填充。
-	st := researchstate.NewWithRelated(ids.New(), taskID, sessionID, len(related)+1, "", related)
+	// 序号 = 已有节点数 + 1；Requirements 初始为空，由用户消息按序填充。
+	st := researchstate.NewWithRelated(ids.New(), taskID, sessionID, len(related)+1, related)
 	if err := r.states.Create(ctx, st); err != nil {
 		return err
 	}

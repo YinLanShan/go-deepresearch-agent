@@ -44,7 +44,7 @@ func shutdownLoop(t *testing.T, loop *Loop) {
 func TestMultiTurnClosedLoop(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "研究某框架的架构")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
@@ -70,8 +70,10 @@ func TestMultiTurnClosedLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get state: %v", err)
 	}
-	if st.Requirement != "研究某框架的架构" {
-		t.Fatalf("requirement should be preserved, got %q", st.Requirement)
+	// Requirements 复数语义：两轮用户消息都按顺序保留。
+	if len(st.Requirements) != 2 ||
+		st.Requirements[0] != "第一轮问题" || st.Requirements[1] != "第二轮问题" {
+		t.Fatalf("requirements should accumulate, got %+v", st.Requirements)
 	}
 	if len(st.Findings) != 2 {
 		t.Fatalf("want 2 findings, got %d", len(st.Findings))
@@ -92,7 +94,7 @@ func TestMultiTurnClosedLoop(t *testing.T) {
 func TestOtherTaskMessagesIgnored(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "需求")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
@@ -130,12 +132,12 @@ func waitFindings(t *testing.T, states researchstate.Store, taskID string, want 
 // 模型慢速流式输出时，新 Commit 事件抢占当前轮次，中断前产生的上下文被保存，
 // 抢占后开启重新规划轮次，最终 Commit 一条 Finding。
 //
-// 注意：InterruptedContext 独立累积，不会被 Commit 消费或清空，
-// 它作为独立分区持续进入上下文构建。
+// 注意：InterruptedContext 是中间产物——被打断的原文会并入下一轮的 Finding，
+// 随后被清空，不再作为独立分区进入上下文。
 func TestPreemptCapturesInterruptedContext(t *testing.T) {
 	ctx := context.Background()
 	states := stateMemory.NewStore()
-	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "研究需求")); err != nil {
+	if err := states.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 
@@ -169,16 +171,20 @@ func TestPreemptCapturesInterruptedContext(t *testing.T) {
 	if !strings.Contains(st.Findings[0].Content, "mock reply to:") {
 		t.Fatalf("finding should contain model answer, got %q", st.Findings[0].Content)
 	}
-	if !strings.Contains(st.Findings[0].Content, "replan") &&
-		!strings.Contains(st.Findings[0].Content, "重新") &&
-		!strings.Contains(st.Findings[0].Content, "结合最新上下文") {
-		t.Logf("finding = %q", st.Findings[0].Content)
+	// 中断原文应被并入本轮的 Finding（"重写被打断的 Finding"），
+	// 随后 InterruptedContext 作为中间产物被清空，且不再作为独立分区进入上下文。
+	merged := st.Findings[0].Content
+	if !strings.Contains(merged, "mock reply to:") {
+		t.Fatalf("finding should contain model answer, got %q", merged)
 	}
-	// 中断上下文不被 Commit 消费，应持续保留
-	if st.InterruptedContext == "" {
-		t.Fatal("interrupted context should be preserved (not consumed by commit)")
+	// 被打断那轮的输出（"mock reply to: 请分析架构"）也应出现在合并结果里。
+	if !strings.Contains(merged, "请分析架构") {
+		t.Fatalf("finding should merge interrupted output, got %q", merged)
 	}
-	if !strings.Contains(st.BuildContext(), st.InterruptedContext) {
-		t.Fatal("interrupted context should appear in built context")
+	if st.InterruptedContext != "" {
+		t.Fatalf("interrupted context should be cleared after commit, got %q", st.InterruptedContext)
+	}
+	if strings.Contains(st.BuildContext(), "被中断的上下文原文") {
+		t.Fatal("interrupted context must not be a standalone section in built context")
 	}
 }

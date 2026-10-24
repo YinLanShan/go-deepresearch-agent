@@ -441,13 +441,13 @@ func (l *Loop) publishEvent(data event.Event) {
 //
 // ReAct 循环中模型可能在工具调用前后多次输出 assistant 文本：
 //   - 每次输出都实时发布为 ModelOutput 事件（前端展示推理过程）；
-//   - 只有"最后一段"assistant 文本作为 Finding（最终结论）。
+//   - Finding 的语义是"除工具调用外的全部模型输出"，即多段叙述的拼接。
 //
 // 收到中断事件（工具审批）时发布审批请求，并跳过本次 Commit。
 func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *schema.Message],
 	events *adk.AsyncIterator[*adk.AgentEvent]) error {
-	var streamed strings.Builder   // 全量输出（用于中断保存）
-	var lastAnswer strings.Builder // 最近一段 assistant 文本（作为 Finding）
+	// answer 累积本轮全部 assistant 文本（跳过 tool 消息），作为 Finding。
+	var answer strings.Builder
 	interrupted := false
 
 	for {
@@ -470,9 +470,8 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 		}
 		mv := event.Output.MessageOutput
 
-		// 工具结果到达：下一段 assistant 文本属于新一轮推理，重置"最终结论"。
+		// 工具结果不属于模型输出，跳过（但不清空已累积的叙述）。
 		if mv.Role == schema.Tool {
-			lastAnswer.Reset()
 			continue
 		}
 		if mv.Role != schema.Assistant {
@@ -480,16 +479,15 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 		}
 
 		if mv.IsStreaming {
-			if err := l.consumeStream(&streamed, &lastAnswer, mv.MessageStream); err != nil {
+			if err := l.consumeStream(&answer, mv.MessageStream); err != nil {
 				break
 			}
 		} else if mv.Message != nil && mv.Message.Content != "" {
-			streamed.WriteString(mv.Message.Content)
-			lastAnswer.WriteString(mv.Message.Content)
+			answer.WriteString(mv.Message.Content)
 		}
 
 		if preempted(tc) {
-			l.saveInterrupted(ctx, streamed.String())
+			l.saveInterrupted(ctx, answer.String())
 			return nil
 		}
 	}
@@ -499,29 +497,25 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 		return nil
 	}
 	if preempted(tc) {
-		l.saveInterrupted(ctx, streamed.String())
+		l.saveInterrupted(ctx, answer.String())
 		return nil // 不发布 done：等待重新规划轮次继续产出
 	}
 
-	answer := lastAnswer.String()
-	if strings.TrimSpace(answer) == "" {
-		// 没有工具调用的普通场景：全量输出即最终结论
-		answer = streamed.String()
-	}
-
-	// 模型是否已通过 finish_research 声明研究结束（不可撤销）。
+	// 本轮过程输出（工具调用前的叙述 + 调用后的叙述）。
+	finding := l.buildFindingContent(ctx, answer.String())
 	finishing, conclusion := l.finishingRequested()
-	if finishing && strings.TrimSpace(conclusion) != "" {
-		// 模型显式给出的结论优先作为本轮 Finding。
-		answer = conclusion
-	}
 
-	err := l.commitFinding(ctx, answer)
-	l.recordAssistantMessage(answer)
+	err := l.commitFinding(ctx, finding)
+	l.recordAssistantMessage(finding)
 
 	if finishing {
-		// 研究终结流程：取消所有后台任务（运行中/等待提交）、关闭提交门控、
-		// 由 Runtime 置 RunTask 为 finished。此后不再接受新的推理输入。
+		// 研究终结：把模型给出的最终结论写入独立字段 Conclusion，
+		// 再取消所有后台任务、关闭提交门控，由 Runtime 置 RunTask 为 finished。
+		if strings.TrimSpace(conclusion) != "" {
+			if err := l.states.SetConclusion(ctx, l.taskID, conclusion); err != nil {
+				slog.Error("set conclusion failed", "task", l.taskID, "err", err)
+			}
+		}
 		l.publishOutputDone()
 		l.publishResearchFinished()
 		return err
@@ -586,7 +580,8 @@ func (l *Loop) handleInterrupt(info *adk.InterruptInfo) {
 }
 
 // consumeStream 逐块读取流式输出，同时累积到 streamed 与 lastAnswer，并发布 ModelOutput 事件。
-func (l *Loop) consumeStream(streamed, lastAnswer *strings.Builder,
+// consumeStream 逐块读取流式输出，累积到 answer 并发布 ModelOutput 事件。
+func (l *Loop) consumeStream(answer *strings.Builder,
 	sr *schema.StreamReader[*schema.Message]) error {
 	if sr == nil {
 		return nil
@@ -601,8 +596,7 @@ func (l *Loop) consumeStream(streamed, lastAnswer *strings.Builder,
 			return err // 流被取消（抢占）或出错
 		}
 		if chunk != nil && chunk.Content != "" {
-			streamed.WriteString(chunk.Content)
-			lastAnswer.WriteString(chunk.Content)
+			answer.WriteString(chunk.Content)
 			l.publishOutput(chunk.Content)
 		}
 	}
@@ -669,30 +663,51 @@ func (l *Loop) SubmitAssignments(ctx context.Context, goals []string) (int, []st
 	return accepted, nil, nil
 }
 
-// commitFinding 把模型回答作为 Finding Commit 到 ResearchState。
+// commitFinding 把模型本轮的过程输出作为 Finding Commit 到 ResearchState。
 //
-// Finding 只包含模型本轮产出；被中断的上下文（InterruptedContext）独立累积，
-// 不由 Commit 消费——它会作为独立分区持续进入上下文构建。
-func (l *Loop) commitFinding(ctx context.Context, answer string) error {
-	if answer == "" {
+// Finding 的语义是"除工具调用外的全部模型输出"；若上一轮被新提交打断，
+// 被打断的原文会拼在本轮 Finding 之前（即"重写被打断的 Finding"）。
+// Commit 成功后，Store 会清空 InterruptedContext（中间产物）。
+func (l *Loop) commitFinding(ctx context.Context, content string) error {
+	if strings.TrimSpace(content) == "" {
 		return nil
 	}
 	return l.states.Commit(ctx, l.taskID, researchstate.CommitInput{
-		ResultContent:  answer,
-		FindingContent: answer,
+		ResultContent:  content,
+		FindingContent: content,
 	})
 }
 
-// recordUserMessage 把用户消息写入 ResearchState 的对话历史；
-// 若该任务尚无研究需求，则把这条消息作为需求。
+// buildFindingContent 组装本轮 Finding：中断原文（若有）+ 本轮输出。
+func (l *Loop) buildFindingContent(ctx context.Context, answer string) string {
+	st, err := l.states.Get(ctx, l.taskID)
+	if err != nil {
+		return answer
+	}
+	interrupted := strings.TrimSpace(st.InterruptedContext)
+	answer = strings.TrimSpace(answer)
+	switch {
+	case interrupted == "":
+		return answer
+	case answer == "":
+		return interrupted
+	default:
+		return interrupted + "\n" + answer
+	}
+}
+
+// recordUserMessage 把用户消息追加为研究需求，并写入对话历史。
+//
+// Requirements 是复数语义：一个 Task 内用户的所有消息都按顺序保留。
 func (l *Loop) recordUserMessage(message string) {
-	if l.states == nil || message == "" {
+	if l.states == nil || strings.TrimSpace(message) == "" {
 		return
 	}
+	message = strings.TrimSpace(message)
 	ctx := context.Background()
-	if err := l.states.SetRequirementIfEmpty(ctx, l.taskID, message); err != nil &&
+	if err := l.states.AddRequirement(ctx, l.taskID, message); err != nil &&
 		!errors.Is(err, researchstate.ErrNotFound) {
-		slog.Error("set research requirement failed", "task", l.taskID, "err", err)
+		slog.Error("add research requirement failed", "task", l.taskID, "err", err)
 	}
 	if err := l.states.AppendMessage(ctx, l.taskID, researchstate.RoleUser, message); err != nil &&
 		!errors.Is(err, researchstate.ErrNotFound) {

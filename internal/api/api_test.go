@@ -514,13 +514,16 @@ func TestResearchLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get state: %v", err)
 	}
-	// 研究需求来自用户发送的第一条消息，而不是 Task 的 Title/Description。
-	if st.Requirement != "请分析" {
-		t.Fatalf("requirement should be the first user message, got %q", st.Requirement)
+	// 研究需求来自用户消息（复数累积），而不是 Task 的 Title/Description。
+	if len(st.Requirements) == 0 || st.Requirements[0] != "请分析" {
+		t.Fatalf("requirements should start with the first user message, got %+v", st.Requirements)
 	}
-	// 模型通过 finish_research 给出的结论作为本轮 Finding。
-	if len(st.Findings) != 1 || st.Findings[0].Content == "" {
+	// 过程输出 Finding 非空；模型通过 finish_research 给出的结论写入独立字段。
+	if len(st.Findings) == 0 || st.Findings[0].Content == "" {
 		t.Fatalf("findings = %+v", st.Findings)
+	}
+	if st.Conclusion == "" {
+		t.Fatal("conclusion should be set after finish_research")
 	}
 	// 对话历史应记录 user + assistant 两条
 	if len(st.History) != 2 ||
@@ -563,8 +566,8 @@ func TestResearchLifecycleFlow(t *testing.T) {
 	if len(prevNode.Findings) == 0 || prevNode.Findings[0].Content == "" {
 		t.Fatalf("related node should carry previous finding, got %+v", prevNode.Findings)
 	}
-	if latest.Requirement != "继续深入" {
-		t.Fatalf("new requirement should be the follow-up message, got %q", latest.Requirement)
+	if len(latest.Requirements) == 0 || latest.Requirements[0] != "继续深入" {
+		t.Fatalf("new requirements should start with the follow-up message, got %+v", latest.Requirements)
 	}
 
 	// 对话历史接口应能回放两个任务的全部消息（每任务 user+assistant，共 4 条）

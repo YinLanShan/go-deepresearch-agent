@@ -859,47 +859,64 @@ async function refreshState() {
 
 function renderState(st) {
   if (!st) return '<div class="state-empty">暂无研究状态。</div>';
+  const requirements = st.requirements || [];
   const findings = st.findings || [];
   const results = st.results || [];
   const related = st.related_nodes || [];
 
   let html = '';
-  html += `<div class="state-block"><h4>研究需求</h4>
-    <div class="state-item">${esc(st.requirement || '—')}</div></div>`;
+
+  // 用户需求：复数语义，按时间顺序编号列出
+  html += `<div class="state-block"><h4>用户需求</h4>`;
+  if (!requirements.length) {
+    html += '<div class="state-empty">暂无</div>';
+  } else {
+    requirements.forEach((r, i) => {
+      html += `<div class="state-item"><span class="turn">${i + 1}</span><br/>${esc(r)}</div>`;
+    });
+  }
+  html += `</div>`;
+
+  // 最终结论：只有模型调用 finish_research 才写入
+  html += `<div class="state-block"><h4>最终结论（Conclusion）</h4>`;
+  if (st.conclusion) {
+    html += `<div class="state-item">${esc(st.conclusion)}</div>`;
+  } else {
+    html += '<div class="state-empty">尚未结束研究（模型未调用 finish_research）</div>';
+  }
+  html += `</div>`;
 
   html += `<div class="state-block"><h4>版本 / 计数</h4>
     <div class="kv"><span class="k">节点序号：</span>第 ${esc(st.ordinal || 1)} 个</div>
     <div class="kv"><span class="k">Version：</span>${esc(st.version || 0)}</div>
+    <div class="kv"><span class="k">需求：</span>${requirements.length}</div>
     <div class="kv"><span class="k">Findings：</span>${findings.length}</div>
     <div class="kv"><span class="k">Results：</span>${results.length}</div>
     <div class="kv"><span class="k">前序节点：</span>${related.length}</div></div>`;
 
-  if (st.interrupted_context) {
-    html += `<div class="state-block"><h4>被中断的上下文</h4>
-      <div class="state-item">${esc(st.interrupted_context)}</div></div>`;
-  }
-
-  // 前序节点：完整展开需求 / Result / Finding / 中断原文
+  // 前序节点：完整展开需求 / Result / 最终结论 / 过程 Finding
   if (related.length) {
     html += `<div class="state-block"><h4>前序研究节点</h4>`;
     for (const n of related) {
       html += `<div class="state-item"><strong>第 ${esc(n.ordinal)} 个节点</strong>`;
-      if (n.requirement) html += `<br/><span class="k">需求：</span>${esc(n.requirement)}`;
+      for (const r of (n.requirements || [])) {
+        html += `<br/><span class="k">需求：</span>${esc(r)}`;
+      }
       for (const r of (n.results || [])) {
         html += `<br/><span class="k">Result 第 ${esc(r.turn)} 轮：</span>${esc(r.content || '')}`;
       }
+      if (n.conclusion) {
+        html += `<br/><span class="k">最终结论：</span>${esc(n.conclusion)}`;
+      }
       for (const f of (n.findings || [])) {
         html += `<br/><span class="k">Finding 第 ${esc(f.turn)} 轮：</span>${esc(f.content || '')}`;
-      }
-      if (n.interrupted_context) {
-        html += `<br/><span class="k">中断原文：</span>${esc(n.interrupted_context)}`;
       }
       html += `</div>`;
     }
     html += `</div>`;
   }
 
-  html += `<div class="state-block"><h4>研究结论（Finding）</h4>`;
+  html += `<div class="state-block"><h4>过程输出（Finding）</h4>`;
   if (!findings.length) html += '<div class="state-empty">暂无</div>';
   for (const f of findings) {
     html += `<div class="state-item"><span class="turn">第 ${esc(f.turn)} 轮</span><br/>${esc(f.content || '')}</div>`;

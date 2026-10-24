@@ -13,7 +13,7 @@ func TestStoreCRUD(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore()
 
-	st := researchstate.New("id1", "t1", "s1", 1, "需求")
+	st := researchstate.New("id1", "t1", "s1", 1)
 	if err := s.Create(ctx, st); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -22,7 +22,7 @@ func TestStoreCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.Requirement != "需求" {
+	if got.TaskID != "t1" || len(got.Requirements) != 0 {
 		t.Fatalf("unexpected state: %+v", got)
 	}
 
@@ -70,10 +70,10 @@ func TestGetLatestBySession(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore()
 
-	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "需求1")); err != nil {
+	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := s.Create(ctx, researchstate.New("id2", "t2", "s1", 1, "需求2")); err != nil {
+	if err := s.Create(ctx, researchstate.New("id2", "t2", "s1", 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -90,7 +90,7 @@ func TestGetLatestBySession(t *testing.T) {
 func TestCommitGate(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore()
-	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "需求")); err != nil {
+	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -115,24 +115,25 @@ func TestCommitGate(t *testing.T) {
 	}
 }
 
-// TestRequirementAndHistory 验证"需求来自首条消息"与对话历史累积。
+// TestRequirementAndHistory 验证需求按时间顺序累积（复数语义）与对话历史累积。
 func TestRequirementAndHistory(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore()
-	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "")); err != nil {
+	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// 首条消息写入需求；后续消息不覆盖
-	if err := s.SetRequirementIfEmpty(ctx, "t1", "第一条消息"); err != nil {
-		t.Fatalf("SetRequirementIfEmpty: %v", err)
+	// 每条用户消息作为一条需求追加，不覆盖
+	if err := s.AddRequirement(ctx, "t1", "第一条消息"); err != nil {
+		t.Fatalf("AddRequirement: %v", err)
 	}
-	if err := s.SetRequirementIfEmpty(ctx, "t1", "第二条消息"); err != nil {
-		t.Fatalf("SetRequirementIfEmpty: %v", err)
+	if err := s.AddRequirement(ctx, "t1", "第二条消息"); err != nil {
+		t.Fatalf("AddRequirement: %v", err)
 	}
 	got, _ := s.Get(ctx, "t1")
-	if got.Requirement != "第一条消息" {
-		t.Fatalf("requirement should come from first message, got %q", got.Requirement)
+	if len(got.Requirements) != 2 ||
+		got.Requirements[0] != "第一条消息" || got.Requirements[1] != "第二条消息" {
+		t.Fatalf("requirements should accumulate in order, got %+v", got.Requirements)
 	}
 
 	// 对话历史累积 user / assistant
@@ -161,12 +162,12 @@ func TestRequirementAndHistory(t *testing.T) {
 	}
 }
 
-// TestInterruptedContextNotConsumedByCommit 验证 InterruptedContext 不被 Commit 消费：
-// Commit 只追加 Result 与 Finding，中断上下文持续保留并进入上下文构建。
-func TestInterruptedContextNotConsumedByCommit(t *testing.T) {
+// TestInterruptedContextClearedByCommit 验证 InterruptedContext 是中间产物：
+// 其内容已由调用方并入本轮 Finding，Commit 成功后应被清空。
+func TestInterruptedContextClearedByCommit(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore()
-	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "需求")); err != nil {
+	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -174,16 +175,54 @@ func TestInterruptedContextNotConsumedByCommit(t *testing.T) {
 		t.Fatalf("AccumulateInterruptedContext: %v", err)
 	}
 	if err := s.Commit(ctx, "t1", researchstate.CommitInput{
-		ResultContent: "本轮证据", FindingContent: "本轮结论"}); err != nil {
+		ResultContent: "中断前的推理原文\n本轮输出", FindingContent: "中断前的推理原文\n本轮输出"}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 
 	st, _ := s.Get(ctx, "t1")
-	if st.InterruptedContext != "中断前的推理原文" {
-		t.Fatalf("interrupted context must survive commit, got %q", st.InterruptedContext)
+	if st.InterruptedContext != "" {
+		t.Fatalf("interrupted context should be cleared after commit, got %q", st.InterruptedContext)
 	}
-	if !strings.Contains(st.BuildContext(), "中断前的推理原文") {
-		t.Fatal("interrupted context should appear in built context")
+	// 原文已并入 Finding，可通过 Finding 追溯到
+	if !strings.Contains(st.Findings[0].Content, "中断前的推理原文") {
+		t.Fatalf("merged finding should contain interrupted text, got %q", st.Findings[0].Content)
+	}
+	if strings.Contains(st.BuildContext(), "被中断的上下文原文") {
+		t.Fatal("interrupted context must not render as a standalone section")
+	}
+}
+
+// TestSetConclusion 验证 Conclusion 独立存储，不受 Commit 影响。
+func TestSetConclusion(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore()
+	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	st, _ := s.Get(ctx, "t1")
+	if st.Conclusion != "" {
+		t.Fatalf("conclusion should be empty before finish, got %q", st.Conclusion)
+	}
+
+	if err := s.Commit(ctx, "t1", researchstate.CommitInput{
+		ResultContent: "过程证据", FindingContent: "过程输出"}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	st, _ = s.Get(ctx, "t1")
+	if st.Conclusion != "" {
+		t.Fatalf("commit must not write conclusion, got %q", st.Conclusion)
+	}
+
+	if err := s.SetConclusion(ctx, "t1", "整项研究的最终结论"); err != nil {
+		t.Fatalf("SetConclusion: %v", err)
+	}
+	st, _ = s.Get(ctx, "t1")
+	if st.Conclusion != "整项研究的最终结论" {
+		t.Fatalf("conclusion = %q", st.Conclusion)
+	}
+	if !strings.Contains(st.BuildContext(), "整项研究的最终结论") {
+		t.Fatal("conclusion should appear in built context")
 	}
 }
 
@@ -192,7 +231,7 @@ func TestInterruptedContextNotConsumedByCommit(t *testing.T) {
 func TestAppendResultOnly(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore()
-	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1, "需求")); err != nil {
+	if err := s.Create(ctx, researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := s.AccumulateInterruptedContext(ctx, "t1", "中断原文"); err != nil {

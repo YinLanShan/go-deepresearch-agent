@@ -30,9 +30,15 @@ const (
 
 // State 是某个研究任务（Task）的研究状态，是研究发现资产的权威来源。
 //
+// 一个 Task 对应唯一一份 ResearchState；它跨 RunTask 重建存活。
+//
 // 注意：Session 的 Title/Description（以及 Task 的 Title/Description）只作为
-// 会话标识，不进入 Supervisor 提示词；ResearchState 的 Requirement 来自用户
-// 实际发送的第一条消息。
+// 会话标识，不进入 Supervisor 提示词；Requirements 来自用户实际发送的消息。
+//
+// 三个易混淆字段的语义边界：
+//   - Findings    ：模型的过程性输出（除工具调用外的全部 assistant 文本），每轮追加；
+//   - Conclusion  ：该节点的最终结论，只有调用 finish_research 才写入，否则为空；
+//   - Requirements：用户需求，按时间顺序累积（复数语义）。
 type State struct {
 	ID        string `json:"id"`
 	TaskID    string `json:"task_id"`
@@ -41,24 +47,32 @@ type State struct {
 	// Ordinal 是该 Task 在所属 Session 内的序号（从 1 开始），用于上下文分区标识。
 	Ordinal int `json:"ordinal"`
 
-	// Requirement 是用户在本次研究任务中实际发送的第一条消息内容。
-	Requirement string `json:"requirement"`
+	// Requirements 是用户在本研究任务中发送的全部消息，按时间顺序累积。
+	//
+	// 复数语义：一个 Task 内用户可能多次补充需求，全部进入上下文（编号列出）。
+	Requirements []string `json:"requirements"`
 
 	// Results 是已提交/待返回的研究产物（证据）。
 	Results []Result `json:"results"`
 
-	// Findings 是 Supervisor 整理后的研究结论（知识）。
+	// Findings 是模型的过程性输出（除工具调用外的全部 assistant 文本）。
 	Findings []Finding `json:"findings"`
+
+	// Conclusion 是该研究节点的最终结论。
+	//
+	// 只有模型调用 finish_research 时才写入；未结束的研究该字段为空，
+	// 这也是"该节点尚未完成"的天然标志。
+	Conclusion string `json:"conclusion"`
 
 	// RelatedNodes 是前序研究节点（已结束的 Task）的完整快照。
 	RelatedNodes []RelatedNode `json:"related_nodes"`
 
-	// InterruptedContext 累积保存中断时正在产生但未完成的上下文原文。
-	// 该字段不被 Commit 消费，始终作为独立分区进入上下文。
+	// InterruptedContext 是中间产物：本轮被新提交打断时暂存未完成的输出原文，
+	// 下一轮开始时会被并入该轮 Finding 后清空。它不作为独立分区进入上下文。
 	InterruptedContext string `json:"interrupted_context"`
 
 	// History 是本研究任务的对话历史（用户消息与 Supervisor 回复），
-	// 用于前端切换会话时回放。内存存储，随 ResearchState 生命周期存活。
+	// 仅用于前端切换会话时回放，不进入 Supervisor 提示词。
 	History []Message `json:"history"`
 
 	// Version 是版本号，每次 Commit 自增。
@@ -77,7 +91,7 @@ type Result struct {
 	CreatedAt time.Time    `json:"created_at"`
 }
 
-// Finding 是经过整理后的研究结论（知识）。
+// Finding 是模型的过程性输出（除工具调用外的全部 assistant 文本）。
 type Finding struct {
 	Turn      int       `json:"turn"`
 	Content   string    `json:"content"`
@@ -87,15 +101,15 @@ type Finding struct {
 // RelatedNode 是前序研究节点（某个已结束的 Task）的完整快照。
 //
 // 保存完整快照而不是摘要，是为了让上下文构建能把历史节点完整展开，
-// 避免后续节点只看到一句结论、丢失证据与被中断的推理原文。
+// 避免后续节点只看到一句结论、丢失证据与过程输出。
 type RelatedNode struct {
-	TaskID      string    `json:"task_id"`
-	Ordinal     int       `json:"ordinal"`
-	Requirement string    `json:"requirement"`
-	Results     []Result  `json:"results"`
-	Findings    []Finding `json:"findings"`
-	// InterruptedContext 是该节点中断时累积的上下文原文。
-	InterruptedContext string `json:"interrupted_context"`
+	TaskID       string    `json:"task_id"`
+	Ordinal      int       `json:"ordinal"`
+	Requirements []string  `json:"requirements"`
+	Results      []Result  `json:"results"`
+	Findings     []Finding `json:"findings"`
+	// Conclusion 是该节点的最终结论（仅当该节点调用过 finish_research 才有值）。
+	Conclusion string `json:"conclusion"`
 }
 
 // MessageRole 是对话历史中一条消息的角色。
@@ -119,51 +133,56 @@ type Message struct {
 
 // CommitInput 描述一次 ResearchState 提交。
 //
-// Commit 只追加 Result 与 Finding，不触碰 InterruptedContext。
+// Commit 追加 Result 与 Finding，并把待合并的中断原文清空（已并入本轮 Finding）。
 type CommitInput struct {
 	// ResultContent 是研究产物（证据）。
 	ResultContent string
-	// FindingContent 是研究结论（知识）。
+	// FindingContent 是模型本轮的过程性输出（已包含合并进来的中断原文）。
 	FindingContent string
 }
 
-// New 创建一个研究任务的初始研究状态：仅含研究需求，无任何研究产物。
-func New(id, taskID, sessionID string, ordinal int, requirement string) *State {
+// New 创建一个研究任务的初始研究状态：不含任何需求与研究产物。
+func New(id, taskID, sessionID string, ordinal int) *State {
 	now := time.Now()
 	return &State{
-		ID:          id,
-		TaskID:      taskID,
-		SessionID:   sessionID,
-		Ordinal:     ordinal,
-		Requirement: requirement,
-		Results:     []Result{},
-		Findings:    []Finding{},
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:           id,
+		TaskID:       taskID,
+		SessionID:    sessionID,
+		Ordinal:      ordinal,
+		Requirements: []string{},
+		Results:      []Result{},
+		Findings:     []Finding{},
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 }
 
 // NewWithRelated 创建一份研究状态，并携带前序研究节点的完整快照。
-func NewWithRelated(id, taskID, sessionID string, ordinal int, requirement string, related []RelatedNode) *State {
-	st := New(id, taskID, sessionID, ordinal, requirement)
+func NewWithRelated(id, taskID, sessionID string, ordinal int, related []RelatedNode) *State {
+	st := New(id, taskID, sessionID, ordinal)
 	st.RelatedNodes = append([]RelatedNode(nil), related...)
 	return st
 }
 
-// Summary 返回该研究状态的结论摘要（仅用于展示/兼容，不再用于上下文构建）。
+// Summary 返回该研究状态的结论摘要（仅用于展示/兼容，不用于上下文构建）。
+//
+// 优先使用 Conclusion；未结束时退回过程 Finding 的摘要。
 func (s *State) Summary() string {
+	if strings.TrimSpace(s.Conclusion) != "" {
+		return s.Conclusion
+	}
 	return s.findingsSummary()
 }
 
 // Snapshot 把当前节点转换为可供后续节点引用的完整快照。
 func (s *State) Snapshot() RelatedNode {
 	return RelatedNode{
-		TaskID:             s.TaskID,
-		Ordinal:            s.Ordinal,
-		Requirement:        s.Requirement,
-		Results:            append([]Result(nil), s.Results...),
-		Findings:           append([]Finding(nil), s.Findings...),
-		InterruptedContext: s.InterruptedContext,
+		TaskID:       s.TaskID,
+		Ordinal:      s.Ordinal,
+		Requirements: append([]string(nil), s.Requirements...),
+		Results:      append([]Result(nil), s.Results...),
+		Findings:     append([]Finding(nil), s.Findings...),
+		Conclusion:   s.Conclusion,
 	}
 }
 
@@ -173,7 +192,9 @@ const pendingResultMark = "（该 Result 尚未返回结果）"
 // BuildContext 构建 Supervisor 的输入上下文。
 //
 // 结构分区（对应 docs/Architecture.md 7.3.6）：前序节点按序完整展开 → 当前节点 →
-// 当前任务与决策要求。每个节点内部再细分 需求 / Result / Finding / 被中断上下文。
+// 当前任务与决策要求。每个节点内部按 需求 / Result / 最终结论 / 过程 Finding 分区。
+//
+// 注意：InterruptedContext 是中间产物，不在此作为独立分区渲染。
 func (s *State) BuildContext() string {
 	var b strings.Builder
 
@@ -190,25 +211,28 @@ func (s *State) BuildContext() string {
 	}
 
 	fmt.Fprintf(&b, "# 当前研究节点（第 %d 个）\n\n", s.Ordinal)
-	b.WriteString("【研究需求】\n")
-	b.WriteString(orEmpty(s.Requirement, "（尚未提供，等待用户输入）"))
+	b.WriteString("【用户需求（按时间顺序）】\n")
+	b.WriteString(requirementsSummaryOf(s.Requirements))
 	b.WriteString("\n\n")
 
 	fmt.Fprintf(&b, "【研究产物 Result（第 %d 个节点的证据）】\n", s.Ordinal)
 	b.WriteString(s.resultsSummary())
 	b.WriteString("\n\n")
 
-	fmt.Fprintf(&b, "【研究结论 Finding（第 %d 个节点的知识）】\n", s.Ordinal)
+	fmt.Fprintf(&b, "【最终结论 Conclusion（第 %d 个节点的结论）】\n", s.Ordinal)
+	b.WriteString(orEmpty(s.Conclusion, "（尚未结束研究，暂无结论）"))
+	b.WriteString("\n\n")
+
+	fmt.Fprintf(&b, "【过程输出 Finding（第 %d 个节点的推理过程）】\n", s.Ordinal)
 	b.WriteString(s.findingsSummary())
 	b.WriteString("\n\n")
 
-	fmt.Fprintf(&b, "【被中断的上下文原文（第 %d 个节点的中断记录）】\n", s.Ordinal)
-	b.WriteString(orEmpty(s.InterruptedContext, "（暂无）"))
-	b.WriteString("\n\n")
-
 	b.WriteString("# 当前任务与决策要求\n")
-	b.WriteString("基于上述前序节点与当前节点，继续推进研究，直接输出本轮的研究结论。\n")
-	b.WriteString("你可以调用提供的工具（例如 web_search）获取外部资料；调用前请简要说明目的。\n")
+	b.WriteString("基于上述前序节点与当前节点，继续推进研究并输出本轮的工作内容。\n")
+	b.WriteString("需要外部资料时调用工具（例如 web_search）；也可以调用 submit_assignments " +
+		"把可独立完成的研究子任务派发到后台并行推进。\n")
+	b.WriteString("派发子任务后无需等待，可以直接结束本轮；子任务结果提交后会唤醒你继续决策。\n")
+	b.WriteString("当研究目标已达成、没有必须继续的工作时，调用 finish_research 给出整项研究的最终结论。\n")
 	b.WriteString("未返回结果的 Result 不得视为已完成事实，不要虚构其结果。\n")
 	b.WriteString("不要重复已经得出的结论。\n")
 
@@ -220,23 +244,35 @@ func (n RelatedNode) render() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## 第 %d 个研究节点\n\n", n.Ordinal)
 
-	b.WriteString("【研究需求】\n")
-	b.WriteString(orEmpty(n.Requirement, "（无）"))
+	b.WriteString("【用户需求（按时间顺序）】\n")
+	b.WriteString(requirementsSummaryOf(n.Requirements))
 	b.WriteString("\n\n")
 
 	fmt.Fprintf(&b, "【研究产物 Result（第 %d 个节点的证据）】\n", n.Ordinal)
 	b.WriteString(resultsSummaryOf(n.Results))
 	b.WriteString("\n\n")
 
-	fmt.Fprintf(&b, "【研究结论 Finding（第 %d 个节点的知识）】\n", n.Ordinal)
-	b.WriteString(findingsSummaryOf(n.Findings))
+	fmt.Fprintf(&b, "【最终结论 Conclusion（第 %d 个节点的结论）】\n", n.Ordinal)
+	b.WriteString(orEmpty(n.Conclusion, "（该节点未宣布结束，暂无结论）"))
 	b.WriteString("\n\n")
 
-	fmt.Fprintf(&b, "【被中断的上下文原文（第 %d 个节点的中断记录）】\n", n.Ordinal)
-	b.WriteString(orEmpty(n.InterruptedContext, "（暂无）"))
+	fmt.Fprintf(&b, "【过程输出 Finding（第 %d 个节点的推理过程）】\n", n.Ordinal)
+	b.WriteString(findingsSummaryOf(n.Findings))
 	b.WriteString("\n")
 
 	return b.String()
+}
+
+// requirementsSummaryOf 把用户需求按时间顺序编号列出。
+func requirementsSummaryOf(reqs []string) string {
+	if len(reqs) == 0 {
+		return "（尚未提供，等待用户输入）"
+	}
+	var b strings.Builder
+	for i, r := range reqs {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, r)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // resultsSummary 汇总当前节点的研究产物；未返回结果的 Result 用固定提示词标注。
@@ -271,13 +307,14 @@ func findingsSummaryOf(findings []Finding) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// SetRequirementIfEmpty 在需求为空时写入（用于"首条消息即研究需求"）。
-// 返回是否实际写入。
-func (s *State) SetRequirementIfEmpty(requirement string) bool {
-	if s.Requirement != "" || requirement == "" {
+// AddRequirement 追加一条用户需求（按时间顺序累积）。
+// 空白内容被忽略；返回是否实际写入。
+func (s *State) AddRequirement(requirement string) bool {
+	requirement = strings.TrimSpace(requirement)
+	if requirement == "" {
 		return false
 	}
-	s.Requirement = requirement
+	s.Requirements = append(s.Requirements, requirement)
 	s.UpdatedAt = time.Now()
 	return true
 }

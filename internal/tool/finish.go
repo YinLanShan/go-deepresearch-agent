@@ -24,7 +24,9 @@ type Finisher interface {
 
 // FinishResearchInput 是 finish_research 的入参。
 type FinishResearchInput struct {
-	Conclusion string `json:"conclusion" jsonschema:"description=研究结论总结（可选，用于记录最终结论）"`
+	// Conclusion 是整项研究的最终结论，不是本轮小结。
+	// 它会被单独写入 ResearchState.Conclusion，作为该研究节点的结论。
+	Conclusion string `json:"conclusion" jsonschema:"description=整项研究的最终结论（不是本轮小结）：应总结研究目标是什么、得出了哪些关键结论、还有哪些未解决的限制。该结论会作为本次研究的正式结论长期保存。"`
 }
 
 // FinishResearchOutput 是 finish_research 的出参。
@@ -34,13 +36,16 @@ type FinishResearchOutput struct {
 
 // NewFinishResearchTool 构造 finish_research 工具。
 //
-// 该工具只负责"标记终结意图"；真正的终止流程（取消后台任务、关闭提交门控、
-// 置 RunTask 为 finished）由 SupervisorLoop 在本轮收尾时统一执行，
+// 该工具只负责"标记终结意图"；真正的终止流程（写入 Conclusion、取消后台任务、
+// 关闭提交门控、置 RunTask 为 finished）由 SupervisorLoop 在本轮收尾时统一执行，
 // 以保证"模型调用后不会再被新一轮推理推翻"。
 func NewFinishResearchTool(f Finisher) (tool.InvokableTool, error) {
 	return utils.InferTool[FinishResearchInput, FinishResearchOutput](
 		FinishToolName,
-		"宣布本次研究结束。当研究目标已达成、没有必须继续的工作时调用。"+
+		"宣布本次研究结束，并给出整项研究的最终结论。"+
+			"当研究目标已达成、没有必须继续的工作时调用。"+
+			"conclusion 必须是针对整个研究目标的总结（而非本轮工作的小结），"+
+			"因为它是该研究节点的正式结论，会长期保留并传递给后续研究节点。"+
 			"调用后不可撤销，且会取消所有仍在运行或等待提交的后台研究任务。",
 		func(_ context.Context, in FinishResearchInput) (FinishResearchOutput, error) {
 			if f == nil {

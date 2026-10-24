@@ -84,10 +84,11 @@ func (s *Store) ListBySession(_ context.Context, sessionID string) ([]*researchs
 	return out, nil
 }
 
-// Commit 追加一轮研究产物（Result）与研究结论（Finding），并自增版本号。
+// Commit 追加一轮研究产物（Result）与过程输出（Finding），并自增版本号。
 //
-// InterruptedContext 不参与 Commit：它独立累积，始终作为分区进入上下文。
-// 若提交门控已关闭（暂停状态），返回 researchstate.ErrNotAccepting。
+// InterruptedContext 是中间产物：其内容已由调用方并入本轮 Finding，
+// 因此这里在提交成功后清空该字段。
+// 若提交门控已关闭（被挤掉的等待状态），返回 researchstate.ErrNotAccepting。
 func (s *Store) Commit(_ context.Context, taskID string, in researchstate.CommitInput) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,8 +114,39 @@ func (s *Store) Commit(_ context.Context, taskID string, in researchstate.Commit
 		Content:   in.FindingContent,
 		CreatedAt: now,
 	})
+	// 中断原文已并入本轮 Finding，作为中间产物清空。
+	st.InterruptedContext = ""
 	st.Version++
 	st.UpdatedAt = now
+	return nil
+}
+
+// SetConclusion 写入该研究节点的最终结论。
+//
+// 仅由 finish_research 触发；未结束的研究该字段保持为空。
+func (s *Store) SetConclusion(_ context.Context, taskID, conclusion string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[taskID]
+	if !ok {
+		return researchstate.ErrNotFound
+	}
+	st.Conclusion = conclusion
+	st.UpdatedAt = time.Now()
+	return nil
+}
+
+// AddRequirement 追加一条用户需求（按时间顺序累积）。
+func (s *Store) AddRequirement(_ context.Context, taskID, requirement string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.m[taskID]
+	if !ok {
+		return researchstate.ErrNotFound
+	}
+	if st.AddRequirement(requirement) {
+		st.UpdatedAt = time.Now()
+	}
 	return nil
 }
 
@@ -154,23 +186,6 @@ func (s *Store) AccumulateInterruptedContext(_ context.Context, taskID, text str
 	}
 	st.InterruptedContext += text
 	st.UpdatedAt = time.Now()
-	return nil
-}
-
-// SetRequirementIfEmpty 在需求为空时写入（首条用户消息即研究需求）。
-func (s *Store) SetRequirementIfEmpty(_ context.Context, taskID, requirement string) error {
-	if requirement == "" {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st, ok := s.m[taskID]
-	if !ok {
-		return researchstate.ErrNotFound
-	}
-	if st.SetRequirementIfEmpty(requirement) {
-		st.UpdatedAt = time.Now()
-	}
 	return nil
 }
 

@@ -136,7 +136,10 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 	// 注意：Supervisor 被 résultat 唤醒时会以新输入开启一轮（历史里可能没有
 	// 上一轮的工具消息），因此还要扫描 assistant 消息里的 ToolCalls，
 	// 否则会重复派发同一批子任务，形成无限扩增。
-	var lastToolResult string
+	//
+	// lastSearchResult 只记录"业务工具"（如 web_search）的返回，
+	// 不把 submit_assignments / finish_research 的控制类返回当作研究证据。
+	var lastSearchResult string
 	var sawAssignResult, sawFinishResult, assignedBefore bool
 	for _, msg := range input {
 		if msg == nil {
@@ -156,12 +159,14 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 		if msg.Role != schema.Tool {
 			continue
 		}
-		lastToolResult = msg.Content
 		switch msg.ToolName {
 		case submitAssignmentsToolName:
 			sawAssignResult = true
 		case finishToolName:
 			sawFinishResult = true
+		default:
+			// 业务工具结果：作为研究证据
+			lastSearchResult = msg.Content
 		}
 	}
 	// 已经派发过子任务（无论工具结果是否还在历史里）就不再重复派发。
@@ -189,8 +194,8 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 	// 已派发过子任务：不再检索，直接出结论；配置了 CallFinish 则顺便宣布结束。
 	if alreadyAssigned {
 		conclusion := "已把研究拆分给后台子任务并汇总其结论。"
-		if lastToolResult != "" {
-			conclusion = "根据检索结果，可以得出结论：" + lastToolResult
+		if lastSearchResult != "" {
+			conclusion = "根据检索结果，可以得出结论：" + lastSearchResult
 		}
 		if m.CallFinish && hasTool(available, finishToolName) {
 			msg := schema.AssistantMessage(conclusion+" 研究到此结束。", nil)
@@ -208,8 +213,8 @@ func (m *ToolModel) Generate(_ context.Context, input []*schema.Message, opts ..
 	}
 
 	// 已有检索结果：出结论；若配置了 CallFinish，则再调用一次 finish_research 宣布结束。
-	if lastToolResult != "" {
-		conclusion := "根据检索结果，可以得出结论：" + lastToolResult
+	if lastSearchResult != "" {
+		conclusion := "根据检索结果，可以得出结论：" + lastSearchResult
 		if m.CallFinish && hasTool(available, finishToolName) {
 			msg := schema.AssistantMessage(conclusion+" 研究到此结束。", nil)
 			msg.ToolCalls = []schema.ToolCall{{

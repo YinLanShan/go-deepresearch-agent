@@ -2,6 +2,7 @@ package resultagg
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
 func newTestAgg(t *testing.T) (*Aggregator, *stateMemory.Store, *fakeScheduler, *event.Bus) {
 	t.Helper()
 	states := stateMemory.NewStore()
-	if err := states.Create(context.Background(), researchstate.New("id1", "t1", "s1", 1, "需求")); err != nil {
+	if err := states.Create(context.Background(), researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 	bus := event.NewBus()
@@ -75,7 +76,11 @@ func slotAssignment(id, runTaskID string) *domain.Assignment {
 	}
 }
 
-// TestAggregatorBatchCommit 验证同一 Task 的多个 Result 合并为一次 Commit。
+// TestAggregatorBatchCommit 验证同一 Task 的多个 Result 都能被提交（可合并为一批）。
+//
+// 注意：批处理边界是"当前已到达且已登记的结果"，两个结果若被分别唤醒处理，
+// 就会落成两次 Commit。因此这里断言"两条证据都进入历史、且每个 Assignment
+// 都收到提交确认"，而不断言批次数量——那取决于调度时序，不是契约。
 func TestAggregatorBatchCommit(t *testing.T) {
 	a, states, sched, bus := newTestAgg(t)
 
@@ -85,21 +90,18 @@ func TestAggregatorBatchCommit(t *testing.T) {
 		}
 	}
 
-	if err := bus.Publish(context.Background(), event.EventEnvelope{
-		Data: event.WorkResultReadyEvent{
-			SessionID: "s1", TaskID: "t1", RunTaskID: "r1",
-			AssignmentID: "a1", WorkID: "w1", Result: "证据一",
-		},
-	}); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	if err := bus.Publish(context.Background(), event.EventEnvelope{
-		Data: event.WorkResultReadyEvent{
-			SessionID: "s1", TaskID: "t1", RunTaskID: "r1",
-			AssignmentID: "a2", WorkID: "w2", Result: "证据二",
-		},
-	}); err != nil {
-		t.Fatalf("publish: %v", err)
+	for _, item := range []struct{ assignment, work, result string }{
+		{"a1", "w1", "证据一"},
+		{"a2", "w2", "证据二"},
+	} {
+		if err := bus.Publish(context.Background(), event.EventEnvelope{
+			Data: event.WorkResultReadyEvent{
+				SessionID: "s1", TaskID: "t1", RunTaskID: "r1",
+				AssignmentID: item.assignment, WorkID: item.work, Result: item.result,
+			},
+		}); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
 	}
 
 	if !waitFor(t, 3*time.Second, func() bool {
@@ -117,12 +119,17 @@ func TestAggregatorBatchCommit(t *testing.T) {
 	if st.Version == 0 {
 		t.Fatal("research state should be committed")
 	}
-	// 两条 Result 都要进入历史（可合并为一次 Commit，但不能丢失）
-	if len(st.Results) != 1 {
-		t.Fatalf("batch should merge into 1 commit, got %d results", len(st.Results))
+
+	// 两条证据都必须进入历史（合并或分次提交都可以，但不能丢失）
+	var all strings.Builder
+	for _, r := range st.Results {
+		all.WriteString(r.Content)
+		all.WriteString("\n")
 	}
-	if st.Results[0].Content == "" {
-		t.Fatal("committed content should not be empty")
+	for _, want := range []string{"证据一", "证据二"} {
+		if !strings.Contains(all.String(), want) {
+			t.Fatalf("committed results missing %q, got %q", want, all.String())
+		}
 	}
 }
 
@@ -153,7 +160,7 @@ func TestAggregatorRejectsWithoutSlot(t *testing.T) {
 // TestAggregatorCommitFailureKeepsSlot 验证 Commit 失败时保留槽位以便重试。
 func TestAggregatorCommitFailureKeepsSlot(t *testing.T) {
 	states := stateMemory.NewStore()
-	if err := states.Create(context.Background(), researchstate.New("id1", "t1", "s1", 1, "需求")); err != nil {
+	if err := states.Create(context.Background(), researchstate.New("id1", "t1", "s1", 1)); err != nil {
 		t.Fatalf("create state: %v", err)
 	}
 	// 关闭提交门控，制造 Commit 失败
