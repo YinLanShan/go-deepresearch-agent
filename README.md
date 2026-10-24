@@ -229,6 +229,11 @@ WorkPool 把未完成 Work 标记 `cancelled`、ResultAggregator 丢弃待提交
 （只追加，含序号、操作类型、Assignment/Result、原因与版本号），
 前端 ResearchState 面板可查看，接口为 `GET /sessions/:id/research-state`。
 
+**被打断的原文**：一轮输出被新提交打断时，未完成的片段暂存于 `InterruptedContext`。
+只要该字段非空，上下文就会渲染"上一轮被中断的输出"，使模型重入时能看到中断前的实际内容；
+Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`）不会 Commit，
+因此残留原文会通过 `RelatedNode.InterruptedContext` 传给下一个研究节点，不会丢失。
+
 **Assignment 归属 RunTask**：RunTask 消失则其下 Assignment 与 Work 一并删除
 （`DeleteByRunTask` 级联），不会留下孤儿数据。
 

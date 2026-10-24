@@ -893,6 +893,12 @@ function renderState(st) {
   }
   html += `</div>`;
 
+  // 当前节点残留的、未提交的被打断原文（中止场景）
+  if (st.interrupted_context) {
+    html += `<div class="state-block"><h4>中止时未完成的输出</h4>
+      <div class="state-item">${esc(st.interrupted_context)}</div></div>`;
+  }
+
   html += `<div class="state-block"><h4>版本 / 计数</h4>
     <div class="kv"><span class="k">节点序号：</span>第 ${esc(st.ordinal || 1)} 个</div>
     <div class="kv"><span class="k">Version：</span>${esc(st.version || 0)}</div>
@@ -917,6 +923,10 @@ function renderState(st) {
       }
       for (const f of (n.findings || [])) {
         html += `<br/><span class="k">Finding 第 ${esc(f.turn)} 轮：</span>${esc(f.content || '')}`;
+      }
+      // 中止节点残留的未提交原文
+      if (n.interrupted_context) {
+        html += `<br/><span class="k">中止时未完成：</span>${esc(n.interrupted_context)}`;
       }
       html += `</div>`;
     }

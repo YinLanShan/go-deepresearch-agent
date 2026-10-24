@@ -158,6 +158,12 @@ type RelatedNode struct {
 	Findings     []Finding `json:"findings"`
 	// Conclusion 是该节点的最终结论（仅当该节点调用过 finish_research 才有值）。
 	Conclusion string `json:"conclusion"`
+	// InterruptedContext 是该节点残留的、未提交的被打断原文。
+	//
+	// 正常结束的节点该字段为空（Commit 已把原文并入 Finding 并清空）；
+	// 但中止（stopped）的节点不会 Commit，此处会保留那一段未完成的输出，
+	// 使后续节点不至于完全丢失。
+	InterruptedContext string `json:"interrupted_context,omitempty"`
 }
 
 // MessageRole 是对话历史中一条消息的角色。
@@ -235,12 +241,13 @@ func (s *State) Summary() string {
 // Snapshot 把当前节点转换为可供后续节点引用的完整快照。
 func (s *State) Snapshot() RelatedNode {
 	return RelatedNode{
-		TaskID:       s.TaskID,
-		Ordinal:      s.Ordinal,
-		Requirements: append([]string(nil), s.Requirements...),
-		Results:      append([]Result(nil), s.Results...),
-		Findings:     append([]Finding(nil), s.Findings...),
-		Conclusion:   s.Conclusion,
+		TaskID:             s.TaskID,
+		Ordinal:            s.Ordinal,
+		Requirements:       append([]string(nil), s.Requirements...),
+		Results:            append([]Result(nil), s.Results...),
+		Findings:           append([]Finding(nil), s.Findings...),
+		Conclusion:         s.Conclusion,
+		InterruptedContext: s.InterruptedContext,
 	}
 }
 
@@ -329,6 +336,13 @@ func (n RelatedNode) render() string {
 	fmt.Fprintf(&b, "【过程输出 Finding（第 %d 个节点的推理过程）】\n", n.Ordinal)
 	b.WriteString(findingsSummaryOf(n.Findings))
 	b.WriteString("\n")
+
+	// 中止节点残留的未提交原文（正常结束的节点该字段为空）。
+	if strings.TrimSpace(n.InterruptedContext) != "" {
+		fmt.Fprintf(&b, "\n【该节点中止时未完成的输出（第 %d 个节点，未提交）】\n", n.Ordinal)
+		b.WriteString(n.InterruptedContext)
+		b.WriteString("\n")
+	}
 
 	return b.String()
 }
