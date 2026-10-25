@@ -254,8 +254,9 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
   子 Agent 不能派发子任务、撤销或结束研究；
 - 子 Agent 的全部 assistant 输出累积为待提交的 Result；
 - 超时与取消都会**显式 cancel** 子 Agent 的 ctx（只停止消费事件流不会让它停下）；
-  超时标记 Work 为 `timedout`，取消标记为 `cancelled`；
-- 子 Agent 不接入审批：遇到工具审批中断直接中止，并把原因回告 Supervisor。
+  超时标记 Work 为 `timedout` 且**不提交任何结果**，取消标记为 `cancelled`；
+- 子 Agent **不参与任何人工审批**：工厂不注入审批中间件，
+  审批只作用于 Supervisor 的工具调用。
 
 **查询接口**：`GET /api/v1/sessions/:id/background-tasks` 返回当前 RunTask 下的
 Assignment 与其最新 Work（状态、阶段、Worker、耗时）；SSE 同时推送

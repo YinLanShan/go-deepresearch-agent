@@ -110,6 +110,10 @@ func filterSubAgentTools(tools []tool.BaseTool) []tool.BaseTool {
 }
 
 // NewWorker 为一个 Work 创建独立的子 Agent 执行器。
+//
+// 注意：这里**不注入任何 ChatModelAgentMiddleware**（自然也没有审批中间件）。
+// 人工审批只作用于 Supervisor 的工具调用；SubAgent 是一次性执行单元，
+// 没有可恢复的轮次状态，因此不参与审批流程。
 func (f *SubAgentFactory) NewWorker(ctx context.Context, w *domain.Work) (Worker, error) {
 	if f.model == nil {
 		return nil, errors.New("workpool: sub-agent model is not configured")
@@ -249,11 +253,12 @@ func (s *SubAgentWorker) Run(ctx context.Context, w *domain.Work,
 	return result, nil
 }
 
-// ErrSubAgentNeedsApproval 表示子 Agent 触发了需要人工审批的工具调用。
+// ErrSubAgentNeedsApproval 表示子 Agent 上报了中断事件。
 //
-// 子 Agent 不接入审批流程：它是一次性任务，没有可恢复的轮次状态，
-// 因此直接中止并把原因回告 Supervisor。
-var ErrSubAgentNeedsApproval = errors.New("workpool: sub-agent requested tool approval (not supported)")
+// 子 Agent 不注入审批中间件，正常情况下不会产生审批中断；
+// 因此该错误只作为防御性兜底——一旦出现，说明有非预期组件触发了中断，
+// 直接终止并把原因回告 Supervisor，不进入任何审批流程。
+var ErrSubAgentNeedsApproval = errors.New("workpool: sub-agent was interrupted unexpectedly (approval is not supported)")
 
 // ErrSubAgentEmptyResult 表示子 Agent 没有产出任何内容。
 var ErrSubAgentEmptyResult = errors.New("workpool: sub-agent produced no output")
