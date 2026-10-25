@@ -62,6 +62,17 @@ func main() {
 	// 依赖方向：Scheduler → WorkPool / ResultAggregator → ResearchState。
 	// ResultAggregator 通过 SchedulerNotifier 回调 Scheduler 完成回收确认。
 	// 它们都参与 Runtime 的协商握手（订阅 CoordinationRequested）。
+	//
+	// 两级并发控制：
+	//   MaxConcurrency（Scheduler）：同时在途的 Work 上限（排队 + 执行），提供背压；
+	//   Workers（WorkPool）：真正的并行执行槽位。
+	// MaxConcurrency < Workers 时部分 Worker 会闲置，属于配置错误。
+	if cfg.Execution.MaxConcurrency < cfg.Execution.Workers {
+		slog.Warn("max_concurrency is less than workers, some workers will stay idle",
+			"max_concurrency", cfg.Execution.MaxConcurrency,
+			"workers", cfg.Execution.Workers,
+			"hint", "set DRA_SCHEDULER_MAX_CONCURRENCY >= DRA_WORKPOOL_WORKERS")
+	}
 	aggregator := resultagg.New(resultagg.Config{
 		States: stateStore,
 		Bus:    bus,

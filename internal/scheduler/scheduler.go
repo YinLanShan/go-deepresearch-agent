@@ -49,11 +49,18 @@ type ResultSlots interface {
 
 // Config 是 Scheduler 的配置。
 type Config struct {
-	Assignments    storage.AssignmentStore
-	Works          storage.WorkStore
-	Pool           WorkRunner
-	Slots          ResultSlots
-	Bus            *event.Bus
+	Assignments storage.AssignmentStore
+	Works       storage.WorkStore
+	Pool        WorkRunner
+	Slots       ResultSlots
+	Bus         *event.Bus
+	// MaxConcurrency 是"同时在途"的 Work 上限（排队中 + 执行中）。
+	//
+	// 它提供的是背压：防止 Scheduler 无限把 Work 塞进 WorkPool 队列。
+	// 注意与 WorkPool 的 Workers（真正的并行执行槽位）区分：
+	//   - MaxConcurrency 计数包含排队中的 Work；
+	//   - Workers 只计正在执行的 Work。
+	// 因此 MaxConcurrency 应 >= Workers，否则部分 Worker 会闲置。
 	MaxConcurrency int
 	Now            func() time.Time
 }
@@ -87,6 +94,9 @@ var (
 )
 
 // New 构造一个 Scheduler。
+//
+// MaxConcurrency 语义是"同时在途的 Work 上限"（排队 + 执行），
+// 与 WorkPool 的 Workers（执行槽位）配合形成两级控制：前者做背压，后者定并行度。
 func New(cfg Config) *Scheduler {
 	maxConc := cfg.MaxConcurrency
 	if maxConc <= 0 {
@@ -172,6 +182,9 @@ func (s *Scheduler) loop() {
 }
 
 // launch 为一个 Assignment 创建 Work 并提交给 WorkPool。
+//
+// 并发容量（sem）在 Work 进入终态后才归还，因此 MaxConcurrency 限制的是
+// "同时在途"的 Work——既包含已入队等待的，也包含正在执行的。
 func (s *Scheduler) launch(a *domain.Assignment, sem chan struct{}) {
 	// 先登记"Work 结束"信号，再提交执行，避免 Work 结束事件先于登记到达。
 	done := make(chan struct{})

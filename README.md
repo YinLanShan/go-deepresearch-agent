@@ -241,10 +241,21 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `DRA_SCHEDULER_MAX_CONCURRENCY` | 2 | Scheduler 同时调度的 Assignment 上限 |
-| `DRA_WORKPOOL_WORKERS` | 2 | WorkPool 的 Worker 数量（真正并行的子 Agent 数） |
+| `DRA_SCHEDULER_MAX_CONCURRENCY` | 2 | Scheduler **在途** Work 上限（排队 + 执行），提供背压 |
+| `DRA_WORKPOOL_WORKERS` | 2 | WorkPool 的执行槽位数（真正并行的子 Agent 数） |
 | `DRA_WORK_TIMEOUT` | 300 | 单个 Work（子 Agent 一次执行）的超时秒数 |
 | `DRA_TOOL_REQUIRE_APPROVAL` | `*` | 需审批的工具名；`-` 或 `none` 显式关闭审批 |
+
+**两级并发控制**：两个参数限制的对象不同，需要配合设置。
+
+| 参数 | 计数范围 | 作用 |
+|---|---|---|
+| `MaxConcurrency` | 已提交但未结束的 Work（**含排队**） | 背压，防止 WorkPool 队列无限增长 |
+| `Workers` | 正在执行的 Work | 决定实际并行度 |
+
+- `MaxConcurrency < Workers`：部分 Worker 会闲置，启动时打印警告；
+- `MaxConcurrency > Workers`：WorkPool 队列会有等待项，属正常；
+- 常用配置：两者相等，或 `MaxConcurrency` 略大于 `Workers`。
 
 **子 Agent 执行模型**：每个 Work 由 `SubAgentFactory` 创建**独立的** `ChatModelAgent`
 （单次任务型，不用 TurnLoop），与 Supervisor 共用同一个模型实例。
