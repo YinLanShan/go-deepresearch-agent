@@ -270,8 +270,22 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
   审批只作用于 Supervisor 的工具调用。
 
 **查询接口**：`GET /api/v1/sessions/:id/background-tasks` 返回当前 RunTask 下的
-Assignment 与其最新 Work（状态、阶段、Worker、耗时）；SSE 同时推送
-`work_updated` / `assignment_updated` 事件。
+Assignment 与其最新 Work（状态、阶段、Worker、耗时）。
+
+**实时推送（两个 SSE 端点，职责不同）**：
+
+| 端点 | 生命周期 | 推送内容 |
+|---|---|---|
+| `POST /sessions/:id/research` | 跟随单次研究请求，结束即关闭 | `message` / `tool_call` / `tool_result` / 审批事件 |
+| `GET /sessions/:id/events` | **常驻**，切换会话才重建 | `run_status` / `assignment_updated` / `work_updated` |
+
+`/events` 是**状态徽章与后台任务面板的实时数据源**：
+
+- 连接建立后立即推送一次当前 `run_status`，前端无需等待下次变更；
+- 任何 RunTask 状态迁移（running / waiting / stopped / finished）都会推送，
+  且带 `previous` 字段；
+- 研究在后台推进时（研究流已关闭）徽章依然实时变化；
+- 前端仅在长连接断开、自动重连期间回退到轮询兜底。
 
 ## ResearchState 与上下文构建
 

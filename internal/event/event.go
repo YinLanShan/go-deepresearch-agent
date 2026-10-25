@@ -63,6 +63,8 @@ const (
 	EventWorkUpdated = "work_updated"
 	// EventWorkResultReady 表示 Work 产出了最终 Result，待 ResultAggregator 提交。
 	EventWorkResultReady = "work_result_ready"
+	// EventRunStatusChanged 表示 RunTask 的状态发生变化（前端状态徽章实时更新）。
+	EventRunStatusChanged = "run_status_changed"
 )
 
 // 协调动作（Runtime 发起的生命周期协商）。
@@ -183,6 +185,31 @@ func (b *Bus) Subscribe(eventType string, s EventSender) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.subs[eventType] = append(b.subs[eventType], s)
+}
+
+// Unsubscribe 取消订阅（幂等）。
+//
+// 长连接类订阅者（如常驻 SSE）在连接关闭时必须调用它，
+// 否则每次重新连接都会留下一个已失效的订阅者。
+func (b *Bus) Unsubscribe(eventType string, s EventSender) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	list, ok := b.subs[eventType]
+	if !ok {
+		return
+	}
+	kept := make([]EventSender, 0, len(list))
+	for _, existing := range list {
+		if existing == s {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	if len(kept) == 0 {
+		delete(b.subs, eventType)
+		return
+	}
+	b.subs[eventType] = kept
 }
 
 // Publish 异步投递：只保证事件被接纳，不等待处理完成。
@@ -463,3 +490,19 @@ type WorkResultReadyEvent struct {
 
 // EventType 实现 Event 接口。
 func (WorkResultReadyEvent) EventType() string { return EventWorkResultReady }
+
+// RunStatusChangedEvent 表示 RunTask 的状态发生变化。
+//
+// 它是前端状态徽章的实时数据源：任何一次 RunTask 状态迁移
+// （running / waiting / stopped / finished）都会发布该事件。
+type RunStatusChangedEvent struct {
+	SessionID string
+	TaskID    string
+	RunTaskID string
+	Status    domain.RunStatus
+	// Previous 是变更前的状态（首次创建时为空）。
+	Previous domain.RunStatus
+}
+
+// EventType 实现 Event 接口。
+func (RunStatusChangedEvent) EventType() string { return EventRunStatusChanged }

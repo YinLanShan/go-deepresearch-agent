@@ -122,6 +122,9 @@ func (a *API) Register(r route.IRouter) {
 	v1.POST("/sessions/:id/stop", a.handleStop)
 	v1.POST("/sessions/:id/approve", a.handleApprove)
 	v1.POST("/sessions/:id/research", a.handleResearchStream)
+	// 会话级常驻 SSE：状态徽章与后台任务面板的实时数据源。
+	// 与 /research 不同，它不绑定某一次研究请求，研究在后台推进时同样推送。
+	v1.GET("/sessions/:id/events", a.handleSessionEvents)
 	// 后台任务（Assignment + Work）：侧边栏实时展示子 Agent 执行情况。
 	v1.GET("/sessions/:id/background-tasks", a.handleBackgroundTasks)
 	v1.GET("/config", a.handleGetConfig)
@@ -536,6 +539,129 @@ func (a *API) handleResearchStream(ctx context.Context, c *app.RequestContext) {
 	case <-time.After(10 * time.Minute): // 含人工审批等待时间
 	}
 	_ = w.Close()
+}
+
+// handleSessionEvents 是**会话级**长连接 SSE：与任何一次研究请求无关，
+// 只推送该 Session 的状态变化，供前端状态徽章与后台任务面板实时更新。
+//
+// 与 handleResearchStream 的分工：
+//   - handleResearchStream：一次研究的输出流（message / tool_call / ...），
+//     随本轮结束而关闭；
+//   - handleSessionEvents ：常驻订阅（run_status / assignment_updated / work_*），
+//     切换会话时才重建，因此研究在后台推进时徽章也能实时变化。
+func (a *API) handleSessionEvents(ctx context.Context, c *app.RequestContext) {
+	sessionID, ok := a.requireSession(ctx, c)
+	if !ok {
+		return
+	}
+
+	w := sse.NewWriter(c)
+	sub := &sessionEventSubscriber{sessionID: sessionID, w: w}
+
+	bus := a.runs.Bus()
+	// RunTask 状态：状态徽章的唯一实时数据源。
+	bus.Subscribe(event.EventRunStatusChanged, sub)
+	// 后台任务：Assignment 调度状态与 Work 执行阶段。
+	bus.Subscribe(event.EventAssignmentUpdated, sub)
+	bus.Subscribe(event.EventWorkCreated, sub)
+	bus.Subscribe(event.EventWorkUpdated, sub)
+	defer func() {
+		bus.Unsubscribe(event.EventRunStatusChanged, sub)
+		bus.Unsubscribe(event.EventAssignmentUpdated, sub)
+		bus.Unsubscribe(event.EventWorkCreated, sub)
+		bus.Unsubscribe(event.EventWorkUpdated, sub)
+		_ = w.Close()
+	}()
+
+	// 立即推送一次当前状态，避免前端等到下次变更才显示正确徽章。
+	if rt, err := a.runs.CurrentRunTask(ctx, sessionID); err == nil && rt != nil {
+		payload, mErr := json.Marshal(map[string]string{
+			"task_id":     rt.TaskID,
+			"run_task_id": rt.ID,
+			"status":      string(rt.Status),
+			"previous":    "",
+		})
+		if mErr == nil {
+			_ = w.WriteEvent("", "run_status", payload)
+		}
+	}
+
+	// 长连接：直到客户端断开或服务关闭。
+	<-ctx.Done()
+}
+
+// sessionEventSubscriber 把会话级状态事件写入 SSE。
+type sessionEventSubscriber struct {
+	sessionID string
+	w         *sse.Writer
+}
+
+var _ event.EventSender = (*sessionEventSubscriber)(nil)
+
+// Send 实现 event.EventSender。
+func (s *sessionEventSubscriber) Send(_ context.Context, e event.EventEnvelope) error {
+	switch ev := e.Data.(type) {
+	case event.RunStatusChangedEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"task_id":     ev.TaskID,
+			"run_task_id": ev.RunTaskID,
+			"status":      string(ev.Status),
+			"previous":    string(ev.Previous),
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "run_status", payload)
+		}
+	case event.WorkUpdatedEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(workUpdatePayload{
+			WorkID:       ev.WorkID,
+			AssignmentID: ev.AssignmentID,
+			WorkerID:     ev.WorkerID,
+			Goal:         ev.Goal,
+			Status:       string(ev.Status),
+			Stage:        ev.Stage,
+			Detail:       ev.Detail,
+			Attempt:      ev.Attempt,
+			Err:          ev.Err,
+			StartedAt:    ev.StartedAt,
+			FinishedAt:   ev.FinishedAt,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "work_updated", payload)
+		}
+	case event.WorkCreatedEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"work_id":       ev.WorkID,
+			"assignment_id": ev.AssignmentID,
+			"goal":          ev.Goal,
+			"status":        string(domain.WorkPending),
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "work_updated", payload)
+		}
+	case event.AssignmentUpdatedEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]string{
+			"assignment_id": ev.AssignmentID,
+			"status":        string(ev.Status),
+			"result":        ev.Result,
+			"error":         ev.Err,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "assignment_updated", payload)
+		}
+	}
+	return nil
 }
 
 // streamSubscriber 订阅流式输出与工具事件并写入 SSE。

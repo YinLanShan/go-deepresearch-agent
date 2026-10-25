@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
@@ -87,7 +88,9 @@ type WorkPool struct {
 	queue   []*domain.Work
 	cancels map[string]context.CancelFunc // workID -> cancel
 	byRun   map[string]map[string]struct{}
-	closed  bool
+	// stale 记录已进入终态的 Work，用于丢弃迟到的进度上报。
+	stale  map[string]struct{}
+	closed bool
 
 	wake     chan struct{}
 	stopCh   chan struct{}
@@ -134,6 +137,7 @@ func New(cfg Config) *WorkPool {
 		now:         now,
 		cancels:     make(map[string]context.CancelFunc),
 		byRun:       make(map[string]map[string]struct{}),
+		stale:       make(map[string]struct{}),
 		wake:        make(chan struct{}, 1),
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
@@ -294,6 +298,8 @@ func (p *WorkPool) Cancel(runTaskID string) int {
 
 // markCancelled 把 Work 置为 cancelled 并广播。
 func (p *WorkPool) markCancelled(w *domain.Work) {
+	// 先标记终态，阻止后续 progress 回调继续写库/推事件。
+	p.markStale(w.ID)
 	now := p.now()
 	w.Status = domain.WorkCancelled
 	w.UpdatedAt = now
@@ -302,6 +308,28 @@ func (p *WorkPool) markCancelled(w *domain.Work) {
 		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
 	}
 	p.publishWork(w)
+}
+
+// markStale 标记某个 Work 已进入终态，其后的进度上报一律忽略。
+func (p *WorkPool) markStale(workID string) {
+	p.mu.Lock()
+	p.stale[workID] = struct{}{}
+	p.mu.Unlock()
+}
+
+// isStale 判断某个 Work 是否已进入终态。
+func (p *WorkPool) isStale(workID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.stale[workID]
+	return ok
+}
+
+// clearStale 在 Work 收尾后清理标记，避免长期占用内存。
+func (p *WorkPool) clearStale(workID string) {
+	p.mu.Lock()
+	delete(p.stale, workID)
+	p.mu.Unlock()
 }
 
 // workerLoop 是单个 Worker 的取任务循环。
@@ -382,7 +410,14 @@ func (p *WorkPool) run(w *domain.Work) {
 	}
 	p.publishWork(w)
 
+	// 已进入终态后不再接受进度上报：取消/超时之后 Worker 仍可能回调 progress，
+	// 若继续写库并推送，前端会收到"状态已 cancelled、阶段却还在推进"的错乱序列。
+	var terminal atomic.Bool
+
 	result, runErr := worker.Run(ctx, w, func(stage, detail string) {
+		if terminal.Load() || p.isStale(w.ID) {
+			return
+		}
 		w.Stage = stage
 		w.Detail = detail
 		w.UpdatedAt = p.now()
@@ -391,6 +426,8 @@ func (p *WorkPool) run(w *domain.Work) {
 		}
 		p.publishWork(w)
 	})
+	terminal.Store(true)
+	defer p.clearStale(w.ID)
 
 	finish := p.now()
 	w.FinishedAt = finish

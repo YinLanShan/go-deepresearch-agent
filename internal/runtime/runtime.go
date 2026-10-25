@@ -415,6 +415,7 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 		if err := r.runs.Create(ctx, rt); err != nil {
 			return err
 		}
+		r.publishRunStatus(rt)
 		return r.initResearchRun(ctx, taskID, rt.ID)
 	}
 	if err != nil {
@@ -439,11 +440,13 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 	if err := r.disableOtherRunningSessions(ctx, taskID); err != nil {
 		return err
 	}
+	previous := rt.Status
 	rt.Status = domain.RunStatusRunning
 	rt.UpdatedAt = r.now()
 	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
+	r.publishRunStatusWithPrevious(rt, previous)
 	// 恢复研究：重新开启提交门控，并确保 SupervisorLoop 存在。
 	_ = r.states.ResumeCommits(ctx, taskID)
 	r.ensureSupervisor(taskID, sessionID, rt.ID)
@@ -509,11 +512,13 @@ func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 	r.terminateSupervisor(taskID)
 	_ = r.states.StopCommits(ctx, taskID)
 
+	previous := rt.Status
 	rt.Status = domain.RunStatusFinished
 	rt.UpdatedAt = r.now()
 	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
+	r.publishRunStatusWithPrevious(rt, previous)
 	// 研究完成：Task 不再处于可运行态。
 	if task, err := r.tasks.Get(ctx, taskID); err == nil {
 		task.Enabled = false
@@ -628,16 +633,48 @@ func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.R
 	}
 
 	// 置 RunTask 状态。
+	previous := rt.Status
 	rt.Status = target
 	rt.UpdatedAt = r.now()
 	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
+	r.publishRunStatusWithPrevious(rt, previous)
 
 	// 失能对应 Task。
 	task.Enabled = false
 	task.UpdatedAt = r.now()
 	return r.tasks.Update(ctx, task)
+}
+
+// publishRunStatus 发布 RunTask 状态变更事件（前端状态徽章的实时数据源）。
+//
+// 只做通知：权威状态仍以 RunTaskStore 中的记录为准。
+func (r *Runtime) publishRunStatus(rt *domain.RunTask) {
+	r.publishRunStatusWithPrevious(rt, "")
+}
+
+// publishRunStatusWithPrevious 发布带"变更前状态"的 RunTask 状态事件。
+func (r *Runtime) publishRunStatusWithPrevious(rt *domain.RunTask, previous domain.RunStatus) {
+	if r.bus == nil || rt == nil {
+		return
+	}
+	task, err := r.tasks.Get(context.Background(), rt.TaskID)
+	if err != nil {
+		slog.Warn("runtime: publish run status without task", "task", rt.TaskID, "err", err)
+		return
+	}
+	_ = r.bus.Publish(context.Background(), event.EventEnvelope{
+		Data: event.RunStatusChangedEvent{
+			SessionID: task.SessionID,
+			TaskID:    rt.TaskID,
+			RunTaskID: rt.ID,
+			Status:    rt.Status,
+			Previous:  previous,
+		},
+	})
+	slog.Debug("runtime: run status changed",
+		"task", rt.TaskID, "status", rt.Status, "previous", previous)
 }
 
 // terminateSupervisor 终止某个 Task 的 SupervisorLoop：作废待审批项、删除 Checkpoint、停止 Loop。
