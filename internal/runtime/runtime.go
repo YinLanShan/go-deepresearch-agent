@@ -415,7 +415,8 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 		if err := r.runs.Create(ctx, rt); err != nil {
 			return err
 		}
-		r.publishRunStatus(rt)
+		// 新建：没有"变更前状态"，previous 为空。
+		r.publishRunStatusChanged(rt, "")
 		return r.initResearchRun(ctx, taskID, rt.ID)
 	}
 	if err != nil {
@@ -446,7 +447,7 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
-	r.publishRunStatusWithPrevious(rt, previous)
+	r.publishRunStatusChanged(rt, previous)
 	// 恢复研究：重新开启提交门控，并确保 SupervisorLoop 存在。
 	_ = r.states.ResumeCommits(ctx, taskID)
 	r.ensureSupervisor(taskID, sessionID, rt.ID)
@@ -518,7 +519,7 @@ func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
-	r.publishRunStatusWithPrevious(rt, previous)
+	r.publishRunStatusChanged(rt, previous)
 	// 研究完成：Task 不再处于可运行态。
 	if task, err := r.tasks.Get(ctx, taskID); err == nil {
 		task.Enabled = false
@@ -639,7 +640,7 @@ func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.R
 	if err := r.runs.Update(ctx, rt); err != nil {
 		return err
 	}
-	r.publishRunStatusWithPrevious(rt, previous)
+	r.publishRunStatusChanged(rt, previous)
 
 	// 失能对应 Task。
 	task.Enabled = false
@@ -647,15 +648,11 @@ func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.R
 	return r.tasks.Update(ctx, task)
 }
 
-// publishRunStatus 发布 RunTask 状态变更事件（前端状态徽章的实时数据源）。
+// publishRunStatusChanged 发布 RunTask 状态变更事件（前端状态徽章的实时数据源）。
 //
+// previous 是变更前的状态；新建 RunTask 时传空。
 // 只做通知：权威状态仍以 RunTaskStore 中的记录为准。
-func (r *Runtime) publishRunStatus(rt *domain.RunTask) {
-	r.publishRunStatusWithPrevious(rt, "")
-}
-
-// publishRunStatusWithPrevious 发布带"变更前状态"的 RunTask 状态事件。
-func (r *Runtime) publishRunStatusWithPrevious(rt *domain.RunTask, previous domain.RunStatus) {
+func (r *Runtime) publishRunStatusChanged(rt *domain.RunTask, previous domain.RunStatus) {
 	if r.bus == nil || rt == nil {
 		return
 	}
