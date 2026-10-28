@@ -281,7 +281,8 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
 **查询接口**：`GET /api/v1/sessions/:id/background-tasks` 返回当前 RunTask 下的
 Assignment 与其最新 Work（状态、阶段、Worker、耗时）。
 
-**错误处理**：详见 `internal/fault`。要点如下：
+**错误处理**：完整清单见 [docs/ErrorHandbook.md](docs/ErrorHandbook.md)，
+实现位于 `internal/fault`。要点如下：
 
 - 统一错误对象携带 `Code` / `Layer` / `Severity` / `Source` / 影响范围，
   并保留 `errors.Is`/`errors.As` 语义；
