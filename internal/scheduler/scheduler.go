@@ -26,6 +26,7 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 )
@@ -63,6 +64,9 @@ type Config struct {
 	// 因此 MaxConcurrency 应 >= Workers，否则部分 Worker 会闲置。
 	MaxConcurrency int
 	Now            func() time.Time
+	// Reporter 用于上报错误（写日志 + 按 Severity 决定是否推送前端）。
+	// 为 nil 时只写日志。
+	Reporter *fault.Reporter
 }
 
 // Scheduler 是 Assignment 的调度器。
@@ -74,6 +78,7 @@ type Scheduler struct {
 	bus         *event.Bus
 	maxConc     int
 	now         func() time.Time
+	reporter    *fault.Reporter
 
 	mu      sync.Mutex
 	queue   []*domain.Assignment
@@ -114,6 +119,7 @@ func New(cfg Config) *Scheduler {
 		bus:         cfg.Bus,
 		maxConc:     maxConc,
 		now:         now,
+		reporter:    cfg.Reporter,
 		wake:        make(chan struct{}, 1),
 		running:     make(map[string]string),
 		waiters:     make(map[string]chan struct{}),
@@ -227,9 +233,7 @@ func (s *Scheduler) launch(a *domain.Assignment, sem chan struct{}) {
 	a.Status = domain.AssignmentRunning
 	a.Attempt = w.Attempt
 	a.UpdatedAt = now
-	if err := s.assignments.Update(context.Background(), a); err != nil {
-		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
-	}
+	s.updateOrInvalidate(a)
 
 	s.publish(event.WorkCreatedEvent{
 		SessionID:    a.SessionID,
@@ -270,9 +274,7 @@ func (s *Scheduler) finishFailure(a *domain.Assignment, cause error) {
 	a.Err = cause.Error()
 	a.UpdatedAt = s.now()
 	a.FinishedAt = a.UpdatedAt
-	if err := s.assignments.Update(context.Background(), a); err != nil {
-		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
-	}
+	s.updateOrInvalidate(a)
 	if s.slots != nil {
 		s.slots.Cancel(a.ID)
 	}
@@ -383,7 +385,11 @@ func (s *Scheduler) enqueue(list []*domain.Assignment) {
 		// 1) 先预留结果接收槽位；预留失败不得进入调度队列。
 		if s.slots != nil {
 			if err := s.slots.Reserve(a); err != nil {
-				slog.Error("scheduler: reserve result slot failed", "assignment", a.ID, "err", err)
+				// 标记为 cancelled 而不是静默跳过（Q4）：
+				// 否则该 Assignment 既不会被调度、也没有终态，成为僵尸任务。
+				s.failEnqueue(a, fault.E(fault.CodeSlotUnavailable, fault.LayerScheduler,
+					"failed to reserve result slot").Severity(fault.SeverityError).
+					Source("scheduler.enqueue").Wrap(err))
 				continue
 			}
 		}
@@ -397,6 +403,9 @@ func (s *Scheduler) enqueue(list []*domain.Assignment) {
 			if s.slots != nil {
 				s.slots.Cancel(a.ID)
 			}
+			s.report(fault.E(fault.CodeWorkCreateFailed, fault.LayerScheduler,
+				"failed to persist assignment").Severity(fault.SeverityError).
+				Source("scheduler.enqueue").Wrap(err), a)
 			continue
 		}
 
@@ -464,9 +473,7 @@ func (s *Scheduler) handleWorkUpdated(ev event.WorkUpdatedEvent) {
 			a.FinishedAt = a.UpdatedAt
 		}
 	}
-	if err := s.assignments.Update(context.Background(), a); err != nil {
-		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
-	}
+	s.updateOrInvalidate(a)
 	s.publish(event.AssignmentUpdatedEvent{
 		SessionID:    a.SessionID,
 		TaskID:       a.TaskID,
@@ -492,9 +499,7 @@ func (s *Scheduler) OnResultCommitted(assignmentID, result string) {
 	a.Result = result
 	a.UpdatedAt = now
 	a.FinishedAt = now
-	if err := s.assignments.Update(context.Background(), a); err != nil {
-		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
-	}
+	s.updateOrInvalidate(a)
 	s.publish(event.AssignmentUpdatedEvent{
 		SessionID:    a.SessionID,
 		TaskID:       a.TaskID,
@@ -564,9 +569,7 @@ func (s *Scheduler) OnResultRejected(assignmentID string, cause error) {
 	}
 	a.UpdatedAt = now
 	a.FinishedAt = now
-	if err := s.assignments.Update(context.Background(), a); err != nil {
-		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
-	}
+	s.updateOrInvalidate(a)
 	s.publish(event.AssignmentUpdatedEvent{
 		SessionID:    a.SessionID,
 		TaskID:       a.TaskID,
@@ -595,9 +598,7 @@ func (s *Scheduler) OnResultRevoked(assignmentID, reason string) {
 	}
 	a.UpdatedAt = now
 	a.FinishedAt = now
-	if err := s.assignments.Update(context.Background(), a); err != nil {
-		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
-	}
+	s.updateOrInvalidate(a)
 	s.publish(event.AssignmentUpdatedEvent{
 		SessionID:    a.SessionID,
 		TaskID:       a.TaskID,
@@ -666,8 +667,11 @@ func (s *Scheduler) CancelAssignments(runTaskID string, assignmentIDs []string, 
 		}
 		a.UpdatedAt = now
 		a.FinishedAt = now
-		if err := s.assignments.Update(context.Background(), a); err != nil {
-			slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
+		// 撤销路径：状态写不进去时只上报，不再作废（它已经是终态）。
+		if err := s.updateAssignment(a); err != nil {
+			s.report(fault.E(fault.CodeInvalidTransition, fault.LayerScheduler,
+				"failed to persist cancelled assignment").Severity(fault.SeverityError).
+				Source("scheduler.CancelAssignments").Wrap(err), a)
 		}
 		s.publish(event.AssignmentUpdatedEvent{
 			SessionID:    a.SessionID,
@@ -782,9 +786,7 @@ func (s *Scheduler) markCancelled(a *domain.Assignment) {
 	a.Status = domain.AssignmentCancelled
 	a.UpdatedAt = now
 	a.FinishedAt = now
-	if err := s.assignments.Update(context.Background(), a); err != nil {
-		slog.Error("scheduler: update assignment failed", "assignment", a.ID, "err", err)
-	}
+	s.updateOrInvalidate(a)
 	if s.slots != nil {
 		s.slots.Cancel(a.ID)
 	}
@@ -795,6 +797,126 @@ func (s *Scheduler) markCancelled(a *domain.Assignment) {
 		AssignmentID: a.ID,
 		Status:       a.Status,
 	})
+}
+
+// updateAssignment 更新 Assignment 状态：失败重试一次（Q3）。
+//
+// 仍失败时由调用方决定后续（多数场景会调用 invalidateAssignment 作废），
+// 因为状态写不进存储意味着前端与实际不一致、重启后还可能丢数据。
+func (s *Scheduler) updateAssignment(a *domain.Assignment) error {
+	return fault.RetryOnce(context.Background(), func() error {
+		return s.assignments.Update(context.Background(), a)
+	})
+}
+
+// invalidateAssignment 把 Assignment 置为 failed 并作废（Q3）。
+//
+// 语义：该 Assignment 不再推进、结果不会被提交；同一 RunTask 的
+// 其它 Assignment 不受影响。用于"状态持续写不进存储"这类不可恢复的情形。
+func (s *Scheduler) invalidateAssignment(a *domain.Assignment, cause error) {
+	if a == nil {
+		return
+	}
+	now := s.now()
+	a.Status = domain.AssignmentFailed
+	a.UpdatedAt = now
+	a.FinishedAt = now
+	if cause != nil {
+		if a.Err == "" {
+			a.Err = cause.Error()
+		}
+	}
+	// 作废也要尽力落库；失败只能上报（已无更弱的降级手段）。
+	if err := s.updateAssignment(a); err != nil {
+		slog.Error("scheduler: persist invalidated assignment failed",
+			"assignment", a.ID, "err", err)
+	}
+	if s.slots != nil {
+		s.slots.Cancel(a.ID)
+	}
+	s.publish(event.AssignmentUpdatedEvent{
+		SessionID:    a.SessionID,
+		TaskID:       a.TaskID,
+		RunTaskID:    a.RunTaskID,
+		AssignmentID: a.ID,
+		Status:       a.Status,
+		Err:          a.Err,
+	})
+	s.report(fault.E(fault.CodeInvalidTransition, fault.LayerScheduler,
+		"assignment invalidated due to persistent state write failure").
+		Severity(fault.SeverityError).
+		Source("scheduler.invalidateAssignment").
+		Wrap(cause), a)
+	if a.RunTaskID != "" {
+		s.maybePublishSettled(a.RunTaskID, a.SessionID, a.TaskID)
+	}
+}
+
+// updateOrInvalidate 更新状态；重试仍失败则作废该 Assignment（Q3）。
+func (s *Scheduler) updateOrInvalidate(a *domain.Assignment) bool {
+	if err := s.updateAssignment(a); err != nil {
+		s.invalidateAssignment(a, err)
+		return false
+	}
+	return true
+}
+
+// report 上报一个错误；reporter 为 nil 时只写日志。
+func (s *Scheduler) report(err error, a *domain.Assignment) {
+	if err == nil {
+		return
+	}
+	scope := fault.Scope{Source: "scheduler"}
+	if a != nil {
+		scope = fault.Scope{
+			SessionID:    a.SessionID,
+			TaskID:       a.TaskID,
+			RunTaskID:    a.RunTaskID,
+			AssignmentID: a.ID,
+			Source:       "scheduler",
+		}
+	}
+	if s.reporter == nil {
+		slog.Error("scheduler: unreported error",
+			"assignment", scope.AssignmentID, "err", err)
+		return
+	}
+	s.reporter.Report(context.Background(), err, scope)
+}
+
+// failEnqueue 在入队阶段失败时把 Assignment 标记为 cancelled 并上报（Q4）。
+//
+// 使用 cancelled 而不是 failed：这类失败发生在"开始执行之前"，
+// 语义上等价于"从未派发"，与用户撤销的终态一致。
+func (s *Scheduler) failEnqueue(a *domain.Assignment, cause error) {
+	now := s.now()
+	a.Status = domain.AssignmentCancelled
+	a.UpdatedAt = now
+	a.FinishedAt = now
+	if cause != nil {
+		a.Err = cause.Error()
+	}
+	// 尝试落库；失败也要上报（否则前端连这个任务存在过都看不到）。
+	if err := fault.RetryOnce(context.Background(), func() error {
+		return s.assignments.Create(context.Background(), a)
+	}); err != nil {
+		s.report(fault.E(fault.CodeWorkCreateFailed, fault.LayerScheduler,
+			"failed to persist cancelled assignment").Severity(fault.SeverityError).
+			Source("scheduler.failEnqueue").Wrap(err), a)
+	} else {
+		s.publish(event.AssignmentUpdatedEvent{
+			SessionID:    a.SessionID,
+			TaskID:       a.TaskID,
+			RunTaskID:    a.RunTaskID,
+			AssignmentID: a.ID,
+			Status:       a.Status,
+			Err:          a.Err,
+		})
+	}
+	s.report(cause, a)
+	if a.RunTaskID != "" {
+		s.maybePublishSettled(a.RunTaskID, a.SessionID, a.TaskID)
+	}
 }
 
 // publish 发布事件。

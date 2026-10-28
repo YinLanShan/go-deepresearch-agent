@@ -23,6 +23,7 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 )
 
@@ -66,6 +67,9 @@ type Config struct {
 	// WorkTimeout 是单个 Work 的执行超时；<=0 时使用 DefaultWorkTimeout。
 	WorkTimeout time.Duration
 	Now         func() time.Time
+	// Reporter 用于上报错误（写日志 + 按 Severity 决定是否推送前端）。
+	// 为 nil 时只写日志。
+	Reporter *fault.Reporter
 }
 
 // DefaultWorkTimeout 是 Work 的默认执行超时。
@@ -83,6 +87,7 @@ type WorkPool struct {
 	workers     int
 	workTimeout time.Duration
 	now         func() time.Time
+	reporter    *fault.Reporter
 
 	mu      sync.Mutex
 	queue   []*domain.Work
@@ -135,6 +140,7 @@ func New(cfg Config) *WorkPool {
 		workers:     workers,
 		workTimeout: timeout,
 		now:         now,
+		reporter:    cfg.Reporter,
 		cancels:     make(map[string]context.CancelFunc),
 		byRun:       make(map[string]map[string]struct{}),
 		stale:       make(map[string]struct{}),
@@ -304,8 +310,12 @@ func (p *WorkPool) markCancelled(w *domain.Work) {
 	w.Status = domain.WorkCancelled
 	w.UpdatedAt = now
 	w.FinishedAt = now
-	if err := p.works.Update(context.Background(), w); err != nil {
-		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	if err := p.updateWork(w); err != nil {
+		p.report(fault.E(fault.CodeWorkFailed, fault.LayerWork,
+			"failed to persist work state").
+			Severity(fault.SeverityError).
+			Source("workpool.updateWork").
+			Wrap(err), w, "workpool.updateWork")
 	}
 	p.publishWork(w)
 }
@@ -405,8 +415,12 @@ func (p *WorkPool) run(w *domain.Work) {
 	w.StartedAt = now
 	w.UpdatedAt = now
 	w.Stage = "starting"
-	if err := p.works.Update(context.Background(), w); err != nil {
-		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	if err := p.updateWork(w); err != nil {
+		p.report(fault.E(fault.CodeWorkFailed, fault.LayerWork,
+			"failed to persist work state").
+			Severity(fault.SeverityError).
+			Source("workpool.updateWork").
+			Wrap(err), w, "workpool.updateWork")
 	}
 	p.publishWork(w)
 
@@ -421,8 +435,14 @@ func (p *WorkPool) run(w *domain.Work) {
 		w.Stage = stage
 		w.Detail = detail
 		w.UpdatedAt = p.now()
-		if err := p.works.Update(context.Background(), w); err != nil {
-			slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+		if err := p.updateWork(w); err != nil {
+			// 进度写库失败降级为 info：不影响最终结果提交，但要让用户知道
+			// 前端进度可能与最终状态不同步。
+			p.report(fault.E(fault.CodeWorkFailed, fault.LayerWork,
+				"failed to persist work progress").
+				Severity(fault.SeverityInfo).
+				Source("workpool.progress").
+				Wrap(err), w, "workpool.progress")
 		}
 		p.publishWork(w)
 	})
@@ -435,7 +455,8 @@ func (p *WorkPool) run(w *domain.Work) {
 	w.Stage = "finished"
 
 	if runErr != nil {
-		// 超时与取消都归为 cancelled；超时额外标注原因，便于排查。
+		p.reportRunFailure(w, runErr)
+		// 超时与取消都归为终态；超时额外标注原因，便于排查。
 		if errors.Is(runErr, context.DeadlineExceeded) {
 			w.Status = domain.WorkTimedOut
 			w.Err = ErrWorkTimeout.Error()
@@ -445,8 +466,12 @@ func (p *WorkPool) run(w *domain.Work) {
 			w.Status = domain.WorkFailed
 			w.Err = runErr.Error()
 		}
-		if err := p.works.Update(context.Background(), w); err != nil {
-			slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+		if err := p.updateWork(w); err != nil {
+			p.report(fault.E(fault.CodeWorkFailed, fault.LayerWork,
+				"failed to persist terminal work state").
+				Severity(fault.SeverityError).
+				Source("workpool.run").
+				Wrap(err), w, "workpool.run")
 		}
 		p.publishWork(w)
 		return
@@ -454,8 +479,12 @@ func (p *WorkPool) run(w *domain.Work) {
 
 	w.Status = domain.WorkSucceeded
 	w.Result = result
-	if err := p.works.Update(context.Background(), w); err != nil {
-		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	if err := p.updateWork(w); err != nil {
+		p.report(fault.E(fault.CodeWorkFailed, fault.LayerWork,
+			"failed to persist work state").
+			Severity(fault.SeverityError).
+			Source("workpool.updateWork").
+			Wrap(err), w, "workpool.updateWork")
 	}
 	p.publishWork(w)
 
@@ -485,6 +514,84 @@ func (p *WorkPool) newWorker(ctx context.Context, w *domain.Work) (Worker, error
 	return worker, nil
 }
 
+// reportRunFailure 按失败原因上报 Work 层错误。
+//
+// 分类（对应错误手册 2.x）：
+//   - 超时      → work_timeout   warning（结果丢弃，研究可继续）
+//   - 取消      → work_canceled  info（控制流程的结果，不打扰用户）
+//   - 空输出    → work_empty_result warning
+//   - 需审批    → work_needs_approval error（防御性兜底）
+//   - 其它      → work_failed    warning
+func (p *WorkPool) reportRunFailure(w *domain.Work, runErr error) {
+	const source = "workpool.run"
+
+	switch {
+	case errors.Is(runErr, context.DeadlineExceeded):
+		p.report(fault.E(fault.CodeWorkTimeout, fault.LayerWork,
+			"sub-agent execution timed out; its result was discarded").
+			Severity(fault.SeverityWarning).
+			Source(source).
+			Retryable(false).
+			Wrap(runErr), w, source)
+	case errors.Is(runErr, context.Canceled):
+		p.report(fault.E(fault.CodeWorkCanceled, fault.LayerWork,
+			"sub-agent execution was cancelled").
+			Severity(fault.SeverityInfo).
+			Source(source).
+			Wrap(runErr), w, source)
+	case errors.Is(runErr, ErrSubAgentEmptyResult):
+		p.report(fault.E(fault.CodeWorkEmptyResult, fault.LayerWork,
+			"sub-agent produced no output").
+			Severity(fault.SeverityWarning).
+			Source(source).
+			Wrap(runErr), w, source)
+	case errors.Is(runErr, ErrSubAgentNeedsApproval):
+		p.report(fault.E(fault.CodeWorkNeedsApproval, fault.LayerWork,
+			"sub-agent was interrupted unexpectedly").
+			Severity(fault.SeverityError).
+			Source(source).
+			Wrap(runErr), w, source)
+	default:
+		p.report(fault.E(fault.CodeWorkFailed, fault.LayerWork,
+			"sub-agent execution failed").
+			Severity(fault.SeverityWarning).
+			Source(source).
+			Wrap(runErr), w, source)
+	}
+}
+
+// report 上报一个错误；reporter 为 nil 时只写日志。
+//
+// 只负责上报，不改变业务状态（状态变更仍由调用点决定）。
+func (p *WorkPool) report(err error, w *domain.Work, source string) {
+	if err == nil {
+		return
+	}
+	scope := fault.Scope{Source: source}
+	if w != nil {
+		scope = fault.Scope{
+			SessionID:    w.SessionID,
+			TaskID:       w.TaskID,
+			RunTaskID:    w.RunTaskID,
+			AssignmentID: w.AssignmentID,
+			WorkID:       w.ID,
+			Source:       source,
+		}
+	}
+	if p.reporter == nil {
+		slog.Error("workpool: unreported error", "source", source, "work", scope.WorkID, "err", err)
+		return
+	}
+	p.reporter.Report(context.Background(), err, scope)
+}
+
+// updateWork 更新 Work 状态：失败重试一次，仍失败则上报（Q3）。
+func (p *WorkPool) updateWork(w *domain.Work) error {
+	return fault.RetryOnce(context.Background(), func() error {
+		return p.works.Update(context.Background(), w)
+	})
+}
+
 // finishFailure 在无法创建 Worker 等前置失败时收尾。
 func (p *WorkPool) finishFailure(w *domain.Work, cause error) {
 	now := p.now()
@@ -493,8 +600,12 @@ func (p *WorkPool) finishFailure(w *domain.Work, cause error) {
 	w.Stage = "finished"
 	w.FinishedAt = now
 	w.UpdatedAt = now
-	if err := p.works.Update(context.Background(), w); err != nil {
-		slog.Error("workpool: update work failed", "work", w.ID, "err", err)
+	if err := p.updateWork(w); err != nil {
+		p.report(fault.E(fault.CodeWorkFailed, fault.LayerWork,
+			"failed to persist work state").
+			Severity(fault.SeverityError).
+			Source("workpool.updateWork").
+			Wrap(err), w, "workpool.updateWork")
 	}
 	p.publishWork(w)
 }

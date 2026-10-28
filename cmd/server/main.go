@@ -80,6 +80,11 @@ func main() {
 	})
 	// Worker 用工厂：每个 Work 创建独立的子 Agent（与 Supervisor 共用模型）。
 	// 子 Agent 只拿到业务工具，控制类工具（submit/cancel/finish）被过滤掉。
+	// 错误上报器：写日志 + 按 Severity 决定是否推送前端（Info 只写日志）。
+	reporter := fault.NewReporter(fault.ReporterConfig{
+		Bus:   bus,
+		Debug: getenvBool("DRA_DEBUG_ERRORS", false),
+	})
 	workPool := workpool.New(workpool.Config{
 		Works: workStore,
 		Bus:   bus,
@@ -89,6 +94,7 @@ func main() {
 		}),
 		Workers:     cfg.Execution.Workers,
 		WorkTimeout: cfg.Execution.WorkTimeout,
+		Reporter:    reporter,
 	})
 	sched := scheduler.New(scheduler.Config{
 		Assignments:    assignmentStore,
@@ -97,6 +103,7 @@ func main() {
 		Slots:          aggregator,
 		Bus:            bus,
 		MaxConcurrency: cfg.Execution.MaxConcurrency,
+		Reporter:       reporter,
 	})
 	// 提交确认回传给 Scheduler（Commit 成功后 Scheduler 才回收 Assignment）。
 	aggregator.SetSchedulerNotifier(sched)
@@ -106,12 +113,8 @@ func main() {
 	rt := runtime.New(runTaskStore, taskStore, stateStore, model, bus)
 	rt.SetTools(toolRegistry, checkPointStore)
 	rt.SetExecution(assignmentStore, workStore, sched, workPool, aggregator)
-	// 错误上报器：写日志 + 按 Severity 决定是否推送前端（Info 只写日志）。
-	// DRA_DEBUG_ERRORS=true 时把底层细节一并下发，便于本地排查。
-	rt.SetReporter(fault.NewReporter(fault.ReporterConfig{
-		Bus:   bus,
-		Debug: getenvBool("DRA_DEBUG_ERRORS", false),
-	}))
+	// 复用同一个上报器：保证同类错误在全局范围内合并计数。
+	rt.SetReporter(reporter)
 	rt.Start()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

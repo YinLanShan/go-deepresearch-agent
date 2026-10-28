@@ -176,8 +176,9 @@ func TestSchedulerReservesSlotBeforeDispatch(t *testing.T) {
 	}
 }
 
-// TestSchedulerSlotReserveFailureSkipsDispatch 验证预留失败时不调度。
-func TestSchedulerSlotReserveFailureSkipsDispatch(t *testing.T) {
+// TestSchedulerSlotReserveFailureCancelsAssignment 验证预留失败时：
+// 不调度 Work，但把 Assignment 标记为 cancelled 并落库（不再是静默跳过）。
+func TestSchedulerSlotReserveFailureCancelsAssignment(t *testing.T) {
 	pool := &fakePool{}
 	slots := &fakeSlots{failWith: errors.New("slot busy")}
 	_, assignments, bus := newTestScheduler(t, pool, slots, 2)
@@ -195,8 +196,17 @@ func TestSchedulerSlotReserveFailureSkipsDispatch(t *testing.T) {
 	if n := len(pool.submittedWorks()); n != 0 {
 		t.Fatalf("work should not be submitted when slot reservation fails, got %d", n)
 	}
-	if _, err := assignments.Get(context.Background(), "a1"); err == nil {
-		t.Fatal("assignment should not be persisted when slot reservation fails")
+
+	// Q4：必须留下终态，避免出现"永远不调度、也没有终态"的僵尸任务。
+	got, err := assignments.Get(context.Background(), "a1")
+	if err != nil {
+		t.Fatalf("assignment should be persisted as cancelled, got %v", err)
+	}
+	if got.Status != domain.AssignmentCancelled {
+		t.Fatalf("assignment status = %s, want cancelled", got.Status)
+	}
+	if got.Err == "" {
+		t.Fatal("cancelled assignment should record the failure reason")
 	}
 }
 

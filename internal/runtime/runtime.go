@@ -301,8 +301,7 @@ func (r *Runtime) HasPendingAssignments(ctx context.Context, runTaskID string) b
 func (r *Runtime) Approve(_ context.Context, sessionID, interruptID string, approved bool, reason string) error {
 	r.mu.Lock()
 	var target *supervisor.Loop
-	for taskID, l := range r.supervisors {
-		_ = taskID
+	for _, l := range r.supervisors {
 		if l.SessionID() != sessionID || !l.HasPendingApproval() {
 			continue
 		}
@@ -346,14 +345,22 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	select {
 	case <-r.done:
 		r.stopAllSupervisors()
+		// 关闭失败只记录日志（Q6）：进程即将退出，前端可能已断开，
+		// 且已提交数据不受影响；失败仅意味着可能残留 goroutine。
 		if r.scheduler != nil {
-			_ = r.scheduler.Shutdown(ctx)
+			if err := r.scheduler.Shutdown(ctx); err != nil {
+				slog.Warn("runtime: scheduler shutdown failed", "err", err)
+			}
 		}
 		if r.workPool != nil {
-			_ = r.workPool.Shutdown(ctx)
+			if err := r.workPool.Shutdown(ctx); err != nil {
+				slog.Warn("runtime: workpool shutdown failed", "err", err)
+			}
 		}
 		if r.aggregator != nil {
-			_ = r.aggregator.Shutdown(ctx)
+			if err := r.aggregator.Shutdown(ctx); err != nil {
+				slog.Warn("runtime: aggregator shutdown failed", "err", err)
+			}
 		}
 		return nil
 	case <-ctx.Done():
@@ -389,7 +396,10 @@ func (r *Runtime) handle(d delivery) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = d.h.Confirmed(ctx)
+		// 确认回执失败只记录：发布方可能已取消等待，不影响状态落地。
+		if err := d.h.Confirmed(ctx); err != nil {
+			slog.Debug("runtime: handshake confirm failed", "err", err)
+		}
 	}()
 }
 
@@ -551,7 +561,23 @@ func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 	if task, err := r.tasks.Get(ctx, taskID); err == nil {
 		task.Enabled = false
 		task.UpdatedAt = r.now()
-		_ = r.tasks.Update(ctx, task)
+		// 状态落库失败重试一次；Task 已删除属正常（幂等）。
+		err := fault.RetryOnce(ctx, func() error {
+			if uErr := r.tasks.Update(ctx, task); uErr != nil && !fault.IsNotFound(uErr, storage.ErrNotFound) {
+				return uErr
+			}
+			return nil
+		})
+		if err != nil {
+			r.reportError(fault.E(fault.CodeInternal, fault.LayerRuntime,
+				"failed to persist task disabled state").
+				Severity(fault.SeverityError).
+				Source("runtime.onResearchFinished").
+				IDs(taskID, rt.ID, "", "").
+				Wrap(err),
+				fault.Scope{SessionID: rt.TaskID, TaskID: taskID, RunTaskID: rt.ID,
+					Source: "runtime.onResearchFinished"})
+		}
 	}
 	return nil
 }
@@ -720,7 +746,9 @@ func (r *Runtime) terminateSupervisor(taskID string) {
 	if ok {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = l.Shutdown(ctx)
+		if err := l.Shutdown(ctx); err != nil {
+			slog.Warn("runtime: supervisor loop shutdown failed", "task", taskID, "err", err)
+		}
 	}
 }
 
@@ -805,7 +833,9 @@ func (r *Runtime) stopSupervisor(taskID string) {
 	if ok {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = l.Shutdown(ctx)
+		if err := l.Shutdown(ctx); err != nil {
+			slog.Warn("runtime: supervisor loop shutdown failed", "task", taskID, "err", err)
+		}
 	}
 }
 
@@ -820,7 +850,10 @@ func (r *Runtime) stopAllSupervisors() {
 
 	for _, l := range loops {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = l.Shutdown(ctx)
+		if err := l.Shutdown(ctx); err != nil {
+			slog.Warn("runtime: supervisor loop shutdown failed",
+				"task_session", l.SessionID(), "err", err)
+		}
 		cancel()
 	}
 }
