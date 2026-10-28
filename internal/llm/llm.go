@@ -34,6 +34,8 @@ type Config struct {
 	MaxRetries int
 	// RetryInterval 是重试的固定间隔；<=0 时使用 DefaultRetryInterval。
 	RetryInterval time.Duration
+	// PingTimeout 是配置连通性探测的超时；<=0 时使用 DefaultPingTimeout。
+	PingTimeout time.Duration
 }
 
 // openai 提供方在配置不全时使用的默认值。

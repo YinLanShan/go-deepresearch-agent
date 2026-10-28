@@ -132,6 +132,8 @@ func (a *API) Register(r route.IRouter) {
 	v1.GET("/sessions/:id/background-tasks", a.handleBackgroundTasks)
 	v1.GET("/config", a.handleGetConfig)
 	v1.PUT("/config", a.handleUpdateConfig)
+	// 配置连通性探测：保存前先试探密钥/地址是否可用，失败则前端不允许确认。
+	v1.POST("/config/verify", a.handleVerifyConfig)
 }
 
 type chatRequest struct {
@@ -222,6 +224,29 @@ func (a *API) handleUpdateConfig(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	c.JSON(http.StatusOK, a.config.Get())
+}
+
+// handleVerifyConfig 探测给定配置是否可用（只探测，不保存、不热切换）。
+//
+// 前端在点击"确认"前先调用它：失败则不允许保存，
+// 避免出现"保存成功但一用就报错"。
+func (a *API) handleVerifyConfig(ctx context.Context, c *app.RequestContext) {
+	if a.config == nil {
+		writeError(c, fault.E(fault.CodeUnavailable, fault.LayerAPI,
+			"config service unavailable").Severity(fault.SeverityError).Build())
+		return
+	}
+	var req service.ModelConfigUpdate
+	if err := c.BindAndValidate(&req); err != nil {
+		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if err := a.config.Verify(ctx, req); err != nil {
+		// 探测失败按 400 返回：这是用户可修正的配置问题。
+		writeErrorWithStatus(c, http.StatusBadRequest, err)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
 type taskRequest struct {

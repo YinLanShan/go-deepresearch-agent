@@ -69,13 +69,55 @@ func isSupportedProvider(provider string) bool {
 // Update 校验并热切换模型配置。
 //
 // APIKey 留空时沿用当前密钥，避免前端每次都回传脱敏值导致密钥被覆盖。
+//
+// 保存前会先做一次连通性探测（Ping）：失败则不落库、不热切换，
+// 避免"配置保存成功但一用就报错"。mock 提供方不涉及网络，直接跳过探测。
 func (s *ConfigService) Update(ctx context.Context, in ModelConfigUpdate) error {
+	next, err := s.resolve(ctx, in)
+	if err != nil {
+		return err
+	}
+
+	// 探测失败即拒绝保存。
+	if err := llm.Ping(ctx, next); err != nil {
+		return err
+	}
+
+	if err := s.model.Swap(ctx, next); err != nil {
+		return fault.Wrap(fault.CodeModelUnavailable, fault.LayerRuntime,
+			"apply model config failed", err)
+	}
+	return nil
+}
+
+// Verify 只做连通性探测，不保存也不热切换。
+//
+// 供前端在"确认"前先行试探；与 Update 使用同一套解析规则，
+// 因此探测结果能真实代表保存后的行为。
+func (s *ConfigService) Verify(ctx context.Context, in ModelConfigUpdate) error {
+	next, err := s.resolve(ctx, in)
+	if err != nil {
+		return err
+	}
+	return llm.Ping(ctx, next)
+}
+
+// resolve 把前端提交的增量配置解析成完整的模型配置。
+//
+// 规则：
+//   - APIKey 留空 → 沿用当前密钥；
+//   - BaseURL / ModelName 留空且提供方未变 → 沿用当前值
+//     （避免只改密钥却把自定义地址/模型名清掉）；
+//   - 提供方切换 → 不使用旧值，交给 WithDefaults 填充新提供方默认值
+//     （否则切到 openai 仍会带着旧模型名，导致接口拒绝请求）。
+func (s *ConfigService) resolve(_ context.Context, in ModelConfigUpdate) (llm.Config, error) {
 	provider := strings.TrimSpace(in.Provider)
 	if provider == "" {
-		return fault.New(fault.CodeInvalidInput, fault.LayerRuntime, "provider is required")
+		return llm.Config{}, fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
+			"provider is required")
 	}
 	if !isSupportedProvider(provider) {
-		return fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
+		return llm.Config{}, fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
 			fmt.Sprintf("unsupported provider %q", provider))
 	}
 
@@ -85,14 +127,10 @@ func (s *ConfigService) Update(ctx context.Context, in ModelConfigUpdate) error 
 		apiKey = cur.APIKey
 	}
 	if provider == "openai" && apiKey == "" {
-		return fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
+		return llm.Config{}, fault.New(fault.CodeInvalidInput, fault.LayerRuntime,
 			"api_key is required for openai provider")
 	}
 
-	// BaseURL / ModelName 留空时的取值规则：
-	//   - 提供方未变：沿用当前值（避免只改密钥却把自定义地址/模型名清掉）；
-	//   - 提供方切换：不使用旧值，交给 WithDefaults 填充新提供方的默认值
-	//     （否则切到 openai 仍会带着旧模型名，导致接口拒绝请求）。
 	baseURL := strings.TrimSpace(in.BaseURL)
 	modelName := strings.TrimSpace(in.ModelName)
 	if provider == cur.Provider {
@@ -105,16 +143,10 @@ func (s *ConfigService) Update(ctx context.Context, in ModelConfigUpdate) error 
 	}
 
 	// 配置不全时回退到默认值，避免因 BaseURL / 模型名为空导致模型不可用。
-	next := llm.Config{
+	return llm.Config{
 		Provider:  provider,
 		BaseURL:   baseURL,
 		APIKey:    apiKey,
 		ModelName: modelName,
-	}.WithDefaults()
-
-	if err := s.model.Swap(ctx, next); err != nil {
-		return fault.Wrap(fault.CodeModelUnavailable, fault.LayerRuntime,
-			"apply model config failed", err)
-	}
-	return nil
+	}.WithDefaults(), nil
 }

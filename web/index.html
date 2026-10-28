@@ -1387,31 +1387,52 @@ async function loadConfig() {
   }
 }
 
+// saveConfig 保存配置。
+//
+// 流程（对应需求"配置 keys 之后需要 ping 一下，失败则不能确认"）：
+//   1. 先调用 /config/verify 探测密钥与地址是否真的可用；
+//   2. 探测失败 → 保持弹窗打开、显示原因、不保存；
+//   3. 探测成功 → 再调用 PUT /config 落库并热切换。
 async function saveConfig() {
   const base = $('cfg-base').value.trim();
+  const provider = $('cfg-provider').value;
+  let baseURL = $('cfg-baseurl').value.trim();
+  let modelName = $('cfg-model').value.trim();
+  // 配置不全时回退默认值，保证模型始终可调用。
+  if (provider === 'openai') {
+    if (!baseURL) baseURL = DEFAULT_BASE_URL;
+    if (!modelName) modelName = DEFAULT_MODEL_NAME;
+    $('cfg-baseurl').value = baseURL;
+    $('cfg-model').value = modelName;
+  }
+
+  const payload = {
+    provider,
+    base_url: baseURL,
+    api_key: $('cfg-apikey').value.trim(),
+    model_name: modelName,
+  };
+
+  // 地址可以立刻生效（本地偏好），密钥/模型配置要等探测通过。
   if (base) {
     state.base = base.replace(/\/$/, '');
     localStorage.setItem('dra_base', state.base);
   }
+
   $('cfg-save').disabled = true;
-  cfgStatus('保存中…', false);
+  cfgStatus('正在探测连通性…', false);
   try {
-    const provider = $('cfg-provider').value;
-    let baseURL = $('cfg-baseurl').value.trim();
-    let modelName = $('cfg-model').value.trim();
-    // 配置不全时回退默认值，保证模型始终可调用。
-    if (provider === 'openai') {
-      if (!baseURL) baseURL = DEFAULT_BASE_URL;
-      if (!modelName) modelName = DEFAULT_MODEL_NAME;
-      $('cfg-baseurl').value = baseURL;
-      $('cfg-model').value = modelName;
-    }
-    const updated = await api('PUT', '/config', {
-      provider,
-      base_url: baseURL,
-      api_key: $('cfg-apikey').value.trim(),
-      model_name: modelName,
-    });
+    // 1) 先探测：失败会抛错，直接进入 catch（不保存）。
+    await api('POST', '/config/verify', payload);
+  } catch (e) {
+    cfgStatus('探测失败，配置未保存：' + e.message, true);
+    $('cfg-save').disabled = false;
+    return; // 关键：不继续保存
+  }
+
+  cfgStatus('探测通过，正在保存…', false);
+  try {
+    const updated = await api('PUT', '/config', payload);
     cfgStatus('✓ 已保存并生效', false);
     $('cfg-apikey').value = '';
     $('cfg-baseurl').value = updated.base_url || DEFAULT_BASE_URL;

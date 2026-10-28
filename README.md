@@ -460,6 +460,15 @@ go test -count=1 ./... -short                 # 跳过 MCP 集成测试，仅跑
 「API 配置」支持设置服务地址、模型提供方（mock / mock-tool / mock-cancel / openai）、Base URL、
 模型名称与 API Key；保存后立即生效。密钥留空表示沿用已保存的密钥，界面只展示脱敏提示。
 
+**保存前会先探测连通性**（`POST /api/v1/config/verify`）：
+
+- 前端点击确认时先探测，**探测失败则不允许保存**（弹窗保持打开并显示原因）；
+- 后端 `PUT /config` 也会在写库前探测，避免绕过前端直接提交无效配置；
+- mock 类提供方不涉及网络，直接视为可用；
+- 错误分类：鉴权失败 → `invalid_input`（提示检查密钥），
+  网络/超时 → `model_unavailable`（提示检查地址），模型名不可用 → `invalid_input`；
+- 探测超时 10 秒（`llm.DefaultPingTimeout`），失败不会改动现有配置。
+
 **配置不全不会导致模型不可用**：
 
 | 字段 | 留空时的行为 |
