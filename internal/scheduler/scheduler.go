@@ -284,6 +284,7 @@ func (s *Scheduler) finishFailure(a *domain.Assignment, cause error) {
 		Status:       a.Status,
 		Err:          a.Err,
 	})
+	s.maybePublishSettled(a.RunTaskID, a.SessionID, a.TaskID)
 }
 
 // pop 取出队首 Assignment；为空返回 nil。
@@ -502,6 +503,49 @@ func (s *Scheduler) OnResultCommitted(assignmentID, result string) {
 		Status:       a.Status,
 		Result:       result,
 	})
+	s.maybePublishSettled(a.RunTaskID, a.SessionID, a.TaskID)
+}
+
+// maybePublishSettled 在某个 Assignment 进入终态后，检查该 RunTask 的子任务是否已全部终结。
+//
+// 若是则发布 AllAssignmentsSettledEvent：让空闲的 Supervisor 被唤醒一次去评估
+// 是否该给出结论。若仍有非终态 Assignment，则什么都不做（保持原有的"结果提交唤醒"语义）。
+func (s *Scheduler) maybePublishSettled(runTaskID, sessionID, taskID string) {
+	if runTaskID == "" {
+		return
+	}
+	list, err := s.assignments.ListByRunTask(context.Background(), runTaskID)
+	if err != nil || len(list) == 0 {
+		return
+	}
+
+	var succeeded, failed, cancelled int
+	for _, a := range list {
+		if !a.Status.IsTerminal() {
+			return // 还有任务在跑或在排队
+		}
+		switch a.Status {
+		case domain.AssignmentCompleted:
+			succeeded++
+		case domain.AssignmentFailed:
+			failed++
+		case domain.AssignmentCancelled:
+			cancelled++
+		}
+	}
+
+	s.publish(event.AllAssignmentsSettledEvent{
+		SessionID: sessionID,
+		TaskID:    taskID,
+		RunTaskID: runTaskID,
+		Total:     len(list),
+		Succeeded: succeeded,
+		Failed:    failed,
+		Cancelled: cancelled,
+	})
+	slog.Info("scheduler: all assignments settled",
+		"run_task", runTaskID, "total", len(list),
+		"succeeded", succeeded, "failed", failed, "cancelled", cancelled)
 }
 
 // OnResultRejected 由 ResultAggregator 在 Commit 失败时调用：置为 failed。
@@ -531,6 +575,7 @@ func (s *Scheduler) OnResultRejected(assignmentID string, cause error) {
 		Status:       a.Status,
 		Err:          a.Err,
 	})
+	s.maybePublishSettled(a.RunTaskID, a.SessionID, a.TaskID)
 }
 
 // OnResultRevoked 由 ResultAggregator 在结果被撤销后调用：把 Assignment 置为 cancelled。
@@ -561,6 +606,7 @@ func (s *Scheduler) OnResultRevoked(assignmentID, reason string) {
 		Status:       a.Status,
 		Err:          a.Err,
 	})
+	s.maybePublishSettled(a.RunTaskID, a.SessionID, a.TaskID)
 }
 
 // CancelAssignments 按 ID 撤销一批 Assignment。
@@ -679,6 +725,11 @@ func (s *Scheduler) CancelAssignments(runTaskID string, assignmentIDs []string, 
 
 	slog.Info("scheduler: assignments cancelled",
 		"run_task", runTaskID, "count", len(prev), "revoked_results", revoked, "reason", reason)
+	// 撤销也可能让该 RunTask 的子任务全部终结。
+	if len(prev) > 0 {
+		p := prev[0].assignment
+		s.maybePublishSettled(runTaskID, p.SessionID, p.TaskID)
+	}
 	return len(prev), revoked, nil
 }
 

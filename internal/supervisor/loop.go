@@ -109,6 +109,15 @@ type Loop struct {
 	finishing        bool
 	finishConclusion string
 
+	// turnActive 表示当前是否有轮次正在推理（true）还是空闲等待输入（false）。
+	//
+	// 它只用于内部判断"能否安全唤醒"，不暴露为 RunTask 状态：
+	//   - 轮次运行中收到结果提交 → 走原有抢占机制；
+	//   - 轮次空闲时收到"子任务全部终结" → 直接入队唤醒一次。
+	turnActive bool
+	// settledWoken 记录本次空闲期是否已因"子任务全部终结"唤醒过，避免重复唤醒。
+	settledWoken bool
+
 	mu sync.Mutex
 	// loop 是当前 TurnLoop 实例。审批恢复需要新的实例（Eino 的 Run 只能生效一次）。
 	loop *adk.TurnLoop[Input, *schema.Message]
@@ -177,6 +186,8 @@ func New(cfg Config) *Loop {
 	if cfg.Bus != nil {
 		cfg.Bus.Subscribe(event.EventUserMessage, l)
 		cfg.Bus.Subscribe(event.EventResearchStateCommitted, l)
+		// 子任务全部终结：让空闲的 Supervisor 被唤醒一次去评估是否该给出结论。
+		cfg.Bus.Subscribe(event.EventAllAssignmentsSettled, l)
 	}
 	return l
 }
@@ -303,17 +314,73 @@ func (l *Loop) Send(_ context.Context, e event.EventEnvelope) error {
 		if ev.RunTaskID != l.runTaskID {
 			return nil
 		}
-		// 记录用户消息到对话历史；首条消息同时作为本次研究任务的需求。
+		// 记录用户消息到对话历史（同时作为需求累积）。
 		l.recordUserMessage(ev.Message)
-		l.push(Input{Message: ev.Message})
+		// 用户消息拥有最高优先级：直接抢占当前轮次。
+		// 被打断的那一轮输出会累积进 InterruptedContext，下一轮并入 Finding，
+		// 这正是"结果延迟到下一轮提交"的表现。
+		l.push(Input{Message: ev.Message}, adk.WithPreempt[Input, *schema.Message](adk.AnySafePoint))
 	case event.ResearchStateCommittedEvent:
 		if ev.TaskID != l.taskID {
 			return nil
 		}
 		// 抢占当前轮次（在模型/工具调用间隙中断），并开启重新规划轮次。
 		l.push(Input{Message: replanPrompt}, adk.WithPreempt[Input, *schema.Message](adk.AnySafePoint))
+	case event.AllAssignmentsSettledEvent:
+		if ev.RunTaskID != l.runTaskID {
+			return nil
+		}
+		l.wakeOnSettled(ev)
 	}
 	return nil
+}
+
+// wakeOnSettled 在"子任务全部终结"时决定是否唤醒 Supervisor。
+//
+// 语义（按约定）：
+//   - 轮次**运行中**：保持原有的抢占机制（结果提交会自己抢占），此处不额外入队，
+//     避免同一时刻有两个输入争抢；
+//   - 轮次**空闲**：直接入队一次唤醒，让模型评估是否该给出结论；
+//   - 同一次空闲期只唤醒一次（settledWoken 去重），避免撤销/失败连续触发时反复唤醒。
+func (l *Loop) wakeOnSettled(ev event.AllAssignmentsSettledEvent) {
+	l.mu.Lock()
+	if l.finishing {
+		l.mu.Unlock()
+		return // 已进入终结流程，无需唤醒
+	}
+	if l.turnActive {
+		l.mu.Unlock()
+		// 运行中：交给原有的抢占/结果提交机制，不重复入队。
+		return
+	}
+	if l.settledWoken {
+		l.mu.Unlock()
+		return // 本次空闲期已唤醒过一次
+	}
+	l.settledWoken = true
+	loop := l.loop
+	l.mu.Unlock()
+
+	slog.Info("supervisor: waking on settled assignments",
+		"task", l.taskID, "total", ev.Total,
+		"succeeded", ev.Succeeded, "failed", ev.Failed, "cancelled", ev.Cancelled)
+	loop.Push(Input{Message: replanPrompt})
+}
+
+// markTurnActive / markTurnIdle 维护"本轮是否在推理"的内部标记。
+//
+// 进入 idle 时重置 settledWoken：新的一次空闲期允许再被"全部终结"唤醒一次。
+func (l *Loop) markTurnActive() {
+	l.mu.Lock()
+	l.turnActive = true
+	l.mu.Unlock()
+}
+
+func (l *Loop) markTurnIdle() {
+	l.mu.Lock()
+	l.turnActive = false
+	l.settledWoken = false
+	l.mu.Unlock()
 }
 
 // push 向当前 TurnLoop 投递输入。
@@ -526,6 +593,10 @@ func (l *Loop) publishEvent(data event.Event) {
 // 收到中断事件（工具审批）时发布审批请求，并跳过本次 Commit。
 func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *schema.Message],
 	events *adk.AsyncIterator[*adk.AgentEvent]) error {
+	// 本轮开始：标记为运行中，并保证退出时恢复空闲。
+	l.markTurnActive()
+	defer l.markTurnIdle()
+
 	// answer 累积本轮全部 assistant 文本（跳过 tool 消息），作为 Finding。
 	var answer strings.Builder
 	interrupted := false

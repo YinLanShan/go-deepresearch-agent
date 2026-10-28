@@ -65,6 +65,12 @@ const (
 	EventWorkResultReady = "work_result_ready"
 	// EventRunStatusChanged 表示 RunTask 的状态发生变化（前端状态徽章实时更新）。
 	EventRunStatusChanged = "run_status_changed"
+	// EventAllAssignmentsSettled 表示某个 RunTask 下的 Assignment 已全部进入终态。
+	//
+	// 它填补一个缺口：当子任务全部失败/被撤销时，不会产生 WorkResultReady，
+	// 也就不会有 ResearchStateCommitted，Supervisor 会永久空闲等待。
+	// 该事件让空闲的 Supervisor 被唤醒一次，评估是否该给出结论。
+	EventAllAssignmentsSettled = "all_assignments_settled"
 )
 
 // 协调动作（Runtime 发起的生命周期协商）。
@@ -506,3 +512,25 @@ type RunStatusChangedEvent struct {
 
 // EventType 实现 Event 接口。
 func (RunStatusChangedEvent) EventType() string { return EventRunStatusChanged }
+
+// AllAssignmentsSettledEvent 表示某个 RunTask 下的 Assignment 已全部进入终态
+// （completed / failed / cancelled）。
+//
+// 语义边界：它只表示"没有在跑或待跑的子任务了"，不表示研究结束——
+// 是否结束仍由模型决定（finish_research）。
+type AllAssignmentsSettledEvent struct {
+	SessionID string
+	TaskID    string
+	RunTaskID string
+	// Total 是该 RunTask 下的 Assignment 总数（含各类终态）。
+	Total int
+	// Succeeded 是其中已成功提交结果的数量。
+	Succeeded int
+	// Failed 是失败的数量。
+	Failed int
+	// Cancelled 是被撤销/取消的数量。
+	Cancelled int
+}
+
+// EventType 实现 Event 接口。
+func (AllAssignmentsSettledEvent) EventType() string { return EventAllAssignmentsSettled }

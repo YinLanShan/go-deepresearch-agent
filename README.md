@@ -137,6 +137,14 @@ Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/sessions/{id}/approve `
 > - **"本轮结束" ≠ "研究结束"**：模型派发 Assignment 后即可结束本轮（RunTask 仍为
 >   `running`，SupervisorLoop 保留），不阻塞等待子任务；结果提交后由
 >   `ResearchStateCommitted` 唤醒下一轮。本轮内用户再发消息仍属同一 Task。
+> - **两种唤醒方式**：
+>   - 运行中的轮次收到结果提交 → **抢占**（中断当前轮次，被打断输出并入下一轮 Finding）；
+>   - 轮次**空闲**时若子任务**全部终结**（成功/失败/撤销皆算）→ 由
+>     `AllAssignmentsSettled` 唤醒一次，让模型评估是否给出结论。
+>     同一个空闲期只唤醒一次，避免撤销/失败连续触发时反复唤醒；
+>     轮次运行中则保持原有抢占机制，不额外入队。
+> - **用户消息优先级最高**：始终带抢占发送，可打断正在进行的轮次；
+>   被打断的输出进入 `InterruptedContext`，下一轮并入 Finding（结果延迟提交）。
 > - **SupervisorLoop** 外层订阅用户消息事件（按 RunTaskID 路由），内层用 Eino 的
 >   TurnLoop 驱动模型产出研究结论，写回该 Task 的 ResearchState；流式输出经
 >   ModelOutput 事件发布为 SSE。
