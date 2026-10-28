@@ -318,26 +318,30 @@
 
 ## 7. 通知类（不产生 fault，保持 `_ =`）
 
-这些属于"上报通道自身"，失败不改变业务状态，**明确保留 `_ =`**：
+这些属于"上报通道自身"，失败不改变业务状态，**明确保留 `_ =`**，
+并在代码中以集中注释说明约定（见各 `publish` 辅助方法与 SSE `Send`）：
 
 | 位置 | 内容 | 数量 |
 |---|---|---|
-| `internal/api/api.go` | SSE `WriteEvent` / `Close` | 20 |
-| `internal/resultagg/resultagg.go:523` | `bus.Publish` | 1 |
-| `internal/runtime/runtime.go:664` | `bus.Publish`（状态变更） | 1 |
-| `internal/scheduler/scheduler.go:805` | `bus.Publish` | 1 |
+| `internal/api/api.go` | SSE `WriteEvent` / `Close` | 21 |
+| `internal/resultagg/resultagg.go` | `bus.Publish`（notifySupervisor） | 1 |
+| `internal/runtime/runtime.go` | `bus.Publish`（状态变更） | 1 |
+| `internal/scheduler/scheduler.go` | `bus.Publish` | 1 |
 | `internal/supervisor/loop.go` | `bus.Publish` × 4 | 4 |
-| `internal/workpool/workpool.go:527` | `bus.Publish` | 1 |
-| `internal/tool/mcp.go:129` | `session.Close()` | 1 |
-| `cmd/server/main.go:112` | `rt.Shutdown` | 1 |
-| `cmd/mcptestserver/main.go:42` | `srv.Close()` | 1 |
+| `internal/workpool/workpool.go` | `bus.Publish` | 1 |
+| `internal/tool/mcp.go` | `session.Close()` | 1 |
+| `cmd/server/main.go` | `rt.Shutdown` | 1 |
+| `cmd/mcptestserver/main.go` | `srv.Close()` | 1 |
 
-**合计 31 处**，建议统一补注释说明原因。
+**合计 32 处**。
 
-### 待清理的占位残留（2 处）
+判断标准：**失败后是否需要改变业务状态？**
 
-- `internal/resultagg/resultagg.go:246` — `_ = now`
-- `internal/runtime/runtime.go:278` — `_ = taskID`
+- 不需要 → 通知类，保留 `_ =` 并注释；
+- 需要（如门控、状态落库）→ 必须处理（重试 / 上报 / 作废）。
+
+占位残留（`_ = now` / `_ = taskID`）已清理完毕。
+
 
 ---
 
@@ -392,13 +396,14 @@
 | 批次 | 内容 | 数量 | 决策 |
 |---|---|---|---|
 | **A/B/C** | 错误对象、上报、API 映射 | —— | ✅ 已完成 |
-| **D** | 状态变更类 `_ =`（runtime 层） | 6 处 | Q6：仅日志 |
-| **E** | 状态更新失败 + `RetryOnce` → 作废 | 16 处 | Q3 |
-| **F1** | work 层接入 fault（超时/取消/失败/空输出） | 6 类 | —— |
-| **F2** | scheduler 层接入 fault | 7 类 | Q4 |
-| **F3** | result 层接入 fault | 5 类 | Q5 |
-| **F4** | infrastructure 层接入 fault + 模型重试 | 7 类 | Q1、Q2 |
-| **G** | 清理占位残留 + 通知类补注释 | 33 处 | —— |
+| **D** | 状态变更类 `_ =`（runtime 层） | 6 处 | ✅ Q6 |
+| **E** | 状态更新失败 + `RetryOnce` → 作废 | 16 处 | ✅ Q3 |
+| **F1** | work 层接入 fault | 6 类 | ✅ |
+| **F2** | scheduler 层接入 fault | 7 类 | ✅ Q4 |
+| **F3** | result 层接入 fault | 5 类 | ✅ Q5 |
+| **F4** | infrastructure 层 + 模型重试 + 工具上报 | 7 类 | ✅ Q1、Q2 |
+| **G** | 清理残留 + 通知类补注释 | 32 处 | ✅ |
 
-**执行顺序**：D → F1 → F2 → E → F3 → F4 → G
+**全部批次已完成。**
+
 

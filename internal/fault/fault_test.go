@@ -117,6 +117,43 @@ func TestCodeOfAndLayerOf(t *testing.T) {
 	}
 }
 
+// TestWrapForceCreatesNewLayer 验证 WrapForce 总是新建一层。
+//
+// 用于"外层语义确实变化"的场景（如重试耗尽：内层可重试 → 外层已放弃），
+// 底层错误仍可通过 errors.Is / errors.As 追溯。
+func TestWrapForceCreatesNewLayer(t *testing.T) {
+	inner := E(CodeRateLimited, LayerInfrastructure, "limited").Build()
+
+	outer := E(CodeModelUnavailable, LayerInfrastructure, "retries exhausted").
+		Retryable(false).
+		WrapForce(inner)
+
+	if outer == inner {
+		t.Fatal("WrapForce should create a new error layer")
+	}
+	if outer.Code != CodeModelUnavailable {
+		t.Fatalf("outer code = %s, want model_unavailable", outer.Code)
+	}
+	if outer.RetryableHint {
+		t.Fatal("outer should not be retryable")
+	}
+	// 底层仍可追溯
+	if !errors.Is(outer, inner) {
+		t.Fatal("unwrapping chain should still reach the inner error")
+	}
+	var got *Error
+	if !errors.As(outer, &got) || got != outer {
+		t.Fatal("errors.As should return the outermost error")
+	}
+}
+
+// TestWrapForceNil 验证 nil 输入不产生错误。
+func TestWrapForceNil(t *testing.T) {
+	if got := E(CodeInternal, LayerRuntime, "x").WrapForce(nil); got != nil {
+		t.Fatalf("WrapForce(nil) should be nil, got %+v", got)
+	}
+}
+
 // TestRetryOnceSucceedsAfterFailure 验证首次失败后重试成功。
 func TestRetryOnceSucceedsAfterFailure(t *testing.T) {
 	calls := 0

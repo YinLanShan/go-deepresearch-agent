@@ -8,6 +8,8 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 )
 
 // isInterruptRerun 判断错误是否为框架的中断重入错误。
@@ -113,25 +115,47 @@ func (m *approvalMiddleware) WrapInvokableToolCall(
 //
 // 把工具执行错误转换成可读文本回传给模型，避免单个工具失败中断整轮研究；
 // 但中断重入错误（InterruptRerunError）必须原样抛给框架，否则会破坏审批恢复。
-func NewSafeToolMiddleware() adk.ChatModelAgentMiddleware {
-	return &safeToolMiddleware{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}}
+func NewSafeToolMiddleware(reporter *fault.Reporter) adk.ChatModelAgentMiddleware {
+	return &safeToolMiddleware{
+		BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
+		reporter:                     reporter,
+	}
 }
 
+// safeToolMiddleware 把工具错误转成文本回传给模型，同时上报 warning。
+//
+// 双通道（Q2）：
+//   - 给模型：错误文本，让它自行调整（保持原有行为，不阻断研究）；
+//   - 给前端：warning 级 ErrorOccurred，让用户知道"这个工具挂了"。
 type safeToolMiddleware struct {
 	*adk.BaseChatModelAgentMiddleware
+	reporter *fault.Reporter
 }
 
-// WrapInvokableToolCall 把普通工具错误转为文本结果。
+// WrapInvokableToolCall 把普通工具错误转为文本结果，并上报 warning。
 func (m *safeToolMiddleware) WrapInvokableToolCall(
 	_ context.Context,
 	endpoint adk.InvokableToolCallEndpoint,
-	_ *adk.ToolContext,
+	tCtx *adk.ToolContext,
 ) (adk.InvokableToolCallEndpoint, error) {
+	name := ""
+	if tCtx != nil {
+		name = tCtx.Name
+	}
 	return func(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
 		out, err := endpoint(ctx, argumentsInJSON, opts...)
 		if err != nil {
 			if isInterruptRerun(err) {
 				return "", err
+			}
+			// 上报 warning（不阻断）：模型仍会收到错误文本并自行调整。
+			if m.reporter != nil {
+				m.reporter.Report(ctx, fault.E(fault.CodeToolFailed, fault.LayerInfrastructure,
+					"tool call failed: "+name).
+					Severity(fault.SeverityWarning).
+					Source("tool.safeToolMiddleware").
+					Retryable(false).
+					Wrap(err), fault.Scope{Source: "tool"})
 			}
 			return fmt.Sprintf("[tool error] %v", err), nil
 		}

@@ -631,6 +631,9 @@ func (p *WorkPool) publishWork(w *domain.Work) {
 }
 
 // publish 发布事件。
+//
+// 通知失败不影响主流程：事件只是观察通道，权威状态已落库。
+// 因此这里显式忽略 Publish 的错误（符合错误手册第 7 节的约定）。
 func (p *WorkPool) publish(data event.Event) {
 	if p.bus == nil || data == nil {
 		return

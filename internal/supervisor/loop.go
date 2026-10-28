@@ -27,6 +27,7 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	agenttool "github.com/YinLanShan/go-deepresearch-agent.git/internal/tool"
@@ -66,6 +67,9 @@ type Config struct {
 	Canceller AssignmentCanceller
 	// Assignments 用于校验撤销请求中的 Assignment ID 归属；为 nil 时跳过归属校验。
 	Assignments storage.AssignmentStore
+	// Reporter 用于上报错误（写日志 + 按 Severity 决定是否推送前端）；
+	// 为 nil 时只写日志。
+	Reporter *fault.Reporter
 }
 
 // AssignmentProposer 由 Runtime 实现：接收模型通过 submit_assignments 提交的研究目标。
@@ -104,6 +108,7 @@ type Loop struct {
 	proposer    AssignmentProposer
 	canceller   AssignmentCanceller
 	assignments storage.AssignmentStore
+	reporter    *fault.Reporter
 	// finishing / finishConclusion 记录模型通过 finish_research 表达的终结意图。
 	// 一旦置位不可撤销（不允许模型"反悔"）。
 	finishing        bool
@@ -162,6 +167,23 @@ func (l *Loop) finishingRequested() (bool, string) {
 	return l.finishing, l.finishConclusion
 }
 
+// reportError 上报一个错误；reporter 为 nil 时只写日志。
+func (l *Loop) reportError(err error) {
+	if err == nil {
+		return
+	}
+	if l.reporter == nil {
+		slog.Error("supervisor: unreported error", "task", l.taskID, "err", err)
+		return
+	}
+	l.reporter.Report(context.Background(), err, fault.Scope{
+		SessionID: l.sessionID,
+		TaskID:    l.taskID,
+		RunTaskID: l.runTaskID,
+		Source:    "supervisor",
+	})
+}
+
 // checkpointID 返回该 Task 的 checkpoint 键。
 func (l *Loop) checkpointID() string { return "task:" + l.taskID }
 
@@ -180,6 +202,7 @@ func New(cfg Config) *Loop {
 		proposer:    cfg.Proposer,
 		canceller:   cfg.Canceller,
 		assignments: cfg.Assignments,
+		reporter:    cfg.Reporter,
 		resumeData:  make(map[string]agenttool.ApprovalResult),
 	}
 	l.loop = l.newTurnLoop()
@@ -451,7 +474,7 @@ func (l *Loop) prepareAgent(ctx context.Context, _ *adk.TurnLoop[Input, *schema.
 		// 中间件顺序即包裹顺序：审批（最外层）→ 错误兜底 → 动作上报（最内层）。
 		Handlers: []adk.ChatModelAgentMiddleware{
 			agenttool.NewApprovalMiddleware(l.policy),
-			agenttool.NewSafeToolMiddleware(),
+			agenttool.NewSafeToolMiddleware(l.reporter),
 			agenttool.NewEventMiddleware(l),
 		},
 	}
@@ -577,6 +600,9 @@ func (l *Loop) ToolFinished(name, output string, err error) {
 }
 
 // publishEvent 发布一个事件；总线为空时忽略。
+//
+// 通知失败不影响主流程：事件只是观察通道，权威状态已落库。
+// 因此这里显式忽略 Publish 的错误（符合错误手册第 7 节的约定）。
 func (l *Loop) publishEvent(data event.Event) {
 	if l.bus == nil || data == nil {
 		return
@@ -664,7 +690,13 @@ func (l *Loop) onAgentEvents(ctx context.Context, tc *adk.TurnContext[Input, *sc
 		// 再取消所有后台任务、关闭提交门控，由 Runtime 置 RunTask 为 finished。
 		if strings.TrimSpace(conclusion) != "" {
 			if err := l.states.SetConclusion(ctx, l.taskID, conclusion); err != nil {
-				slog.Error("set conclusion failed", "task", l.taskID, "err", err)
+				// Q5：结论写入失败意味着研究已终结但结论丢失，
+				// 属数据不一致，升级为 fatal；但研究已终结，不阻断也不回滚。
+				l.reportError(fault.E(fault.CodeCommitFailed, fault.LayerResult,
+					"failed to persist research conclusion").Severity(fault.SeverityFatal).
+					Source("supervisor.onAgentEvents").
+					IDs(l.taskID, l.runTaskID, "", "").
+					Wrap(err))
 			}
 		}
 		l.publishOutputDone()

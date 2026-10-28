@@ -37,10 +37,12 @@ func main() {
 
 	// 构建可热切换的模型：API 配置界面保存后立即生效，无需重启服务。
 	model, err := llm.NewSwappable(context.Background(), llm.Config{
-		Provider:  cfg.Model.Provider,
-		BaseURL:   cfg.Model.BaseURL,
-		APIKey:    cfg.Model.APIKey,
-		ModelName: cfg.Model.ModelName,
+		Provider:      cfg.Model.Provider,
+		BaseURL:       cfg.Model.BaseURL,
+		APIKey:        cfg.Model.APIKey,
+		ModelName:     cfg.Model.ModelName,
+		MaxRetries:    cfg.Model.MaxRetries,
+		RetryInterval: cfg.Model.RetryInterval,
 	})
 	if err != nil {
 		slog.Error("init model failed", "err", err)
@@ -74,17 +76,19 @@ func main() {
 			"workers", cfg.Execution.Workers,
 			"hint", "set DRA_SCHEDULER_MAX_CONCURRENCY >= DRA_WORKPOOL_WORKERS")
 	}
-	aggregator := resultagg.New(resultagg.Config{
-		States: stateStore,
-		Bus:    bus,
-	})
-	// Worker 用工厂：每个 Work 创建独立的子 Agent（与 Supervisor 共用模型）。
-	// 子 Agent 只拿到业务工具，控制类工具（submit/cancel/finish）被过滤掉。
 	// 错误上报器：写日志 + 按 Severity 决定是否推送前端（Info 只写日志）。
+	// 所有执行实体共用一个实例，保证同类错误在全局范围内合并计数。
 	reporter := fault.NewReporter(fault.ReporterConfig{
 		Bus:   bus,
 		Debug: getenvBool("DRA_DEBUG_ERRORS", false),
 	})
+	aggregator := resultagg.New(resultagg.Config{
+		States:   stateStore,
+		Bus:      bus,
+		Reporter: reporter,
+	})
+	// Worker 用工厂：每个 Work 创建独立的子 Agent（与 Supervisor 共用模型）。
+	// 子 Agent 只拿到业务工具，控制类工具（submit/cancel/finish）被过滤掉。
 	workPool := workpool.New(workpool.Config{
 		Works: workStore,
 		Bus:   bus,

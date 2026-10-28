@@ -204,6 +204,19 @@ func (b *Builder) Wrap(err error) *Error {
 	return b.e
 }
 
+// WrapForce 与 Wrap 的区别：**总是**新建一层，即使 err 已经是 *Error。
+//
+// 仅用于"外层语义确实发生了变化"的场景，例如重试耗尽：
+// 内层是 rate_limited（可重试），外层要表达 model_unavailable（已放弃）。
+// 底层错误仍可通过 errors.Is / errors.As 追溯。
+func (b *Builder) WrapForce(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	b.e.Err = err
+	return b.e
+}
+
 // Build 返回不含底层错误的 *Error。
 func (b *Builder) Build() *Error { return b.e }
 

@@ -47,6 +47,10 @@ type ModelConfig struct {
 	APIKey string
 	// ModelName 是模型名称。
 	ModelName string
+	// MaxRetries 是可重试错误（限流 / 服务不可用）的重试次数；0 表示不重试。
+	MaxRetries int
+	// RetryInterval 是重试的固定间隔；<=0 时由 llm 层使用默认值。
+	RetryInterval time.Duration
 }
 
 // ToolConfig 描述工具来源与审批策略。
@@ -104,10 +108,12 @@ func Load() Config {
 		HTTPAddr: getenv("DRA_HTTP_ADDR", ":8080"),
 		LogLevel: getenv("DRA_LOG_LEVEL", "info"),
 		Model: ModelConfig{
-			Provider:  getenv("DRA_MODEL_PROVIDER", "mock"),
-			BaseURL:   getenv("DRA_OPENAI_BASE_URL", ""),
-			APIKey:    getenv("DRA_OPENAI_API_KEY", ""),
-			ModelName: getenv("DRA_OPENAI_MODEL", "gpt-4o-mini"),
+			Provider:      getenv("DRA_MODEL_PROVIDER", "mock"),
+			BaseURL:       getenv("DRA_OPENAI_BASE_URL", ""),
+			APIKey:        getenv("DRA_OPENAI_API_KEY", ""),
+			ModelName:     getenv("DRA_OPENAI_MODEL", "gpt-4o-mini"),
+			MaxRetries:    getenvInt("DRA_MODEL_MAX_RETRIES", 2),
+			RetryInterval: getenvSeconds("DRA_MODEL_RETRY_INTERVAL", 2*time.Second),
 		},
 		Tool: ToolConfig{
 			MCPServersJSON:         getenv("DRA_MCP_SERVERS", ""),

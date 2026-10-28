@@ -817,6 +817,7 @@ func (r *Runtime) ensureSupervisor(taskID, sessionID, runTaskID string) {
 		Proposer:    r,
 		Canceller:   r,
 		Assignments: r.assignments,
+		Reporter:    r.reporter,
 	})
 	l.Start()
 	r.supervisors[taskID] = l

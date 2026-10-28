@@ -22,6 +22,7 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 )
 
@@ -75,6 +76,9 @@ type Config struct {
 	Bus       *event.Bus
 	Scheduler SchedulerNotifier
 	Now       func() time.Time
+	// Reporter 用于上报错误（写日志 + 按 Severity 决定是否推送前端）。
+	// 为 nil 时只写日志。
+	Reporter *fault.Reporter
 }
 
 // Aggregator 串行处理 Work 的最终 Result。
@@ -83,6 +87,7 @@ type Aggregator struct {
 	bus       *event.Bus
 	scheduler SchedulerNotifier
 	now       func() time.Time
+	reporter  *fault.Reporter
 
 	mu    sync.Mutex
 	slots map[string]*slot // assignmentID -> slot
@@ -117,6 +122,7 @@ func New(cfg Config) *Aggregator {
 		bus:            cfg.Bus,
 		scheduler:      cfg.Scheduler,
 		now:            now,
+		reporter:       cfg.Reporter,
 		slots:          make(map[string]*slot),
 		revokedRunTask: make(map[string]map[string]string),
 		wake:           make(chan struct{}, 1),
@@ -196,7 +202,6 @@ func (a *Aggregator) Revoke(runTaskID string, assignmentIDs []string, reason str
 	if len(assignmentIDs) == 0 {
 		return 0
 	}
-	now := a.now()
 
 	// 1) 先标记状态（无论后续能否定位到槽位，都要记住"已撤销"）。
 	a.mu.Lock()
@@ -235,15 +240,19 @@ func (a *Aggregator) Revoke(runTaskID string, assignmentIDs []string, reason str
 		for _, id := range ids {
 			n, err := a.states.RevokeResult(context.Background(), taskID, id, reason)
 			if err != nil {
-				slog.Error("resultagg: revoke committed result failed",
-					"task", taskID, "assignment", id, "err", err)
+				// Q5：撤销失败会留下"本该删除却仍在 State 中"的结果，
+				// 属数据不一致，升级为 fatal，但不阻断（研究可能已终结）。
+				a.report(fault.E(fault.CodeCommitFailed, fault.LayerResult,
+					"failed to revoke committed result").Severity(fault.SeverityFatal).
+					Source("resultagg.Revoke").
+					IDs(taskID, runTaskID, id, "").
+					Wrap(err))
 				continue
 			}
 			revokedCount += n
 			if a.scheduler != nil {
 				a.scheduler.OnResultRevoked(id, reason)
 			}
-			_ = now
 		}
 	}
 	slog.Info("resultagg: assignments revoked",
@@ -385,7 +394,15 @@ func (a *Aggregator) process(batch []*pendingResult) {
 	for _, taskID := range order {
 		group := groups[taskID]
 		if err := a.commitGroup(taskID, group); err != nil {
-			slog.Error("resultagg: commit failed", "task", taskID, "err", err)
+			// Commit 失败必须保留未提交结果、不得宣告成功（设计文档 4.x）。
+			// 这里通知 Scheduler 置 Assignment 为 failed，并上报给前端。
+			for _, p := range group {
+				a.report(fault.E(fault.CodeCommitFailed, fault.LayerResult,
+					"failed to commit research result").Severity(fault.SeverityError).
+					Source("resultagg.process").
+					IDs(taskID, p.RunTaskID, p.AssignmentID, p.WorkID).
+					Wrap(err))
+			}
 			for _, p := range group {
 				a.markRejected(p, err)
 			}
@@ -527,6 +544,31 @@ func (a *Aggregator) notifySupervisor(taskID string, group []*pendingResult) {
 			Version:   version,
 		},
 	})
+}
+
+// report 上报一个错误；reporter 为 nil 时只写日志。
+//
+// 只负责上报，不改变业务状态（状态变更仍由调用点决定）。
+func (a *Aggregator) report(err error) {
+	if err == nil {
+		return
+	}
+	if a.reporter == nil {
+		slog.Error("resultagg: unreported error", "err", err)
+		return
+	}
+	var fe *fault.Error
+	scope := fault.Scope{Source: "resultagg"}
+	if errors.As(err, &fe) {
+		scope = fault.Scope{
+			TaskID:       fe.TaskID,
+			RunTaskID:    fe.RunTaskID,
+			AssignmentID: fe.AssignmentID,
+			WorkID:       fe.WorkID,
+			Source:       "resultagg",
+		}
+	}
+	a.reporter.Report(context.Background(), err, scope)
 }
 
 // dropRunTask 丢弃某个 RunTask 的待提交结果（全局中止）。

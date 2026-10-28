@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 
@@ -29,6 +30,10 @@ type Config struct {
 	BaseURL   string
 	APIKey    string
 	ModelName string
+	// MaxRetries 是可重试错误（限流 / 服务不可用）的重试次数；<=0 表示不重试。
+	MaxRetries int
+	// RetryInterval 是重试的固定间隔；<=0 时使用 DefaultRetryInterval。
+	RetryInterval time.Duration
 }
 
 // openai 提供方在配置不全时使用的默认值。
@@ -93,7 +98,12 @@ func New(ctx context.Context, cfg Config) (ChatModel, error) {
 		m.CancelCompleted = true
 		return m, nil
 	case "openai":
-		return newOpenAI(ctx, cfg)
+		m, err := newOpenAI(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		// 只对可重试错误（限流 / 服务不可用）做固定间隔重试。
+		return withRetry(m, cfg), nil
 	default:
 		return nil, fault.New(fault.CodeInvalidInput, fault.LayerInfrastructure,
 			fmt.Sprintf("unsupported model provider %q", cfg.Provider))

@@ -605,6 +605,9 @@ type sessionEventSubscriber struct {
 var _ event.EventSender = (*sessionEventSubscriber)(nil)
 
 // Send 实现 event.EventSender。
+// 注意：SSE 写入错误一律显式忽略（_ =）。
+// 客户端断开是正常现象，且此时无法补救；SSE 只是观察通道，
+// 不影响服务端状态（符合错误手册第 7 节的约定）。
 func (s *sessionEventSubscriber) Send(_ context.Context, e event.EventEnvelope) error {
 	switch ev := e.Data.(type) {
 	case event.RunStatusChangedEvent:
@@ -683,6 +686,9 @@ var _ event.EventSender = (*streamSubscriber)(nil)
 // Send 实现 event.EventSender：过滤本 Session 的事件并写入 SSE。
 //
 // SSE 事件名：message（模型输出）/ tool_call / tool_result / approval_required。
+// 注意：SSE 写入错误一律显式忽略（_ =）。
+// 客户端断开是正常现象，且此时无法补救；SSE 只是观察通道，
+// 不影响服务端状态（符合错误手册第 7 节的约定）。
 func (s *streamSubscriber) Send(_ context.Context, e event.EventEnvelope) error {
 	switch ev := e.Data.(type) {
 	case event.ModelOutputEvent:
