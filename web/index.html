@@ -451,6 +451,8 @@ const state = {
   pollTimer: null,
   // sessionEvents 是会话级常驻 SSE（状态徽章实时来源）。
   sessionEvents: null,
+  // lastConfig 是已生效的模型配置，供保存前判断"是否真的变化"（未变化则跳过探测）。
+  lastConfig: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1375,6 +1377,12 @@ function closeApiModal() { $('api-modal').classList.remove('open'); }
 async function loadConfig() {
   try {
     const cfg = await api('GET', '/config');
+    // 记录已生效配置，供保存时判断"是否真的变化"（未变化则跳过探测）。
+    state.lastConfig = {
+      provider: cfg.provider || 'mock',
+      base_url: cfg.base_url || '',
+      model_name: cfg.model_name || '',
+    };
     $('cfg-provider').value = cfg.provider || 'mock';
     // 留空时展示默认值（后端也会回退到同样的默认值，两边保持一致）
     $('cfg-baseurl').value = cfg.base_url || DEFAULT_BASE_URL;
@@ -1419,21 +1427,38 @@ async function saveConfig() {
     localStorage.setItem('dra_base', state.base);
   }
 
+  // 只有"相关配置真的变了"才探测：避免重复保存时白白消耗一次真实 API 调用。
+  // 判定依据：输入了新密钥，或提供方/地址/模型名与已生效配置不同。
+  const cur = state.lastConfig || {};
+  const changed = payload.api_key !== ''
+    || provider !== (cur.provider || '')
+    || baseURL !== (cur.base_url || '')
+    || modelName !== (cur.model_name || '');
+
   $('cfg-save').disabled = true;
-  cfgStatus('正在探测连通性…', false);
-  try {
-    // 1) 先探测：失败会抛错，直接进入 catch（不保存）。
-    await api('POST', '/config/verify', payload);
-  } catch (e) {
-    cfgStatus('探测失败，配置未保存：' + e.message, true);
-    $('cfg-save').disabled = false;
-    return; // 关键：不继续保存
+  if (changed) {
+    cfgStatus('正在探测连通性…', false);
+    try {
+      // 1) 先探测：失败会抛错，直接进入 catch（不保存）。
+      await api('POST', '/config/verify', payload);
+    } catch (e) {
+      cfgStatus('探测失败，配置未保存：' + e.message, true);
+      $('cfg-save').disabled = false;
+      return; // 关键：不继续保存
+    }
+  } else {
+    cfgStatus('配置未变化，正在保存…', false);
   }
 
-  cfgStatus('探测通过，正在保存…', false);
+  cfgStatus(changed ? '探测通过，正在保存…' : '正在保存…', false);
   try {
     const updated = await api('PUT', '/config', payload);
     cfgStatus('✓ 已保存并生效', false);
+    state.lastConfig = {
+      provider: updated.provider || 'mock',
+      base_url: updated.base_url || '',
+      model_name: updated.model_name || '',
+    };
     $('cfg-apikey').value = '';
     $('cfg-baseurl').value = updated.base_url || DEFAULT_BASE_URL;
     $('cfg-model').value = updated.model_name || DEFAULT_MODEL_NAME;
