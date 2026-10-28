@@ -309,25 +309,20 @@ func (s *Store) AppendMessage(_ context.Context, taskID string, role researchsta
 }
 
 // StopCommits 关闭提交门控：此后新的 Commit 返回 ErrNotAccepting。
-func (s *Store) StopCommits(_ context.Context, taskID string) error {
+//
+// 门控是派生状态：条目不存在时也直接记录（幂等、自愈），
+// 真正创建该 Task 时 Create 会显式把门控开启为 true。
+func (s *Store) StopCommits(_ context.Context, taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.m[taskID]; !ok {
-		return researchstate.ErrNotFound
-	}
 	s.accepting[taskID] = false
-	return nil
 }
 
-// ResumeCommits 重新开启提交门控（暂停后恢复研究时调用）。
-func (s *Store) ResumeCommits(_ context.Context, taskID string) error {
+// ResumeCommits 重新开启提交门控（恢复研究时调用），同样幂等自愈。
+func (s *Store) ResumeCommits(_ context.Context, taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.m[taskID]; !ok {
-		return researchstate.ErrNotFound
-	}
 	s.accepting[taskID] = true
-	return nil
 }
 
 // DeleteBySession 删除指定 Session 的全部研究状态。

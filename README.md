@@ -253,6 +253,7 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
 | `DRA_WORKPOOL_WORKERS` | 2 | WorkPool 的执行槽位数（真正并行的子 Agent 数） |
 | `DRA_WORK_TIMEOUT` | 300 | 单个 Work（子 Agent 一次执行）的超时秒数 |
 | `DRA_TOOL_REQUIRE_APPROVAL` | `*` | 需审批的工具名；`-` 或 `none` 显式关闭审批 |
+| `DRA_DEBUG_ERRORS` | `false` | 为 `true` 时错误响应会附带内部细节（仅本地排查用） |
 
 **两级并发控制**：两个参数限制的对象不同，需要配合设置。
 
@@ -279,6 +280,19 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
 
 **查询接口**：`GET /api/v1/sessions/:id/background-tasks` 返回当前 RunTask 下的
 Assignment 与其最新 Work（状态、阶段、Worker、耗时）。
+
+**错误处理**：详见 `internal/fault`。要点如下：
+
+- 统一错误对象携带 `Code` / `Layer` / `Severity` / `Source` / 影响范围，
+  并保留 `errors.Is`/`errors.As` 语义；
+- `fault.Wrap` **幂等**：已包装过的错误不会被外层重新标记，
+  "最早、最了解情况"的那一层决定分类；
+- 6 个层级（infrastructure / work / scheduler / result / runtime / api）
+  表达"谁该处理"，`Severity`（info / warning / error / fatal）表达"该不该打扰用户"；
+- 错误上报走 `fault.Reporter`：写日志 + 按 Severity 决定是否推送前端；
+  同类错误在 5 秒窗口内合并，用 `count` 表达发生次数；
+- API 层统一用 `writeError` 映射：`fault.Error` 按其 Code 映射状态码并只返回
+  `ClientMessage`，未包装错误一律 500 + `internal error`，不泄漏内部细节。
 
 **实时推送（两个 SSE 端点，职责不同）**：
 

@@ -31,6 +31,7 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/resultagg"
@@ -71,6 +72,10 @@ type Runtime struct {
 	scheduler   *scheduler.Scheduler
 	workPool    *workpool.WorkPool
 	aggregator  *resultagg.Aggregator
+
+	// reporter 统一上报错误（写日志 + 按 Severity 决定是否推送前端）。
+	// 为 nil 时只写日志，不影响主流程。
+	reporter *fault.Reporter
 
 	events chan delivery
 	stop   chan struct{}
@@ -153,6 +158,28 @@ func (r *Runtime) SetExecution(
 	r.scheduler = sched
 	r.workPool = pool
 	r.aggregator = agg
+}
+
+// SetReporter 注入错误上报器（写日志 + 按 Severity 决定是否推送前端）。
+//
+// 应在 Start 之前调用；为 nil 时错误只写日志。
+func (r *Runtime) SetReporter(reporter *fault.Reporter) {
+	r.reporter = reporter
+}
+
+// reportError 上报一个错误；reporter 为 nil 时退化为只写日志。
+//
+// 只负责"上报"，不改变业务状态：状态变更仍由责任组件完成。
+func (r *Runtime) reportError(err error, scope fault.Scope) {
+	if err == nil {
+		return
+	}
+	if r.reporter == nil {
+		slog.Error("runtime: unreported error",
+			"source", scope.Source, "task", scope.TaskID, "err", err)
+		return
+	}
+	r.reporter.Report(context.Background(), err, scope)
 }
 
 // ExecutionStatus 返回执行实体的运行态摘要（诊断用）。
@@ -449,7 +476,7 @@ func (r *Runtime) onTaskEnabled(ctx context.Context, taskID string) error {
 	}
 	r.publishRunStatusChanged(rt, previous)
 	// 恢复研究：重新开启提交门控，并确保 SupervisorLoop 存在。
-	_ = r.states.ResumeCommits(ctx, taskID)
+	r.states.ResumeCommits(ctx, taskID)
 	r.ensureSupervisor(taskID, sessionID, rt.ID)
 	return nil
 }
@@ -511,7 +538,7 @@ func (r *Runtime) onResearchFinished(ctx context.Context, taskID string) error {
 		return err
 	}
 	r.terminateSupervisor(taskID)
-	_ = r.states.StopCommits(ctx, taskID)
+	r.states.StopCommits(ctx, taskID)
 
 	previous := rt.Status
 	rt.Status = domain.RunStatusFinished
@@ -630,7 +657,7 @@ func (r *Runtime) globalStop(ctx context.Context, taskID string, target domain.R
 	} else {
 		// 暂停/等待：保留现场，仅停止运行。
 		r.stopSupervisor(taskID)
-		_ = r.states.StopCommits(ctx, taskID)
+		r.states.StopCommits(ctx, taskID)
 	}
 
 	// 置 RunTask 状态。

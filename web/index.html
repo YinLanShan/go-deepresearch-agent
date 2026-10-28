@@ -666,8 +666,47 @@ function startSessionEvents() {
   es.addEventListener('work_updated', refreshBg);
   es.addEventListener('assignment_updated', refreshBg);
 
+  // 错误上报：按 severity 决定展示方式（info 级别服务端不会推送）。
+  es.addEventListener('error_occurred', (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch (_) { return; }
+    showErrorNotice(d);
+  });
+
   // 连接断开时浏览器会自动重连；仅在会话切换时主动关闭。
   es.onerror = () => { /* 交给 EventSource 自动重连 */ };
+}
+
+// 错误严重级别的展示文案。
+const ERROR_SEVERITY_TEXT = {
+  warning: '警告',
+  error: '错误',
+  fatal: '致命',
+};
+
+// showErrorNotice 把服务端上报的错误渲染成提示卡。
+//
+// severity 语义：
+//   warning — 局部失败（如某个子任务失败），研究可继续
+//   error   — 需要用户注意（如结果保存失败）
+//   fatal   — 研究无法继续（如提交门控失效）
+function showErrorNotice(d) {
+  const sev = d.severity || 'error';
+  const count = d.count > 1 ? `（已发生 ${d.count} 次）` : '';
+  const tag = ERROR_SEVERITY_TEXT[sev] || ERROR_SEVERITY_TEXT.error;
+  const code = d.code ? `<br/><span class="k">错误码：</span>${esc(d.code)}` : '';
+  const src = d.source ? `<br/><span class="k">来源：</span>${esc(d.source)}` : '';
+  const detail = d.detail ? `<br/><span class="k">详情：</span>${esc(d.detail)}` : '';
+
+  addCard(`error-${sev}`,
+    `【${tag}】${esc(d.message || '未知错误')}${count}${code}${src}${detail}`,
+    {raw: true});
+
+  // 致命错误同时写入顶部提示，避免用户忽略。
+  if (sev === 'fatal') {
+    const hint = $('header-hint');
+    if (hint) hint.textContent = `致命错误：${d.message || d.code || ''}`;
+  }
 }
 
 async function refreshRunStatus() {

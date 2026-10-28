@@ -99,17 +99,13 @@ func TestCommitGate(t *testing.T) {
 	}
 
 	// 中止：关闭门控
-	if err := s.StopCommits(ctx, "t1"); err != nil {
-		t.Fatalf("StopCommits: %v", err)
-	}
+	s.StopCommits(ctx, "t1")
 	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "x"}}, FindingContent: "y"}); !errors.Is(err, researchstate.ErrNotAccepting) {
 		t.Fatalf("want ErrNotAccepting, got %v", err)
 	}
 
 	// 恢复：重新接受
-	if err := s.ResumeCommits(ctx, "t1"); err != nil {
-		t.Fatalf("ResumeCommits: %v", err)
-	}
+	s.ResumeCommits(ctx, "t1")
 	if err := s.Commit(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "证据2"}}, FindingContent: "结论2"}); err != nil {
 		t.Fatalf("Commit after resume: %v", err)
 	}
@@ -278,9 +274,7 @@ func TestAppendResultOnly(t *testing.T) {
 	}
 
 	// 模拟任务已中止：门控关闭
-	if err := s.StopCommits(ctx, "t1"); err != nil {
-		t.Fatalf("StopCommits: %v", err)
-	}
+	s.StopCommits(ctx, "t1")
 
 	// 迟到产物仍可追加，且不产生 Finding
 	if err := s.AppendResult(ctx, "t1", researchstate.CommitInput{Results: []researchstate.ResultInput{{Content: "迟到的证据"}}}); err != nil {

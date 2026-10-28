@@ -71,6 +71,11 @@ const (
 	// 也就不会有 ResearchStateCommitted，Supervisor 会永久空闲等待。
 	// 该事件让空闲的 Supervisor 被唤醒一次，评估是否该给出结论。
 	EventAllAssignmentsSettled = "all_assignments_settled"
+	// EventErrorOccurred 表示发生了一个需要被感知的错误。
+	//
+	// 只表示"发生了什么"：不代替业务状态变更，也不代表系统已自动处理。
+	// 是否上报前端由 fault.Severity 决定（info 级别只写日志）。
+	EventErrorOccurred = "error_occurred"
 )
 
 // 协调动作（Runtime 发起的生命周期协商）。
@@ -534,3 +539,37 @@ type AllAssignmentsSettledEvent struct {
 
 // EventType 实现 Event 接口。
 func (AllAssignmentsSettledEvent) EventType() string { return EventAllAssignmentsSettled }
+
+// ErrorOccurredEvent 表示发生了一个需要被感知的错误。
+//
+// 字段是 fault.Error 的扁平投影：事件本身可序列化，
+// 不携带 error 接口（那会带来序列化与比较问题）。
+type ErrorOccurredEvent struct {
+	SessionID string
+	TaskID    string
+	RunTaskID string
+
+	// Code 是稳定错误标识（如 work_timeout / commit_failed）。
+	Code string
+	// Layer 是错误所属层级（如 work / result / runtime）。
+	Layer string
+	// Severity 决定前端展示级别：info / warning / error / fatal。
+	Severity string
+	// Source 是产生错误的组件。
+	Source string
+	// Message 是面向用户的说明（不含内部细节）。
+	Message string
+	// Detail 是内部排查信息（可能为空；默认仅写日志，debug 模式下才下发）。
+	Detail string
+
+	AssignmentID string
+	WorkID       string
+
+	// Count 是该错误合并的次数（同类错误在窗口内合并）。
+	Count int
+	// OccurredAt 是首次发生时间。
+	OccurredAt time.Time
+}
+
+// EventType 实现 Event 接口。
+func (ErrorOccurredEvent) EventType() string { return EventErrorOccurred }

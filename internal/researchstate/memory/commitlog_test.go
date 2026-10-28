@@ -108,9 +108,7 @@ func TestRevokeResultWorksAfterStopCommits(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	if err := s.StopCommits(ctx, "t1"); err != nil {
-		t.Fatalf("StopCommits: %v", err)
-	}
+	s.StopCommits(ctx, "t1")
 
 	// 门控已关闭：新提交被拒绝
 	if err := s.Commit(ctx, "t1", researchstate.CommitInput{

@@ -34,6 +34,7 @@ import (
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/ids"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
@@ -94,10 +95,12 @@ func (a *API) requireSession(ctx context.Context, c *app.RequestContext) (string
 	}
 	if _, err := a.sessions.Get(ctx, sessionID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
+			// 用 fault 包装以带上稳定的 code，同时保留具体说明。
+			writeError(c, fault.E(fault.CodeNotFound, fault.LayerAPI, "session not found").
+				Severity(fault.SeverityWarning).Wrap(err))
 			return "", false
 		}
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return "", false
 	}
 	return sessionID, true
@@ -175,7 +178,7 @@ func (a *API) handleCreateSession(_ context.Context, c *app.RequestContext) {
 	now := a.now()
 	sess := &domain.Session{ID: ids.New(), Title: req.Title, CreatedAt: now, UpdatedAt: now}
 	if err := a.sessions.Create(context.Background(), sess); err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, sess)
@@ -185,7 +188,7 @@ func (a *API) handleCreateSession(_ context.Context, c *app.RequestContext) {
 func (a *API) handleListSessions(ctx context.Context, c *app.RequestContext) {
 	sessions, err := a.sessions.List(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	if sessions == nil {
@@ -215,7 +218,7 @@ func (a *API) handleUpdateConfig(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	if err := a.config.Update(ctx, req); err != nil {
-		c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeErrorWithStatus(c, http.StatusBadRequest, err)
 		return
 	}
 	c.JSON(http.StatusOK, a.config.Get())
@@ -248,7 +251,7 @@ func (a *API) handleCreateTask(_ context.Context, c *app.RequestContext) {
 		UpdatedAt:   now,
 	}
 	if err := a.tasks.Create(context.Background(), t); err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, t)
@@ -261,7 +264,7 @@ func (a *API) handleListTasks(_ context.Context, c *app.RequestContext) {
 	}
 	tasks, err := a.tasks.ListBySession(context.Background(), sessionID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, map[string]any{"tasks": tasks})
@@ -276,24 +279,24 @@ func (a *API) handleDeleteSession(ctx context.Context, c *app.RequestContext) {
 
 	tasks, err := a.tasks.ListBySession(ctx, id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	for _, t := range tasks {
 		// 级联：先请求删除 RunTask（经 Runtime 协商后原子删除），再删 Task。
 		if err := a.runs.RequestDeleteRunTask(ctx, t.ID); err != nil {
-			c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeError(c, err)
 			return
 		}
 		if err := a.tasks.Delete(ctx, t.ID); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeError(c, err)
 			return
 		}
 	}
 
 	// 级联删除该 Session 的 ResearchState（研究发现资产随 Session 删除）。
 	if err := a.runs.DeleteResearchState(ctx, id); err != nil && !errors.Is(err, researchstate.ErrNotFound) {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 
@@ -302,7 +305,7 @@ func (a *API) handleDeleteSession(ctx context.Context, c *app.RequestContext) {
 			c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -333,7 +336,7 @@ func (a *API) handleUpdateTask(ctx context.Context, c *app.RequestContext) {
 				c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
 				return
 			}
-			c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeError(c, err)
 			return
 		}
 		c.JSON(http.StatusOK, task)
@@ -346,7 +349,7 @@ func (a *API) handleUpdateTask(ctx context.Context, c *app.RequestContext) {
 		case errors.Is(err, storage.ErrNotFound):
 			c.JSON(http.StatusNotFound, map[string]string{"error": "task not found"})
 		default:
-			c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeError(c, err)
 		}
 		return
 	}
@@ -366,7 +369,7 @@ func (a *API) handleGetRunByTask(ctx context.Context, c *app.RequestContext) {
 			c.JSON(http.StatusNotFound, map[string]string{"error": "run task not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, rt)
@@ -385,7 +388,7 @@ func (a *API) handleGetRunTask(ctx context.Context, c *app.RequestContext) {
 			c.JSON(http.StatusNotFound, map[string]string{"error": "run task not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, rt)
@@ -416,7 +419,7 @@ func (a *API) handleSendMessage(ctx context.Context, c *app.RequestContext) {
 	}
 
 	if err := a.runs.SendUserMessage(ctx, sessionID, req.Message); err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusAccepted, map[string]string{"status": "accepted"})
@@ -434,7 +437,7 @@ func (a *API) handleGetResearchState(ctx context.Context, c *app.RequestContext)
 			c.JSON(http.StatusNotFound, map[string]string{"error": "research state not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, st)
@@ -448,7 +451,7 @@ func (a *API) handleGetHistory(ctx context.Context, c *app.RequestContext) {
 	}
 	msgs, err := a.runs.GetConversationHistory(ctx, sessionID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, map[string]any{"messages": msgs})
@@ -461,7 +464,7 @@ func (a *API) handleStop(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	if err := a.runs.RequestStop(ctx, sessionID); err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, map[string]string{"status": "stopped"})
@@ -489,7 +492,7 @@ func (a *API) handleApprove(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	if err := a.runs.Approve(ctx, sessionID, req.ApprovalID, req.Approved, req.Reason); err != nil {
-		c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		writeErrorWithStatus(c, http.StatusConflict, err)
 		return
 	}
 	c.JSON(http.StatusOK, map[string]any{"approval_id": req.ApprovalID, "approved": req.Approved})
@@ -565,11 +568,14 @@ func (a *API) handleSessionEvents(ctx context.Context, c *app.RequestContext) {
 	bus.Subscribe(event.EventAssignmentUpdated, sub)
 	bus.Subscribe(event.EventWorkCreated, sub)
 	bus.Subscribe(event.EventWorkUpdated, sub)
+	// 错误上报：前端据此显示提示/告警（info 级别服务端已过滤）。
+	bus.Subscribe(event.EventErrorOccurred, sub)
 	defer func() {
 		bus.Unsubscribe(event.EventRunStatusChanged, sub)
 		bus.Unsubscribe(event.EventAssignmentUpdated, sub)
 		bus.Unsubscribe(event.EventWorkCreated, sub)
 		bus.Unsubscribe(event.EventWorkUpdated, sub)
+		bus.Unsubscribe(event.EventErrorOccurred, sub)
 		_ = w.Close()
 	}()
 
@@ -783,6 +789,27 @@ func (s *streamSubscriber) Send(_ context.Context, e event.EventEnvelope) error 
 		if err == nil {
 			_ = s.w.WriteEvent("", "assignment_updated", payload)
 		}
+	case event.ErrorOccurredEvent:
+		if ev.SessionID != s.sessionID {
+			return nil
+		}
+		payload, err := json.Marshal(map[string]any{
+			"code":          ev.Code,
+			"layer":         ev.Layer,
+			"severity":      ev.Severity,
+			"source":        ev.Source,
+			"message":       ev.Message,
+			"detail":        ev.Detail,
+			"task_id":       ev.TaskID,
+			"run_task_id":   ev.RunTaskID,
+			"assignment_id": ev.AssignmentID,
+			"work_id":       ev.WorkID,
+			"count":         ev.Count,
+			"occurred_at":   ev.OccurredAt,
+		})
+		if err == nil {
+			_ = s.w.WriteEvent("", "error_occurred", payload)
+		}
 	}
 	return nil
 }
@@ -841,12 +868,12 @@ func (a *API) handleBackgroundTasks(ctx context.Context, c *app.RequestContext) 
 
 	assignments, err := a.assignments.ListByRunTask(ctx, rt.ID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 	works, err := a.works.ListByRunTask(ctx, rt.ID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeError(c, err)
 		return
 	}
 

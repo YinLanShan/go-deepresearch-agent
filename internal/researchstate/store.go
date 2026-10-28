@@ -47,8 +47,12 @@ type Store interface {
 	// AppendMessage 追加一条对话历史（用于前端切换会话时回放）。
 	AppendMessage(ctx context.Context, taskID string, role MessageRole, content string) error
 	// StopCommits 关闭提交门控：此后新的 Commit 返回 ErrNotAccepting，正在进行的 Commit 继续完成。
-	StopCommits(ctx context.Context, taskID string) error
+	//
+	// 门控是派生状态而非核心数据，因此永远"设置成功"：
+	// 对应条目不存在时也直接记录（真正创建时 Create 会显式开启门控，
+	// 不会误用陈旧标记），从而避免"门控丢失"这种无法处理的错误。
+	StopCommits(ctx context.Context, taskID string)
 	// ResumeCommits 重新开启提交门控（被挤掉的 RunTask 恢复运行时调用）。
-	ResumeCommits(ctx context.Context, taskID string) error
+	ResumeCommits(ctx context.Context, taskID string)
 	DeleteBySession(ctx context.Context, sessionID string) error
 }

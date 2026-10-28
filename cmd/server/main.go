@@ -19,6 +19,7 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/checkpoint"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/config"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm"
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/resultagg"
@@ -105,6 +106,12 @@ func main() {
 	rt := runtime.New(runTaskStore, taskStore, stateStore, model, bus)
 	rt.SetTools(toolRegistry, checkPointStore)
 	rt.SetExecution(assignmentStore, workStore, sched, workPool, aggregator)
+	// 错误上报器：写日志 + 按 Severity 决定是否推送前端（Info 只写日志）。
+	// DRA_DEBUG_ERRORS=true 时把底层细节一并下发，便于本地排查。
+	rt.SetReporter(fault.NewReporter(fault.ReporterConfig{
+		Bus:   bus,
+		Debug: getenvBool("DRA_DEBUG_ERRORS", false),
+	}))
 	rt.Start()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -163,6 +170,18 @@ func setupLog(level string) {
 //
 // 说明：审批不再使用阻塞等待，而是由中间件调用 tool.StatefulInterrupt 暂停本轮，
 // ADK 负责把执行状态序列化进 Checkpoint；用户决定后经 Resume 恢复。
+// getenvBool 读取布尔环境变量（"1"/"true"/"yes" 视为真）。
+func getenvBool(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
 func setupTools(cfg config.Config) (*agenttool.Registry, adk.CheckPointStore) {
 	var servers []agenttool.MCPServerConfig
 	if strings.TrimSpace(cfg.Tool.MCPServersJSON) != "" {

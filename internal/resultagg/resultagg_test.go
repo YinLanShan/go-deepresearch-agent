@@ -177,9 +177,7 @@ func TestAggregatorCommitFailureKeepsSlot(t *testing.T) {
 		t.Fatalf("create state: %v", err)
 	}
 	// 关闭提交门控，制造 Commit 失败
-	if err := states.StopCommits(context.Background(), "t1"); err != nil {
-		t.Fatalf("stop commits: %v", err)
-	}
+	states.StopCommits(context.Background(), "t1")
 
 	bus := event.NewBus()
 	sched := &fakeScheduler{}
