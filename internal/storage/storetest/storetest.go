@@ -683,6 +683,69 @@ func testStateCommit(t *testing.T, newStores Factory) {
 	if err := st.States.Commit(ctx, ids.New(), researchstate.CommitInput{}); !errors.Is(err, researchstate.ErrNotFound) {
 		t.Fatalf("missing commit: want ErrNotFound, got %v", err)
 	}
+
+	// AppendResult 的 Turn 与 Commit 同基准（Findings 数量 + 1），
+	// 而不是 Result 条数——否则轮次会跳号。
+	testAppendResultTurn(t, f)
+}
+
+// testAppendResultTurn 验证迟到产物的 Turn 取自 Findings 数量。
+//
+// 回归背景：AppendResult 曾使用 len(Results)+1，
+// 导致一轮内提交多条 Result 后，补录产物被算成更大的轮次（跳号）。
+func testAppendResultTurn(t *testing.T, f *fixture) {
+	t.Helper()
+	ctx := context.Background()
+	st := f.st
+
+	// 当前 Findings = 3（testStateCommit 已提交 3 轮），
+	// 因此补录的迟到产物应落在 turn 4。
+	before, err := st.States.Get(ctx, f.task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	wantTurn := len(before.Findings) + 1
+
+	if err := st.States.AppendResult(ctx, f.task.ID, researchstate.CommitInput{
+		Results: []researchstate.ResultInput{
+			{AssignmentID: "late-1", Content: "迟到一"},
+			{AssignmentID: "late-2", Content: "迟到二"},
+		},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	after, err := st.States.Get(ctx, f.task.ID)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	for _, r := range after.Results {
+		if r.AssignmentID != "late-1" && r.AssignmentID != "late-2" {
+			continue
+		}
+		if r.Turn != wantTurn {
+			t.Fatalf("late result %s turn = %d, want %d (findings-based, not results-based)",
+				r.AssignmentID, r.Turn, wantTurn)
+		}
+	}
+	// 同一次补录的多条 Result 必须共享同一 Turn。
+	if len(after.Findings) != len(before.Findings) {
+		t.Fatalf("AppendResult must not create findings: %d -> %d",
+			len(before.Findings), len(after.Findings))
+	}
+	// 迟到产物的 CommitLog 理由固定。
+	var seen int
+	for _, rec := range after.CommitLog {
+		if rec.Reason == "迟到产物" {
+			seen++
+			if rec.Turn != wantTurn {
+				t.Fatalf("late commit record turn = %d, want %d", rec.Turn, wantTurn)
+			}
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("late commit records = %d, want 2", seen)
+	}
 }
 
 // ─── ResearchState：Revoke ──────────────────────────────────────────────────

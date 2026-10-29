@@ -21,12 +21,15 @@ import (
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/event"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/fault"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/llm"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
 	stateMemory "github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate/memory"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/resultagg"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/runtime"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/scheduler"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/service"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage/memory"
+	"github.com/YinLanShan/go-deepresearch-agent.git/internal/storage/postgres"
 	agenttool "github.com/YinLanShan/go-deepresearch-agent.git/internal/tool"
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/workpool"
 )
@@ -49,11 +52,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	taskStore := memory.NewTaskStore()
-	runTaskStore := memory.NewRunTaskStore()
-	stateStore := stateMemory.NewStore()
-	assignmentStore := memory.NewAssignmentStore()
-	workStore := memory.NewWorkStore()
+	// ─── 存储：默认内存，可通过 DRA_DB_ENABLED 切到 PostgreSQL ─────────────
+	//
+	// 两种实现共用同一批接口与同一套契约测试（internal/storage/storetest），
+	// 因此这里只切换构造方式，上层逻辑无需改动。
+	taskStore, runTaskStore, stateStore, assignmentStore, workStore, sessions, closeDB :=
+		setupStores(cfg)
+	defer closeDB()
+
 	bus := event.NewBus()
 
 	// 装配工具：MCP Server（可选）+ 内置演示搜索工具，以及中断用 Checkpoint 存储。
@@ -132,7 +138,7 @@ func main() {
 
 	a := api.New(
 		service.NewChatService(model),
-		memory.NewSessionStore(),
+		sessions,
 		taskStore,
 		runService,
 		service.NewConfigService(model),
@@ -187,6 +193,67 @@ func getenvBool(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// setupStores 按配置构造存储实现。
+//
+// 返回的 closeDB 负责关闭数据库连接（内存模式下为空操作）。
+// 两种实现共用同一批接口与同一套契约测试，因此上层（Runtime /
+// Scheduler / API）无需区分。
+func setupStores(cfg config.Config) (
+	tasks storage.TaskStore,
+	runs storage.RunTaskStore,
+	states researchstate.Store,
+	assignments storage.AssignmentStore,
+	works storage.WorkStore,
+	sessions storage.SessionStore,
+	closeDB func(),
+) {
+	noop := func() {}
+
+	if !cfg.Database.Enabled {
+		return memory.NewTaskStore(),
+			memory.NewRunTaskStore(),
+			stateMemory.NewStore(),
+			memory.NewAssignmentStore(),
+			memory.NewWorkStore(),
+			memory.NewSessionStore(),
+			noop
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	db, err := postgres.Open(ctx, postgres.Config{
+		DSN:             cfg.Database.DSN,
+		MaxOpen:         cfg.Database.MaxOpen,
+		MaxIdle:         cfg.Database.MaxIdle,
+		ConnMaxLifetime: cfg.Database.ConnMaxLifetime,
+	})
+	if err != nil {
+		slog.Error("init postgres failed", "err", err)
+		os.Exit(1)
+	}
+
+	// 建表脚本幂等（IF NOT EXISTS），重复启动安全。
+	if cfg.Database.Migrate {
+		if err := postgres.Migrate(ctx, db); err != nil {
+			slog.Error("apply migrations failed", "err", err)
+			_ = db.Close()
+			os.Exit(1)
+		}
+	}
+
+	slog.Info("using postgres storage",
+		"max_open", cfg.Database.MaxOpen, "migrate", cfg.Database.Migrate)
+
+	return postgres.NewTaskStore(db),
+		postgres.NewRunTaskStore(db),
+		postgres.NewResearchStateStore(db),
+		postgres.NewAssignmentStore(db),
+		postgres.NewWorkStore(db),
+		postgres.NewSessionStore(db),
+		func() { _ = db.Close() }
 }
 
 func setupTools(cfg config.Config) (*agenttool.Registry, adk.CheckPointStore) {

@@ -213,7 +213,11 @@ func (s *ResearchStateStore) RevokeResult(ctx context.Context, taskID, assignmen
 // AppendResult 仅追加 Result（用于任务中止后到达的迟到产物）。
 //
 // 不产生 Finding、不触碰 InterruptedContext、**不受提交门控限制**。
-// turn 取 len(Results)+1，逐条递增；CommitLog 的 Reason 固定为"迟到产物"。
+//
+// Turn 与 Commit 使用**同一基准**（Findings 数量 + 1）：它表示"第几轮研究"，
+// 而不是"第几条证据"。迟到产物不产生 Finding，因此同一次补录的多条 Result
+// 共享同一个 Turn；若按 Result 条数递增会出现轮次跳号。
+// CommitLog 的 Reason 固定为"迟到产物"。
 func (s *ResearchStateStore) AppendResult(ctx context.Context, taskID string, in researchstate.CommitInput) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -231,10 +235,11 @@ func (s *ResearchStateStore) AppendResult(ctx context.Context, taskID string, in
 		return convertStateErr(err)
 	}
 
-	var resultCount int
+	// Turn 取自 Findings 数量，与 Commit 保持同一基准。
+	var findingCount int
 	if err := tx.QueryRowContext(ctx, `
-		SELECT count(*) FROM research_results WHERE state_id = $1`, stateID).
-		Scan(&resultCount); err != nil {
+		SELECT count(*) FROM research_findings WHERE state_id = $1`, stateID).
+		Scan(&findingCount); err != nil {
 		return convertStateErr(err)
 	}
 
@@ -243,13 +248,12 @@ func (s *ResearchStateStore) AppendResult(ctx context.Context, taskID string, in
 	now := time.Now().UTC()
 
 	records := make([]commitRecord, 0, len(in.Results))
-	turn := resultCount
+	turn := findingCount + 1
 	for _, item := range in.Results {
 		content := strings.TrimSpace(item.Content)
 		if content == "" {
 			continue
 		}
-		turn++
 		resultID := ids.New()
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO research_results

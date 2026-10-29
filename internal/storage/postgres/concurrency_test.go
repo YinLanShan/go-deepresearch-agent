@@ -218,14 +218,11 @@ func TestPGStateConcurrentAppendResult(t *testing.T) {
 	if got.Version != int64(workers) {
 		t.Fatalf("version = %d, want %d", got.Version, workers)
 	}
-	// turn 应覆盖 1..workers 且不重复。
-	turns := make(map[int]struct{}, workers)
+	// Turn 取自 Findings 数量 + 1；AppendResult 不产生 Finding，
+	// 因此所有迟到产物共享同一个 Turn（= 1），不得出现跳号。
 	for _, r := range got.Results {
-		turns[r.Turn] = struct{}{}
-	}
-	for i := 1; i <= workers; i++ {
-		if _, ok := turns[i]; !ok {
-			t.Fatalf("turn %d missing: %v", i, turns)
+		if r.Turn != 1 {
+			t.Fatalf("turn = %d, want 1 (findings-based; no findings exist)", r.Turn)
 		}
 	}
 }

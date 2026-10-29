@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/researchstate"
@@ -371,8 +372,12 @@ func TestPGStateAppendResult(t *testing.T) {
 	}
 }
 
-// TestPGStateAppendResultTurnIncrements 验证 AppendResult 的 turn 逐条递增。
-func TestPGStateAppendResultTurnIncrements(t *testing.T) {
+// TestPGStateAppendResultTurnSameAsCommit 验证 AppendResult 的 turn 与 Commit 同基准。
+//
+// Turn 表示"第几轮研究"，来自 Findings 数量 + 1，而不是 Result 条数。
+// 迟到产物不产生 Finding，因此同一次补录的多条 Result 共享同一个 Turn；
+// 若按 Result 条数递增会出现轮次跳号（Result 数总比轮次多）。
+func TestPGStateAppendResultTurnSameAsCommit(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
 	task := seedTask(t, db, 88)
@@ -381,10 +386,20 @@ func TestPGStateAppendResultTurnIncrements(t *testing.T) {
 	if err := store.Create(ctx, newState(task, 1)); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+
+	// 第一轮正常提交，产生 1 条 Finding → 下一轮 turn 应为 2。
+	if err := store.Commit(ctx, task.ID, researchstate.CommitInput{
+		Results:        []researchstate.ResultInput{{AssignmentID: assignmentID(1), Content: "第一轮证据"}},
+		FindingContent: "第一轮过程",
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// 一次补录两条迟到产物：都属于 turn 2（而不是 2 和 3）。
 	if err := store.AppendResult(ctx, task.ID, researchstate.CommitInput{
 		Results: []researchstate.ResultInput{
-			{AssignmentID: assignmentID(1), Content: "第一条"},
-			{AssignmentID: assignmentID(2), Content: "第二条"},
+			{AssignmentID: assignmentID(2), Content: "迟到一"},
+			{AssignmentID: assignmentID(3), Content: "迟到二"},
 		},
 	}); err != nil {
 		t.Fatalf("append: %v", err)
@@ -394,11 +409,83 @@ func TestPGStateAppendResultTurnIncrements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if len(got.Results) != 2 {
-		t.Fatalf("results = %d", len(got.Results))
+
+	var lateTurns []int
+	for _, r := range got.Results {
+		if strings.HasPrefix(r.Content, "迟到") {
+			lateTurns = append(lateTurns, r.Turn)
+		}
 	}
-	if got.Results[0].Turn != 1 || got.Results[1].Turn != 2 {
-		t.Fatalf("turns = %d, %d; want 1, 2", got.Results[0].Turn, got.Results[1].Turn)
+	if len(lateTurns) != 2 {
+		t.Fatalf("late results = %d, want 2: %+v", len(lateTurns), got.Results)
+	}
+	for i, turn := range lateTurns {
+		if turn != 2 {
+			t.Fatalf("late result[%d].Turn = %d, want 2 (based on findings, not results)", i, turn)
+		}
+	}
+
+	// 再来一次补录：仍然属于 turn 2（本轮无新 Finding）。
+	if err := store.AppendResult(ctx, task.ID, researchstate.CommitInput{
+		Results: []researchstate.ResultInput{{AssignmentID: assignmentID(4), Content: "迟到三"}},
+	}); err != nil {
+		t.Fatalf("append 2: %v", err)
+	}
+	got, err = store.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	for _, r := range got.Results {
+		if r.Content == "迟到三" && r.Turn != 2 {
+			t.Fatalf("late 3 turn = %d, want 2", r.Turn)
+		}
+	}
+}
+
+// TestPGStateAppendResultTurnSkipsNoNumbers 验证 Result 数量不会造成 turn 跳号。
+//
+// 这是原缺陷的直接回归测试：一轮内提交多条 Result 后，
+// 补录的迟到产物不得被算成 turn 3 / turn 4。
+func TestPGStateAppendResultTurnSkipsNoNumbers(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	task := seedTask(t, db, 93)
+	store := NewResearchStateStore(db)
+
+	if err := store.Create(ctx, newState(task, 1)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// 一轮提交 3 条 Result + 1 条 Finding。
+	if err := store.Commit(ctx, task.ID, researchstate.CommitInput{
+		Results: []researchstate.ResultInput{
+			{AssignmentID: assignmentID(1), Content: "a"},
+			{AssignmentID: assignmentID(2), Content: "b"},
+			{AssignmentID: assignmentID(3), Content: "c"},
+		},
+		FindingContent: "过程",
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// 补录迟到产物：应为 turn 2，而不是 len(Results)+1 = 4。
+	if err := store.AppendResult(ctx, task.ID, researchstate.CommitInput{
+		Results: []researchstate.ResultInput{{AssignmentID: assignmentID(4), Content: "late"}},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	got, err := store.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	var lateTurn int
+	for _, r := range got.Results {
+		if r.Content == "late" {
+			lateTurn = r.Turn
+		}
+	}
+	if lateTurn != 2 {
+		t.Fatalf("late turn = %d, want 2 (regression: used to be %d)", lateTurn, 3+1)
 	}
 }
 

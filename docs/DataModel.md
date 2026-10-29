@@ -530,6 +530,25 @@ postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable&application_name=dra
 | **6** | 双实现并行 + 一致性测试 | 全部 | ✅ 已完成 |
 | **7** | Checkpoint（可选，建议先不做） | —— | ⬜ 待做 |
 
+**已接入 Runtime**：`cmd/server/main.go` 的 `setupStores` 根据
+`DRA_DB_ENABLED` 选择实现，两种实现共用同一批接口，
+因此 Runtime / Scheduler / API 无需区分。
+
+端到端已验证（真实 PostgreSQL 18.3）：
+
+1. 以 PG 模式启动 → 自动建表（10 张业务表，checkpoints 未启用）；
+2. 跑一次完整研究 → sessions/tasks/run_tasks/research_states/
+   assignments/works/research_results/research_findings/
+   research_commit_log/research_messages 全部落库；
+3. **重启服务 → 全部数据仍在**（含结论、提交历史、后台任务面板）。
+
+### 已知限制
+
+**提交门控是进程内状态**：PG 模式下重启后门控会重置为"全部开启"。
+这符合设计（门控是派生状态，见 4.4 节），但要意识到：
+重启后不会自动阻止对已终结研究的提交，需由 Runtime 依据
+RunTask 状态重新 `StopCommits`。
+
 **每个阶段都应能独立跑通测试**：内存实现保持不变，
 PG 实现用同一批测试用例验证（通过 Store 接口抽象）。
 
@@ -683,12 +702,32 @@ func (s *ResearchStateStore) Commit(...) error {
 
 | # | 语义 | 说明 |
 |---|---|---|
-| 1 | `turn = len(Findings) + 1` | **不是** `len(Results)+1` |
+| 1 | `turn = len(Findings) + 1` | **不是** `len(Results)+1`；Commit 与 AppendResult 同一基准 |
 | 2 | Commit 的 `Version` 只自增一次 | 与该批 Result 条数无关 |
 | 3 | 空白内容跳过 | 但 Commit 仍会自增 Version 并清空 InterruptedContext |
 | 4 | Revoke 未命中不自增 Version | 返回 `(0, nil)`，不写日志 |
-| 5 | AppendResult 的 `turn = len(Results)+1` | 逐条递增；Reason 固定 `"迟到产物"` |
+| 5 | AppendResult 与 Commit 同 turn 基准 | 同一次补录的迟到产物共享同一个 Turn |
 | 6 | 门控适用范围不同 | Commit 受限；Revoke / AppendResult 不受限 |
+
+#### 关于第 1 / 5 条：AppendResult 的 Turn 曾用错基准
+
+早期实现中 `AppendResult` 用 `len(Results)+1` 计算 Turn，
+而 `Commit` 用 `len(Findings)+1`——**同一字段两个基准**，导致轮次跳号：
+
+```
+Turn 1: Result A + Result B + Result C   （一次 Commit，3 条 Result）
+Turn ?: 补录的迟到产物 → 算成 len(Results)+1 = 4   ← 跳过了 turn 2、3
+```
+
+`Turn` 的语义是"第几轮研究"，必须与 Findings 对齐（一轮可以有多个 Result）。
+现已统一为 `len(Findings) + 1`，并由两处测试锁定：
+
+- `TestPGStateAppendResultTurnSameAsCommit`：补录多条共享同一 Turn；
+- `TestPGStateAppendResultTurnSkipsNoNumbers`：一轮 3 条 Result 后补录仍为 turn 2；
+- 契约测试 `testAppendResultTurn`：两套实现行为一致。
+
+副作用：同一次补录的多条迟到产物共享 Turn（它们本就没有对应 Finding），
+这是预期行为而非缺陷。
 
 #### 为什么需要 0002_ordering.sql
 

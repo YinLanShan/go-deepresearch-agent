@@ -245,6 +245,10 @@ func (s *Store) AddRequirement(_ context.Context, taskID, requirement string) er
 // AppendResult 仅追加一条 Result（用于任务中止后到达的迟到产物）。
 //
 // 不产生 Finding、不触碰 InterruptedContext、不受提交门控限制。
+//
+// Turn 与 Commit 使用**同一基准**（Findings 数量 + 1）：它表示"第几轮研究"，
+// 而不是"第几条证据"。迟到产物本身不产生 Finding，因此同一次补录的多条
+// Result 共享同一个 Turn；若按 Result 条数递增会出现轮次跳号。
 func (s *Store) AppendResult(_ context.Context, taskID string, in researchstate.CommitInput) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -253,6 +257,7 @@ func (s *Store) AppendResult(_ context.Context, taskID string, in researchstate.
 		return researchstate.ErrNotFound
 	}
 	now := time.Now()
+	turn := len(st.Findings) + 1
 	st.Version++
 	for _, item := range in.Results {
 		content := strings.TrimSpace(item.Content)
@@ -262,7 +267,7 @@ func (s *Store) AppendResult(_ context.Context, taskID string, in researchstate.
 		result := researchstate.Result{
 			ID:           ids.New(),
 			AssignmentID: item.AssignmentID,
-			Turn:         len(st.Results) + 1,
+			Turn:         turn,
 			Content:      content,
 			Status:       researchstate.ResultCommitted,
 			CreatedAt:    now,

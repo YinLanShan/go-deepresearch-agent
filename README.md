@@ -278,6 +278,24 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
 启用 PostgreSQL 见 [docs/DataModel.md](docs/DataModel.md)，
 建表脚本内嵌在二进制中，`DRA_DB_MIGRATE=true` 时启动自动执行。
 
+```bash
+# 启用 PostgreSQL
+psql -U postgres -c "CREATE DATABASE dra;"
+DRA_DB_ENABLED=true \
+DRA_DB_DSN="postgres://postgres:pass@127.0.0.1:5432/dra?sslmode=disable" \
+  ./bin/server
+```
+
+两种实现共用同一批接口与同一套契约测试（`internal/storage/storetest`），
+因此切换存储不改变任何上层行为。
+
+运行集成测试（未设置 DSN 时自动 skip）：
+
+```bash
+DRA_TEST_PG_DSN="postgres://postgres:pass@127.0.0.1:5432/dra_test?sslmode=disable" \
+  go test ./internal/storage/postgres/ -v
+```
+
 **两级并发控制**：两个参数限制的对象不同，需要配合设置。
 
 | 参数 | 计数范围 | 作用 |
