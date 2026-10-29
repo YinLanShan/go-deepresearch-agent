@@ -32,12 +32,18 @@ func NewStore() *Store {
 }
 
 // Create 保存一份研究状态（按 TaskID），并开启提交门控。
+//
+// 错误语义：参数为空 → ErrInvalidArgument；同 Task 已存在 → ErrAlreadyExists
+// （一个 Task 只能有一份研究状态，重复创建是调用方逻辑错误，不得静默覆盖）。
 func (s *Store) Create(_ context.Context, st *researchstate.State) error {
 	if st == nil || st.TaskID == "" {
-		return researchstate.ErrNotFound
+		return researchstate.ErrInvalidArgument
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.m[st.TaskID]; ok {
+		return researchstate.ErrAlreadyExists
+	}
 	s.m[st.TaskID] = clone(st)
 	s.accepting[st.TaskID] = true
 	// 记录该 Session 最近创建的研究状态，供 GetLatestBySession 使用。

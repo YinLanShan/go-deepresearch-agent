@@ -524,7 +524,7 @@ postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable&application_name=dra
 | **0** | 补 `storage.ErrAlreadyExists` / `ErrInvalidArgument` 哨兵错误（内存实现同步） | 无 | ✅ 已完成 |
 | **1** | 建表脚本 + Session/Task/RunTask 三个存储 | 阶段 0 | ✅ 已完成 |
 | **2** | Assignment / Work 存储（级联删除） | 阶段 1 | ✅ 已完成 |
-| **3** | ResearchState 标量部分 + Conclusion | 阶段 1 | ⬜ 待做 |
+| **3** | ResearchState 标量部分 + Conclusion | 阶段 1 | ✅ 已完成（不含子表集合，未接入 Runtime） |
 | **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 | ⬜ 待做 |
 | **5** | 撤销与 Commit 的乐观锁 | 阶段 4 | ⬜ 待做 |
 | **6** | 双实现并行 + 一致性测试 | 全部 | ⬜ 待做 |
@@ -616,6 +616,56 @@ func marshalConstraint(c *domain.WorkConstraint) (any, error) {
 
 删 0 行也返回 nil。它与 `Delete` 不同：后者是业务删除，
 找不到应报 `ErrNotFound`；前者是级联清理，重复执行是正常情况。
+
+### 阶段 3 已落地的内容
+
+| 文件 | 内容 |
+|---|---|
+| `internal/storage/postgres/researchstate.go` | ResearchStateStore（标量部分） |
+| `internal/storage/postgres/gate.go` | 提交门控（进程内，不落库） |
+| `internal/storage/postgres/researchstate_test.go` | 17 个集成测试 |
+
+**覆盖的方法：**
+
+`Create` / `Get` / `GetLatestBySession` / `ListBySession` /
+`AddRequirement` / `SetConclusion` / `DeleteBySession` /
+`StopCommits` / `ResumeCommits`
+
+**未实现的方法显式报错**，绝不静默返回成功：
+
+```go
+var ErrNotImplemented = errors.New("researchstate: operation not implemented")
+
+func (s *ResearchStateStore) Commit(...) error {
+    if !s.gate.accepting(taskID) {
+        return researchstate.ErrNotAccepting   // 门控先于实现生效
+    }
+    return fmt.Errorf("%w: Commit (stage 4)", researchstate.ErrNotImplemented)
+}
+```
+
+这样即使有人误把阶段 3 的实现接入 Runtime，也会**立刻报错**而不是丢数据。
+
+> ⚠️ **阶段 3 的实现不得接入 Runtime**：
+> `Get` 返回的 State 只有标量与 `requirements` / `related_nodes`，
+> `Results` / `Findings` / `CommitLog` / `History` 四个集合为空。
+> 接入会丢数据，必须等阶段 4 完成。
+
+**提交门控不落库**（第 4.4 节的决策在这里落地）：
+
+`commitGate` 是进程内的 `map[string]struct{}`，记录"已关闭"的 Task。
+默认放行——未记录的 Task 视为开启，避免"门控丢失"导致提交被静默拒绝。
+`DeleteBySession` 会同步清理门控记录，防止残留关闭标记。
+
+**顺带统一了 researchstate 的哨兵错误**（与阶段 0 同类问题）：
+
+- `Create` 对空参数返回 `ErrInvalidArgument`（原来误用 `ErrNotFound`）；
+- 同一 Task 重复 `Create` 返回 `ErrAlreadyExists`
+  （原来**静默覆盖**，会丢失已有研究状态）。
+
+**一个语义澄清**：`State.AddRequirement` **不去重**，只忽略空白内容。
+需求是"按时间顺序累积"的复数语义，重复表达是合法的。
+`requirements` 用 `TEXT[]` 而非 `SET` 正是为了保留这种累积顺序。
 
 ---
 

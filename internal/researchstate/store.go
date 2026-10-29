@@ -8,6 +8,23 @@ import (
 // ErrNotFound 表示目标研究状态不存在。
 var ErrNotFound = errors.New("researchstate: not found")
 
+// ErrInvalidArgument 表示调用方传入了非法参数（如空 TaskID）。
+//
+// 与 ErrNotFound 区分：前者是"你给的东西不合法"，后者是"查不到"。
+var ErrInvalidArgument = errors.New("researchstate: invalid argument")
+
+// ErrAlreadyExists 表示同一 Task 已存在 ResearchState。
+//
+// 一个 Task 只能有一份研究状态（task_id 唯一），
+// 重复创建说明调用方逻辑有误，而不是可以静默覆盖。
+var ErrAlreadyExists = errors.New("researchstate: already exists")
+
+// ErrNotImplemented 表示该存储实现尚未支持该操作。
+//
+// 持久化分层实现期间用于"显式失败而不是静默丢数据"：
+// 未实现的方法必须报错，绝不能返回成功让调用方误以为已落库。
+var ErrNotImplemented = errors.New("researchstate: operation not implemented")
+
 // ErrNotAccepting 表示 ResearchState 已暂停，不再接收新的 Commit。
 var ErrNotAccepting = errors.New("researchstate: not accepting commits")
 
