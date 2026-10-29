@@ -75,20 +75,31 @@ func (s *ResearchStateStore) Create(ctx context.Context, st *researchstate.State
 	return nil
 }
 
-// Get 按 TaskID 返回研究状态。
-//
-// 阶段 3 只返回标量与 requirements / related_nodes；
-// Results / Findings / CommitLog / History 留空。
+// Get 按 TaskID 返回研究状态（含四张子表的集合内容）。
 func (s *ResearchStateStore) Get(ctx context.Context, taskID string) (*researchstate.State, error) {
-	return s.queryOne(ctx, `WHERE task_id = $1`, taskID)
+	st, err := s.queryOne(ctx, `WHERE task_id = $1`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.loadCollections(ctx, st); err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 // GetLatestBySession 返回该 Session 下序号最大（最新）的研究状态。
 func (s *ResearchStateStore) GetLatestBySession(ctx context.Context, sessionID string) (*researchstate.State, error) {
-	return s.queryOne(ctx, `WHERE session_id = $1 ORDER BY ordinal DESC LIMIT 1`, sessionID)
+	st, err := s.queryOne(ctx, `WHERE session_id = $1 ORDER BY ordinal DESC LIMIT 1`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.loadCollections(ctx, st); err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
-// ListBySession 返回该 Session 下全部研究状态，按序号升序。
+// ListBySession 返回该 Session 下全部研究状态，按序号升序（含集合内容）。
 func (s *ResearchStateStore) ListBySession(ctx context.Context, sessionID string) ([]*researchstate.State, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+stateColumns+` FROM research_states
@@ -107,7 +118,19 @@ func (s *ResearchStateStore) ListBySession(ctx context.Context, sessionID string
 		}
 		out = append(out, st)
 	}
-	return out, convertStateErr(rows.Err())
+	if err := rows.Err(); err != nil {
+		return nil, convertStateErr(err)
+	}
+	// 逐条补齐集合（rows 必须先关闭，避免嵌套查询占用同一连接）。
+	if err := rows.Close(); err != nil {
+		return nil, convertStateErr(err)
+	}
+	for _, st := range out {
+		if err := s.loadCollections(ctx, st); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // AddRequirement 追加一条用户需求（去重与空串判断交给 State.AddRequirement）。
@@ -214,39 +237,6 @@ func (s *ResearchStateStore) StopCommits(_ context.Context, taskID string) {
 // ResumeCommits 重新开启提交门控。
 func (s *ResearchStateStore) ResumeCommits(_ context.Context, taskID string) {
 	s.gate.open(taskID)
-}
-
-// ─── 尚未实现（阶段 4/5）──────────────────────────────────────────────────
-//
-// 显式返回 ErrNotImplemented：绝不能返回 nil 让调用方误以为已落库。
-
-// Commit 追加一批 Result + Finding（阶段 4 实现）。
-func (s *ResearchStateStore) Commit(ctx context.Context, taskID string, in researchstate.CommitInput) error {
-	if !s.gate.accepting(taskID) {
-		return researchstate.ErrNotAccepting
-	}
-	return fmt.Errorf("%w: Commit (stage 4)", researchstate.ErrNotImplemented)
-}
-
-// RevokeResult 撤销已提交的 Result（阶段 4 实现）。
-func (s *ResearchStateStore) RevokeResult(ctx context.Context, taskID, assignmentID, reason string) (int, error) {
-	return 0, fmt.Errorf("%w: RevokeResult (stage 4)", researchstate.ErrNotImplemented)
-}
-
-// AppendResult 仅追加一条 Result（阶段 4 实现）。
-func (s *ResearchStateStore) AppendResult(ctx context.Context, taskID string, in researchstate.CommitInput) error {
-	return fmt.Errorf("%w: AppendResult (stage 4)", researchstate.ErrNotImplemented)
-}
-
-// AccumulateInterruptedContext 累积被打断的原文（阶段 4 实现，需 TEXT 拼接）。
-func (s *ResearchStateStore) AccumulateInterruptedContext(ctx context.Context, taskID, text string) error {
-	return fmt.Errorf("%w: AccumulateInterruptedContext (stage 4)",
-		researchstate.ErrNotImplemented)
-}
-
-// AppendMessage 追加一条对话历史（阶段 4 实现）。
-func (s *ResearchStateStore) AppendMessage(ctx context.Context, taskID string, role researchstate.MessageRole, content string) error {
-	return fmt.Errorf("%w: AppendMessage (stage 4)", researchstate.ErrNotImplemented)
 }
 
 // ─── 内部辅助 ───────────────────────────────────────────────────────────────

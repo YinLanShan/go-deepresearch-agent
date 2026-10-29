@@ -349,22 +349,28 @@ func TestPGStateCommitGate(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	// 阶段 3 的 Commit 未实现，但门控必须先于实现生效。
-	err := store.Commit(ctx, task.ID, researchstate.CommitInput{})
-	if !errors.Is(err, researchstate.ErrNotImplemented) {
-		t.Fatalf("open gate: want ErrNotImplemented, got %v", err)
+	// 门控开启时允许提交。
+	if err := store.Commit(ctx, task.ID, researchstate.CommitInput{
+		Results: []researchstate.ResultInput{{AssignmentID: assignmentID(1), Content: "证据"}},
+	}); err != nil {
+		t.Fatalf("open gate should accept commit: %v", err)
 	}
 
+	// 关闭门控后拒绝提交。
 	store.StopCommits(ctx, task.ID)
-	err = store.Commit(ctx, task.ID, researchstate.CommitInput{})
+	err := store.Commit(ctx, task.ID, researchstate.CommitInput{
+		Results: []researchstate.ResultInput{{AssignmentID: assignmentID(2), Content: "证据2"}},
+	})
 	if !errors.Is(err, researchstate.ErrNotAccepting) {
 		t.Fatalf("closed gate: want ErrNotAccepting, got %v", err)
 	}
 
+	// 重新开启后恢复提交。
 	store.ResumeCommits(ctx, task.ID)
-	err = store.Commit(ctx, task.ID, researchstate.CommitInput{})
-	if !errors.Is(err, researchstate.ErrNotImplemented) {
-		t.Fatalf("reopened gate: want ErrNotImplemented, got %v", err)
+	if err := store.Commit(ctx, task.ID, researchstate.CommitInput{
+		Results: []researchstate.ResultInput{{AssignmentID: assignmentID(3), Content: "证据3"}},
+	}); err != nil {
+		t.Fatalf("reopened gate should accept commit: %v", err)
 	}
 }
 
@@ -373,24 +379,28 @@ func TestPGStateGateSelfHealing(t *testing.T) {
 	store := NewResearchStateStore(db)
 	ctx := context.Background()
 
-	// 对不存在的 Task 关闭门控也必须"成功"（派生状态自愈语义）。
+	// 对不存在的 Task 关闭门控也必须"成功"（派生状态自愈语义），
+	// 且该门控能在提交时生效（先于 ErrNotFound 检查）。
 	store.StopCommits(ctx, "no-such-task")
 	if err := store.Commit(ctx, "no-such-task", researchstate.CommitInput{}); !errors.Is(err, researchstate.ErrNotAccepting) {
 		t.Fatalf("want ErrNotAccepting, got %v", err)
 	}
 	store.ResumeCommits(ctx, "no-such-task")
-	if err := store.Commit(ctx, "no-such-task", researchstate.CommitInput{}); !errors.Is(err, researchstate.ErrNotImplemented) {
-		t.Fatalf("want ErrNotImplemented, got %v", err)
+	// 门控开启后，才会因为状态不存在而报 ErrNotFound。
+	if err := store.Commit(ctx, "no-such-task", researchstate.CommitInput{}); !errors.Is(err, researchstate.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
 
-// ─── 未实现的方法必须显式报错 ───────────────────────────────────────────────
+// ─── 阶段 4：子表与业务操作 ─────────────────────────────────────────────────
 
-func TestPGStateUnimplementedMethodsFailLoudly(t *testing.T) {
+// TestPGStateUnimplementedRemoved 确认阶段 4 的方法已实现（不再返回 ErrNotImplemented）。
+func TestPGStateUnimplementedRemoved(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
 	store := NewResearchStateStore(db)
 
+	// 对不存在的状态，所有方法都应报 ErrNotFound，而不是 ErrNotImplemented。
 	checks := []struct {
 		name string
 		err  error
@@ -404,8 +414,11 @@ func TestPGStateUnimplementedMethodsFailLoudly(t *testing.T) {
 		{"AppendMessage", store.AppendMessage(ctx, "t", researchstate.RoleUser, "x")},
 	}
 	for _, c := range checks {
-		if !errors.Is(c.err, researchstate.ErrNotImplemented) {
-			t.Fatalf("%s: want ErrNotImplemented, got %v", c.name, c.err)
+		if errors.Is(c.err, researchstate.ErrNotImplemented) {
+			t.Fatalf("%s: should be implemented in stage 4, got %v", c.name, c.err)
+		}
+		if !errors.Is(c.err, researchstate.ErrNotFound) {
+			t.Fatalf("%s: want ErrNotFound, got %v", c.name, c.err)
 		}
 	}
 }
@@ -442,9 +455,10 @@ func TestPGStateDeleteBySession(t *testing.T) {
 	if _, err := store.Get(ctx, task.ID); !errors.Is(err, researchstate.ErrNotFound) {
 		t.Fatalf("state should be deleted, got %v", err)
 	}
-	// 门控记录已清理 → 重新允许提交（会走到未实现的 Commit）。
-	if err := store.Commit(ctx, task.ID, researchstate.CommitInput{}); !errors.Is(err, researchstate.ErrNotImplemented) {
-		t.Fatalf("gate should be forgotten, got %v", err)
+	// 门控记录已清理 → 门控重新放行，因此报的是 ErrNotFound（状态已删），
+	// 而不是 ErrNotAccepting（门控残留）。
+	if err := store.Commit(ctx, task.ID, researchstate.CommitInput{}); !errors.Is(err, researchstate.ErrNotFound) {
+		t.Fatalf("gate should be forgotten (expect ErrNotFound), got %v", err)
 	}
 }
 

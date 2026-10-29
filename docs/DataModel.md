@@ -525,7 +525,7 @@ postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable&application_name=dra
 | **1** | 建表脚本 + Session/Task/RunTask 三个存储 | 阶段 0 | ✅ 已完成 |
 | **2** | Assignment / Work 存储（级联删除） | 阶段 1 | ✅ 已完成 |
 | **3** | ResearchState 标量部分 + Conclusion | 阶段 1 | ✅ 已完成（不含子表集合，未接入 Runtime） |
-| **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 | ⬜ 待做 |
+| **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 | ✅ 已完成 |
 | **5** | 撤销与 Commit 的乐观锁 | 阶段 4 | ⬜ 待做 |
 | **6** | 双实现并行 + 一致性测试 | 全部 | ⬜ 待做 |
 | **7** | Checkpoint（可选，建议先不做） | —— | ⬜ 待做 |
@@ -666,6 +666,65 @@ func (s *ResearchStateStore) Commit(...) error {
 **一个语义澄清**：`State.AddRequirement` **不去重**，只忽略空白内容。
 需求是"按时间顺序累积"的复数语义，重复表达是合法的。
 `requirements` 用 `TEXT[]` 而非 `SET` 正是为了保留这种累积顺序。
+
+### 阶段 4 已落地的内容
+
+| 文件 | 内容 |
+|---|---|
+| `internal/storage/postgres/migrations/0002_ordering.sql` | 子表补 `seq` 插入顺序列 |
+| `internal/storage/postgres/researchstate_commit.go` | Commit / RevokeResult / AppendResult / Accumulate / AppendMessage + loadCollections |
+| `internal/storage/postgres/researchstate_commit_test.go` | 18 个集成测试 |
+
+`Get` / `GetLatestBySession` / `ListBySession` 现在会载入四张子表，
+返回**完整**的 State。阶段 3 的"未实现"占位方法已全部替换为真实实现
+（`ErrNotImplemented` 保留在 `researchstate` 包中，供未来其他实现使用）。
+
+#### 与内存实现对齐的 6 个易错语义
+
+| # | 语义 | 说明 |
+|---|---|---|
+| 1 | `turn = len(Findings) + 1` | **不是** `len(Results)+1` |
+| 2 | Commit 的 `Version` 只自增一次 | 与该批 Result 条数无关 |
+| 3 | 空白内容跳过 | 但 Commit 仍会自增 Version 并清空 InterruptedContext |
+| 4 | Revoke 未命中不自增 Version | 返回 `(0, nil)`，不写日志 |
+| 5 | AppendResult 的 `turn = len(Results)+1` | 逐条递增；Reason 固定 `"迟到产物"` |
+| 6 | 门控适用范围不同 | Commit 受限；Revoke / AppendResult 不受限 |
+
+#### 为什么需要 0002_ordering.sql
+
+Commit 在一个事务内批量插入多条 Result，它们的 `created_at` **完全相同**。
+仅靠 `created_at ASC, id ASC` 排序无法稳定还原插入顺序
+（`id` 是随机 hex），而内存实现按切片追加顺序返回。
+
+因此为 `research_results` / `research_findings` 增加：
+
+```sql
+seq BIGINT GENERATED ALWAYS AS IDENTITY
+```
+
+读取时按 `seq` 升序，与内存实现的插入顺序语义完全对齐。
+这个问题是集成测试先暴露出来的（断言 `Results[0]` 内容时顺序错乱）。
+
+#### RevokeResult 使用 RETURNING
+
+```sql
+DELETE FROM research_results
+WHERE state_id = $1 AND assignment_id = $2
+RETURNING id, turn, content;
+```
+
+一条语句完成"删除 + 拿到被删内容"，随后写入 `commit_log`
+（保留原文用于审计）。全程一个事务，不留中间态。
+
+#### 事务边界
+
+| 操作 | 事务内动作 |
+|---|---|
+| `Commit` | 锁 state → 插 Results → 插 Finding → version++ → 清 InterruptedContext → 写 CommitLog |
+| `RevokeResult` | 锁 state → DELETE RETURNING → version++ → 写 CommitLog |
+| `AppendResult` | 锁 state → 插 Results → version++ → 写 CommitLog |
+
+`SELECT ... FOR UPDATE` 保证 `version` 自增与 `turn` 计算基于最新值。
 
 ---
 
