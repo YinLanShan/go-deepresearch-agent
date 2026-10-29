@@ -1,11 +1,12 @@
-# 数据模型设计（MySQL 持久化）
+# 数据模型设计（PostgreSQL 持久化）
 
 本文件定义持久化层的数据模型，是**实现前的契约**：表结构、字段映射、
 JSON 与拆表的边界、事务与并发约定。
 
-- 目标数据库：MySQL 8.0+
-- 字符集：`utf8mb4` / `utf8mb4_0900_ai_ci`（支持 emoji 与多语言）
-- 引擎：InnoDB（需要事务与外键）
+- 目标数据库：**PostgreSQL 14+**（本地验证版本 18.3）
+- 驱动：`github.com/jackc/pgx/v5/stdlib`（标准 `database/sql` 接口 + pgx 内核）
+- 编码：`UTF8`（数据库级）
+- 时区：`TIMESTAMPTZ`，由数据库负责时区语义
 
 ---
 
@@ -14,27 +15,46 @@ JSON 与拆表的边界、事务与并发约定。
 | 原则 | 说明 |
 |---|---|
 | **内存实现保留** | 作为参考实现与测试替身，180 个测试仍跑内存 |
-| **ID 由业务层生成** | 沿用 `ids.New()` 的 32 位 hex 字符串，表用 `CHAR(32)` |
+| **ID 由业务层生成** | 沿用 `ids.New()` 的 32 位 hex 字符串，表用 `TEXT` |
 | **硬删除 + 外键级联** | 与当前内存实现的语义一致，不做软删除 |
 | **每个 Store 方法一个事务** | 跨 Store 的级联由上层（Runtime）协调 |
-| **时间统一 UTC** | `DATETIME(3)` 毫秒精度，应用层负责时区转换 |
+| **时间统一 `TIMESTAMPTZ`** | 由数据库处理时区，应用层无需手工换算 |
 | **JSON 列用于"整体读写"的集合** | 需要按字段增删的集合才拆表 |
+| **原生类型优先** | `TEXT[]` 而非 JSON 存字符串数组；`BOOLEAN` 而非 0/1 |
 
 ### JSON 与拆表的判断标准
 
-> **需要按元素级增删改 → 拆表；只需整体读写 → JSON。**
+> **需要按元素级增删改 → 拆表；只需整体读写 → 集合类型列。**
 
 据此：
 
 | 集合 | 现状需求 | 决定 |
 |---|---|---|
 | `Results` | **按 AssignmentID 精确删除**（撤销功能） | **拆表** |
-| `Findings` | 只追加，整体读 | 拆表（与 Results 同生命周期，便于 JOIN 与分页） |
-| `CommitLog` | 只追加，按序读 | **拆表**（审计需要按 op / 时间查询） |
+| `Findings` | 只追加，整体读 | 拆表（与 Results 同生命周期） |
+| `CommitLog` | 只追加，按序读 | **拆表**（审计需按 op / 时间查询） |
 | `History` | 只追加，可能很长，前端分页 | **拆表** |
-| `Requirements` | 只追加，整体读 | JSON |
-| `RelatedNodes` | 创建时写入，之后只读 | JSON |
+| `Requirements` | 只追加，整体读，`[]string` | **`TEXT[]`** |
+| `RelatedNodes` | 创建时写入，之后只读，嵌套结构 | `JSONB` |
 | `Conclusion` / `InterruptedContext` | 标量 | 普通列 |
+
+**为什么 `Requirements` 用 `TEXT[]` 而不是 `JSONB`：**
+
+它是纯粹的字符串数组、无嵌套，用原生数组可：
+
+```sql
+-- 按关键词检索需求（JSON 做不到这么直接）
+SELECT * FROM research_states
+WHERE EXISTS (SELECT 1 FROM unnest(requirements) r WHERE r ILIKE '%Eino%');
+
+-- 统计每个节点的需求条数
+SELECT task_id, cardinality(requirements) FROM research_states;
+```
+
+**为什么 `RelatedNodes` 用 `JSONB`：**
+
+它是嵌套结构（每个节点含 requirements / results / findings / conclusion），
+拆表会产生 4 层嵌套关系，收益远低于复杂度。`JSONB` 还能建 GIN 索引备用。
 
 ---
 
@@ -68,38 +88,36 @@ sessions
 
 ---
 
-## 2. 建表 SQL
+## 2. 建表 SQL（PostgreSQL）
 
 ### 2.1 sessions
 
 ```sql
 CREATE TABLE sessions (
-  id         CHAR(32)     NOT NULL,
-  title      VARCHAR(255) NOT NULL DEFAULT '',
-  created_at DATETIME(3)  NOT NULL,
-  updated_at DATETIME(3)  NOT NULL,
-  PRIMARY KEY (id),
-  KEY idx_created (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  id         TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  title      TEXT        NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_sessions_created ON sessions (created_at);
 ```
 
 ### 2.2 tasks
 
 ```sql
 CREATE TABLE tasks (
-  id          CHAR(32)     NOT NULL,
-  session_id  CHAR(32)     NOT NULL,
-  user_id     VARCHAR(64)  NOT NULL DEFAULT '',
-  title       VARCHAR(255) NOT NULL DEFAULT '',
-  description TEXT         NULL,
-  enabled     TINYINT(1)   NOT NULL DEFAULT 0,
-  created_at  DATETIME(3)  NOT NULL,
-  updated_at  DATETIME(3)  NOT NULL,
-  PRIMARY KEY (id),
-  KEY idx_session (session_id, created_at),
-  CONSTRAINT fk_tasks_session FOREIGN KEY (session_id)
-    REFERENCES sessions (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  id          TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  session_id  TEXT    NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+  user_id     TEXT        NOT NULL DEFAULT '',
+  title       TEXT        NOT NULL DEFAULT '',
+  description TEXT,
+  enabled     BOOLEAN     NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL,
+  updated_at  TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_tasks_session ON tasks (session_id, created_at);
 ```
 
 `enabled` 用于"Task 是否允许启动新的执行"，与 RunTask 状态相互独立。
@@ -108,148 +126,140 @@ CREATE TABLE tasks (
 
 ```sql
 CREATE TABLE run_tasks (
-  id            CHAR(32)    NOT NULL,
-  task_id       CHAR(32)    NOT NULL,
-  status        VARCHAR(16) NOT NULL,
-  turn          INT         NOT NULL DEFAULT 0,
+  id            TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  task_id       TEXT    NOT NULL UNIQUE REFERENCES tasks (id) ON DELETE CASCADE,
+  status        TEXT        NOT NULL,
+  turn          INTEGER     NOT NULL DEFAULT 0,
   state_version BIGINT      NOT NULL DEFAULT 0,
-  created_at    DATETIME(3) NOT NULL,
-  updated_at    DATETIME(3) NOT NULL,
-  PRIMARY KEY (id),
-  -- 一个 Task 同时只有一个 RunTask（重建会替换）
-  UNIQUE KEY uk_task (task_id),
-  KEY idx_status (status),
-  CONSTRAINT fk_runtasks_task FOREIGN KEY (task_id)
-    REFERENCES tasks (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  created_at    TIMESTAMPTZ NOT NULL,
+  updated_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_run_tasks_status ON run_tasks (status);
+
+-- 只索引"活跃"运行，加速全局单例检查
+CREATE INDEX idx_run_tasks_active ON run_tasks (status)
+  WHERE status IN ('running', 'waiting');
 ```
 
 `status` 取值：`created` / `running` / `waiting` / `stopped` / `finished`。
+
+**部分索引**：PostgreSQL 支持 `WHERE` 子句，只索引活跃记录，
+比 MySQL 需要全表索引更省空间。
 
 ### 2.4 research_states
 
 ```sql
 CREATE TABLE research_states (
-  id                  CHAR(32)     NOT NULL,
-  task_id             CHAR(32)     NOT NULL,
-  session_id          CHAR(32)     NOT NULL,
-  ordinal             INT          NOT NULL DEFAULT 1,
+  id                  TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  task_id             TEXT    NOT NULL UNIQUE REFERENCES tasks (id) ON DELETE CASCADE,
+  session_id          TEXT    NOT NULL,
+  ordinal             INTEGER     NOT NULL DEFAULT 1,
 
   -- 标量
-  conclusion          MEDIUMTEXT   NULL,
-  interrupted_context MEDIUMTEXT   NULL,
+  conclusion          TEXT,
+  interrupted_context TEXT,
 
-  -- 整体读写的集合（只追加，不按元素增删）
-  requirements        JSON         NULL,   -- string[]
-  related_nodes       JSON         NULL,   -- RelatedNode[]
+  -- 整体读写的集合
+  requirements        TEXT[]      NOT NULL DEFAULT '{}',   -- string[]
+  related_nodes       JSONB       NOT NULL DEFAULT '[]',   -- RelatedNode[]
 
-  version             BIGINT       NOT NULL DEFAULT 0,
-  created_at          DATETIME(3)  NOT NULL,
-  updated_at          DATETIME(3)  NOT NULL,
+  version             BIGINT      NOT NULL DEFAULT 0,
+  created_at          TIMESTAMPTZ NOT NULL,
+  updated_at          TIMESTAMPTZ NOT NULL
+);
 
-  PRIMARY KEY (id),
-  -- 一个 Task 一份 ResearchState
-  UNIQUE KEY uk_task (task_id),
-  KEY idx_session_ordinal (session_id, ordinal),
-  CONSTRAINT fk_states_task FOREIGN KEY (task_id)
-    REFERENCES tasks (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+CREATE INDEX idx_states_session ON research_states (session_id, ordinal);
+
+-- 需要按需求内容检索时启用
+CREATE INDEX idx_states_requirements ON research_states USING GIN (requirements);
+CREATE INDEX idx_states_related ON research_states USING GIN (related_nodes);
 ```
 
-**为什么 `requirements` / `related_nodes` 用 JSON：**
-
-- `requirements`：只追加、整体读进提示词，无需按元素查询；
-- `related_nodes`：Task 创建时一次性写入的快照，之后只读。
-
-**为什么不把 `results` 放这里：** 见 2.5。
+**`TEXT[]` 与 `JSONB` 都配了 GIN 索引**，当前不用，但未来加检索时无需改表。
 
 ### 2.5 research_results
 
 ```sql
 CREATE TABLE research_results (
-  id            CHAR(32)    NOT NULL,
-  state_id      CHAR(32)    NOT NULL,
-  assignment_id CHAR(32)    NOT NULL DEFAULT '',
-  turn          INT         NOT NULL,
-  status        VARCHAR(16) NOT NULL,
-  content       MEDIUMTEXT  NOT NULL,
-  created_at    DATETIME(3) NOT NULL,
-  PRIMARY KEY (id),
-  -- 撤销功能：按 assignment_id 精确删除
-  KEY idx_state_assignment (state_id, assignment_id),
-  KEY idx_state_turn (state_id, turn),
-  CONSTRAINT fk_results_state FOREIGN KEY (state_id)
-    REFERENCES research_states (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  id            TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  state_id      TEXT    NOT NULL REFERENCES research_states (id) ON DELETE CASCADE,
+  assignment_id TEXT    NOT NULL DEFAULT '',
+  turn          INTEGER     NOT NULL,
+  status        TEXT        NOT NULL,
+  content       TEXT        NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_results_state_assignment ON research_results (state_id, assignment_id);
+CREATE INDEX idx_results_state_turn ON research_results (state_id, turn);
 ```
 
-**关键：`assignment_id` 必须有索引。**
+**关键：`(state_id, assignment_id)` 索引支撑撤销。**
 
-撤销流程 `RevokeResult(taskID, assignmentID, reason)` 在这里就是：
+撤销流程 `RevokeResult(taskID, assignmentID, reason)`：
 
 ```sql
 DELETE FROM research_results
-WHERE state_id = (SELECT id FROM research_states WHERE task_id = ?)
-  AND assignment_id = ?;
+WHERE state_id = (SELECT id FROM research_states WHERE task_id = $1)
+  AND assignment_id = $2
+RETURNING id, assignment_id, turn, content;   -- ← PG 的 RETURNING 直接拿到被删行
 ```
+
+**`RETURNING` 是 PostgreSQL 的关键优势**：撤销需要把被删内容写进
+`commit_log`，一条语句即可完成，无需先查后删。
 
 ### 2.6 research_findings
 
 ```sql
 CREATE TABLE research_findings (
-  id         CHAR(32)    NOT NULL,
-  state_id   CHAR(32)    NOT NULL,
-  turn       INT         NOT NULL,
-  content    MEDIUMTEXT  NOT NULL,
-  created_at DATETIME(3) NOT NULL,
-  PRIMARY KEY (id),
-  KEY idx_state_turn (state_id, turn),
-  CONSTRAINT fk_findings_state FOREIGN KEY (state_id)
-    REFERENCES research_states (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  id         TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  state_id   TEXT    NOT NULL REFERENCES research_states (id) ON DELETE CASCADE,
+  turn       INTEGER     NOT NULL,
+  content    TEXT        NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_findings_state_turn ON research_findings (state_id, turn);
 ```
 
 ### 2.7 research_commit_log
 
 ```sql
 CREATE TABLE research_commit_log (
-  seq           BIGINT      NOT NULL AUTO_INCREMENT,
-  state_id      CHAR(32)    NOT NULL,
-  op            VARCHAR(32) NOT NULL,
-  turn          INT         NOT NULL DEFAULT 0,
-  assignment_id CHAR(32)    NOT NULL DEFAULT '',
-  result_id     CHAR(32)    NOT NULL DEFAULT '',
-  content       MEDIUMTEXT  NULL,
-  reason        VARCHAR(512) NOT NULL DEFAULT '',
+  seq           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  state_id      TEXT    NOT NULL REFERENCES research_states (id) ON DELETE CASCADE,
+  op            TEXT        NOT NULL,
+  turn          INTEGER     NOT NULL DEFAULT 0,
+  assignment_id TEXT    NOT NULL DEFAULT '',
+  result_id     TEXT    NOT NULL DEFAULT '',
+  content       TEXT,
+  reason        TEXT        NOT NULL DEFAULT '',
   version       BIGINT      NOT NULL,
-  created_at    DATETIME(3) NOT NULL,
-  PRIMARY KEY (seq),
-  KEY idx_state (state_id, seq),
-  KEY idx_op_time (op, created_at),
-  CONSTRAINT fk_commitlog_state FOREIGN KEY (state_id)
-    REFERENCES research_states (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  created_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_commitlog_state ON research_commit_log (state_id, seq);
+CREATE INDEX idx_commitlog_op ON research_commit_log (op, created_at DESC);
 ```
 
 `op` 取值：`commit_result` / `commit_finding` / `revoke_result` / `set_conclusion`。
 
-**注意：`seq` 是全局自增，不再使用业务层的序号。**
-业务层的 `CommitRecord.Seq` 读出来后按 `state_id` 内部顺序重新编号。
+**`seq` 使用 `GENERATED ALWAYS AS IDENTITY`**（SQL 标准，优于 `BIGSERIAL`）。
+业务层的 `CommitRecord.Seq` 读出后按 `state_id` 内部顺序重新编号。
 
 ### 2.8 research_messages
 
 ```sql
 CREATE TABLE research_messages (
-  seq        BIGINT      NOT NULL AUTO_INCREMENT,
-  state_id   CHAR(32)    NOT NULL,
-  role       VARCHAR(16) NOT NULL,
-  content    MEDIUMTEXT  NOT NULL,
-  created_at DATETIME(3) NOT NULL,
-  PRIMARY KEY (seq),
-  KEY idx_state (state_id, seq),
-  CONSTRAINT fk_messages_state FOREIGN KEY (state_id)
-    REFERENCES research_states (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  seq        BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  state_id   TEXT    NOT NULL REFERENCES research_states (id) ON DELETE CASCADE,
+  role       TEXT        NOT NULL,
+  content    TEXT        NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_messages_state ON research_messages (state_id, seq);
 ```
 
 `role` 取值：`user` / `assistant`。
@@ -258,82 +268,86 @@ CREATE TABLE research_messages (
 
 ```sql
 CREATE TABLE assignments (
-  id          CHAR(32)     NOT NULL,
-  session_id  CHAR(32)     NOT NULL,
-  task_id     CHAR(32)     NOT NULL,
-  run_task_id CHAR(32)     NOT NULL,
-  goal        TEXT         NOT NULL,
-  status      VARCHAR(24)  NOT NULL,
-  attempt     INT          NOT NULL DEFAULT 0,
-  result      MEDIUMTEXT   NULL,
-  err         TEXT         NULL,
-  created_at  DATETIME(3)  NOT NULL,
-  updated_at  DATETIME(3)  NOT NULL,
-  finished_at DATETIME(3)  NULL,
-  PRIMARY KEY (id),
-  KEY idx_run_task (run_task_id, created_at),
-  KEY idx_status (status),
-  CONSTRAINT fk_assignments_runtask FOREIGN KEY (run_task_id)
-    REFERENCES run_tasks (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  id          TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  session_id  TEXT    NOT NULL,
+  task_id     TEXT    NOT NULL,
+  run_task_id TEXT    NOT NULL REFERENCES run_tasks (id) ON DELETE CASCADE,
+  goal        TEXT        NOT NULL,
+  status      TEXT        NOT NULL,
+  attempt     INTEGER     NOT NULL DEFAULT 0,
+  result      TEXT,
+  err         TEXT,
+  created_at  TIMESTAMPTZ NOT NULL,
+  updated_at  TIMESTAMPTZ NOT NULL,
+  finished_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_assignments_runtask ON assignments (run_task_id, created_at);
+CREATE INDEX idx_assignments_status ON assignments (status);
+
+-- 加速"是否还有未完成 Assignment"的判定
+CREATE INDEX idx_assignments_pending ON assignments (run_task_id)
+  WHERE status NOT IN ('completed', 'failed', 'cancelled');
 ```
 
 `status` 取值：`pending` / `scheduled` / `running` / `awaiting_result` /
 `completed` / `failed` / `cancelled`。
 
+**部分索引 `idx_assignments_pending`** 直接支撑 `HasPendingAssignments`
+与 `maybePublishSettled` 的热路径查询。
+
 ### 2.10 works
 
 ```sql
 CREATE TABLE works (
-  id            CHAR(32)     NOT NULL,
-  assignment_id CHAR(32)     NOT NULL,
-  session_id    CHAR(32)     NOT NULL,
-  task_id       CHAR(32)     NOT NULL,
-  run_task_id   CHAR(32)     NOT NULL,
-  goal          TEXT         NOT NULL,
-  status        VARCHAR(16)  NOT NULL,
-  constraint_json JSON       NULL,   -- WorkConstraint，当前仅预留
-  worker_id     VARCHAR(64)  NOT NULL DEFAULT '',
-  attempt       INT          NOT NULL DEFAULT 1,
-  stage         VARCHAR(32)  NOT NULL DEFAULT '',
-  detail        VARCHAR(512) NOT NULL DEFAULT '',
-  result        MEDIUMTEXT   NULL,
-  err           TEXT         NULL,
-  started_at    DATETIME(3)  NULL,
-  finished_at   DATETIME(3)  NULL,
-  created_at    DATETIME(3)  NOT NULL,
-  updated_at    DATETIME(3)  NOT NULL,
-  PRIMARY KEY (id),
-  KEY idx_run_task (run_task_id, created_at),
-  KEY idx_assignment (assignment_id),
-  CONSTRAINT fk_works_assignment FOREIGN KEY (assignment_id)
-    REFERENCES assignments (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  id            TEXT    PRIMARY KEY CHECK (length(id) = 32),
+  assignment_id TEXT    NOT NULL REFERENCES assignments (id) ON DELETE CASCADE,
+  session_id    TEXT    NOT NULL,
+  task_id       TEXT    NOT NULL,
+  run_task_id   TEXT    NOT NULL,
+  goal          TEXT        NOT NULL,
+  status        TEXT        NOT NULL,
+  constraint_data JSONB,             -- WorkConstraint，当前仅预留
+  worker_id     TEXT        NOT NULL DEFAULT '',
+  attempt       INTEGER     NOT NULL DEFAULT 1,
+  stage         TEXT        NOT NULL DEFAULT '',
+  detail        TEXT        NOT NULL DEFAULT '',
+  result        TEXT,
+  err           TEXT,
+  started_at    TIMESTAMPTZ,
+  finished_at   TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL,
+  updated_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_works_runtask ON works (run_task_id, created_at);
+CREATE INDEX idx_works_assignment ON works (assignment_id);
 ```
 
 `status` 取值：`pending` / `running` / `succeeded` / `failed` /
 `cancelled` / `timedout`。
 
-### 2.11 checkpoints（可选）
+> `constraint` 是 PostgreSQL 保留字，列名改用 `constraint_data`。
+
+### 2.11 checkpoints（可选，建议不启用）
 
 ```sql
 CREATE TABLE checkpoints (
-  checkpoint_id VARCHAR(128) NOT NULL,
-  data          LONGBLOB     NOT NULL,
-  updated_at    DATETIME(3)  NOT NULL,
-  PRIMARY KEY (checkpoint_id),
-  KEY idx_updated (updated_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  checkpoint_id TEXT        PRIMARY KEY,
+  data          BYTEA       NOT NULL,
+  updated_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_checkpoints_updated ON checkpoints (updated_at);
 ```
 
-**建议不放 MySQL**，理由：
+**建议不放 PostgreSQL**，理由：
 
 - Eino checkpoint 是 gob 编码，可能几 MB；
 - 生命周期极短（中断 → 恢复即删除）；
-- 高频读写会拖慢主库。
+- 高频读写会污染主库的 WAL。
 
-**替代方案**：Redis（带 TTL）或本地文件。若必须用 MySQL，
-请使用 `LONGBLOB` 并配合定期清理任务。
+**替代方案**：Redis（带 TTL）或本地文件。若必须入库，请配合定期清理。
 
 ---
 
@@ -343,8 +357,8 @@ CREATE TABLE checkpoints (
 
 ```
 research_states (1 行)
-├── requirement_list   → requirements JSON
-├── related_nodes      → related_nodes JSON
+├── requirements       → requirements TEXT[]
+├── related_nodes      → related_nodes JSONB
 ├── conclusion         → conclusion 列
 ├── interrupted_context→ interrupted_context 列
 ├── results[]          → research_results 表（N 行）
@@ -353,34 +367,68 @@ research_states (1 行)
 └── history[]          → research_messages 表（N 行）
 ```
 
-**读取 `Get(taskID)` 需要 4 次额外查询**（results/findings/commitlog/messages）。
+**读取 `Get(taskID)` 需要 4 次额外查询。**
 
 优化建议：
 
-- `Get` 常用于构建提示词，需要全部数据 → 一次 4 表 JOIN 或 4 次查询均可；
-- 前端列表页只需要标量 → 单独提供 `GetMeta`。
+- `Get` 常用于构建提示词，需要全部数据 → 4 次查询可接受（各带索引）；
+- 前端列表页只需要标量 → 后续可加 `GetMeta`。
 
 ### 3.2 时间字段
 
-| Go | MySQL | 说明 |
+| Go | PostgreSQL | 说明 |
 |---|---|---|
-| `time.Time`（必填） | `DATETIME(3) NOT NULL` | createdAt / updatedAt |
-| `time.Time`（可空） | `DATETIME(3) NULL` | finishedAt / startedAt |
-| 零值 `time.Time{}` | `NULL` | 不要存 `0001-01-01`，那是 Go 零值的误存 |
+| `time.Time`（必填） | `TIMESTAMPTZ NOT NULL` | createdAt / updatedAt |
+| `time.Time`（可空） | `TIMESTAMPTZ` | finishedAt / startedAt |
+| 零值 `time.Time{}` | `NULL` | 不要存 `0001-01-01` |
 
 > **重要**：当前内存实现里 `FinishedAt` 零值会序列化成
-> `"0001-01-01T00:00:00Z"`。MySQL 实现应存 `NULL`，
+> `"0001-01-01T00:00:00Z"`。PG 实现应存 `NULL`，
 > 读取时再转回零值，避免前端显示异常时间。
+
+**`TIMESTAMPTZ` 的语义**：存储为 UTC，读取时返回带时区的 `time.Time`。
+Go 的 `pgx` 驱动会自动处理，无需手工 `loc=UTC`。
 
 ### 3.3 枚举字段
 
-全部用 `VARCHAR` 而非 `ENUM`：
+全部用 `TEXT` 而非 PG 的 `ENUM` 类型：
 
-- 便于新增状态而不改表结构；
+- PG 的 `ENUM` 增删值需要 `ALTER TYPE`，迁移成本高；
 - 应用层已有 `IsTerminal()` 等判断；
 - 加索引后查询性能足够。
 
-**读取时需校验**：非法值应返回错误而不是静默接受。
+**可选增强**：用 `CHECK` 约束保证取值合法。
+
+```sql
+status TEXT NOT NULL
+  CHECK (status IN ('pending','scheduled','running','awaiting_result',
+                    'completed','failed','cancelled'))
+```
+
+我建议**加 CHECK**——PG 的约束校验开销很小，能防止脏数据。
+
+### 3.4 Go 类型映射（pgx）
+
+| PG 类型 | Go 类型 | 备注 |
+|---|---|---|
+| `TEXT` | `string` | pgx 会把 `CHAR` 补空格，**建议改用 `TEXT`**，见下 |
+| `TEXT` | `string` | |
+| `INTEGER` | `int` | |
+| `BIGINT` | `int64` | |
+| `BOOLEAN` | `bool` | |
+| `TIMESTAMPTZ` | `time.Time` | |
+| `TEXT[]` | `[]string` | pgx 原生支持 |
+| `JSONB` | `[]byte` 或自定义类型 | 建议 `[]byte` + `encoding/json` |
+| `BYTEA` | `[]byte` | |
+
+本文件全部 ID 列使用 `TEXT` + `CHECK (length(...) = 32)`，而非 `CHAR(32)`。
+
+**原因**：PostgreSQL 的 `CHAR(n)` 是定长、会用空格补齐。
+虽然比较时忽略尾部空格，但**取出时可能带空格**，
+Go 侧拿到 `"abc...  "` 会导致 map 查找失败、ID 比较不等等隐蔽问题。
+
+`TEXT` + `CHECK` 既保证长度约束，又不会引入填充字符，
+且与 MySQL 的 `VARCHAR(32)` 语义一致，便于将来迁移。
 
 ---
 
@@ -392,11 +440,12 @@ research_states (1 行)
 
 ```sql
 UPDATE research_states
-SET version = version + 1, updated_at = ?
-WHERE id = ? AND version = ?;
+SET version = version + 1, updated_at = now()
+WHERE id = $1 AND version = $2
+RETURNING version;
 ```
 
-影响行数为 0 → 版本冲突。
+无返回行 → 版本冲突。
 
 **当前策略：记录日志但不重试。**
 
@@ -407,9 +456,9 @@ WHERE id = ? AND version = ?;
 
 | 操作 | 事务范围 |
 |---|---|
-| `Commit` | research_states 的 version + results 插入 + findings 插入 + commit_log 插入 = **一个事务** |
-| `RevokeResult` | results 删除 + commit_log 插入 + version 自增 = **一个事务** |
-| `DeleteByRunTask` | assignments + works 删除 = **一个事务** |
+| `Commit` | state version + results 插入 + findings 插入 + commit_log 插入 = **一个事务** |
+| `RevokeResult` | results 删除（RETURNING）+ commit_log 插入 + version 自增 = **一个事务** |
+| `DeleteByRunTask` | assignments + works 删除 = **一个事务**（可由外键级联一次完成） |
 | Session 级联删除 | 由 Runtime 逐层调用，每层各自事务（与当前协商流程一致） |
 
 ### 4.3 不该放进事务的
@@ -421,15 +470,29 @@ WHERE id = ? AND version = ?;
 
 当前语义是"派生状态、自愈、不返回 error"。
 
-**MySQL 实现建议：存在 `run_tasks` 表的一个列？** 不——门控针对的是
-ResearchState 的 Commit 能力，但它的生命周期与 RunTask 绑定。
-
-**建议做法**：内存态 + 启动时重建。
+**决定：不落库，保持内存态。**
 
 - 门控是纯运行时状态，进程重启后所有 RunTask 要么已终止、要么需恢复；
-- 持久化它反而要处理"重启后门控该默认开还是关"的歧义；
-- 因此：**不落库**，`StopCommits`/`ResumeCommits` 仍操作内存 map，
-  Store 构造时按 RunTask 状态初始化（终态 → 关闭，否则 → 开启）。
+- 持久化它要处理"重启后门控该默认开还是关"的歧义；
+- Store 构造时按 RunTask 状态初始化（终态 → 关闭，否则 → 开启）。
+
+### 4.5 连接池
+
+```go
+db, err := sql.Open("pgx", dsn)   // 使用 pgx/stdlib
+db.SetMaxOpenConns(20)
+db.SetMaxIdleConns(10)
+db.SetConnMaxLifetime(30 * time.Minute)
+db.SetConnMaxIdleTime(5 * time.Minute)
+```
+
+**DSN 示例：**
+
+```
+postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable&application_name=dra
+```
+
+生产环境请把 `sslmode` 改为 `require` 或 `verify-full`。
 
 ---
 
@@ -437,16 +500,20 @@ ResearchState 的 Commit 能力，但它的生命周期与 RunTask 绑定。
 
 | 索引 | 支撑的查询 |
 |---|---|
-| `tasks(session_id, created_at)` | 列出某 Session 的全部 Task（前端切换会话） |
-| `run_tasks(status)` | 全局单例运行检查（`disableOtherRunningSessions`） |
+| `tasks(session_id, created_at)` | 列出某 Session 的全部 Task |
+| `run_tasks(status)` | 全局单例运行检查 |
+| `run_tasks(status) WHERE active` | **部分索引**，只索引活跃运行 |
 | `research_states(session_id, ordinal)` | `GetLatestBySession` / `ListBySession` |
 | `research_results(state_id, assignment_id)` | **撤销时精确定位** |
 | `research_results(state_id, turn)` | 按轮次展示 |
-| `research_commit_log(op, created_at)` | 审计查询（"最近所有撤销"） |
+| `research_commit_log(op, created_at DESC)` | 审计查询（"最近所有撤销"） |
 | `assignments(run_task_id, created_at)` | 后台任务面板 |
-| `assignments(status)` | 查未完成 Assignment（`HasPendingAssignments`） |
+| `assignments(status) WHERE pending` | `HasPendingAssignments` 热路径 |
 | `works(run_task_id, created_at)` | 后台任务面板 |
 | `works(assignment_id)` | 查某 Assignment 的执行实例 |
+
+**部分索引是 PostgreSQL 的独有优势**：只索引需要的子集，
+索引体积更小、更新更快。
 
 ---
 
@@ -454,7 +521,8 @@ ResearchState 的 Commit 能力，但它的生命周期与 RunTask 绑定。
 
 | 阶段 | 内容 | 依赖 |
 |---|---|---|
-| **1** | 建表脚本 + Session/Task/RunTask 三个存储 | 无 |
+| **0** | 补 `storage.ErrAlreadyExists` 哨兵错误（内存实现也改） | 无 |
+| **1** | 建表脚本 + Session/Task/RunTask 三个存储 | 阶段 0 |
 | **2** | Assignment / Work 存储（级联删除） | 阶段 1 |
 | **3** | ResearchState 标量部分 + Conclusion | 阶段 1 |
 | **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 |
@@ -463,7 +531,7 @@ ResearchState 的 Commit 能力，但它的生命周期与 RunTask 绑定。
 | **7** | Checkpoint（可选，建议先不做） | —— |
 
 **每个阶段都应能独立跑通测试**：内存实现保持不变，
-MySQL 实现用同一批测试用例验证（通过 Store 接口抽象）。
+PG 实现用同一批测试用例验证（通过 Store 接口抽象）。
 
 ---
 
@@ -472,30 +540,30 @@ MySQL 实现用同一批测试用例验证（通过 Store 接口抽象）。
 | # | 问题 | 建议 |
 |---|---|---|
 | D1 | `History` 是否需要分页接口？ | 当前 `Get` 全量读；超过 1000 条再考虑 |
-| D2 | `ResearchState.Get` 是否拆成 `GetMeta` + `GetFull`？ | 先不拆，等前端列表页有性能问题再说 |
-| D3 | 是否需要 `research_results.status`（pending/committed）？ | 需要，当前 `Result.Pending` 语义要保留 |
-| D4 | 乐观锁冲突如何处理？ | 记日志，不重试（等真并发再议） |
-| D5 | Checkpoint 是否入 MySQL？ | **建议不入**，用 Redis 或文件 |
-| D6 | 是否需要数据迁移脚本（从内存导出）？ | 当前无生产数据，不需要 |
+| D2 | `ResearchState.Get` 是否拆成 `GetMeta` + `GetFull`？ | 先不拆，等有性能问题再说 |
+| D3 | 枚举字段是否加 `CHECK` 约束？ | **建议加**，开销小、防脏数据 |
+| D4 | 乐观锁冲突如何处理？ | 记日志，不重试 |
+| D5 | Checkpoint 是否入库？ | **建议不入**，用 Redis 或文件 |
+| D6 | 是否需要数据迁移脚本？ | 当前无生产数据，不需要 |
 
 ---
 
 ## 8. 与内存实现的语义对齐清单
 
-实现 MySQL 版时，以下行为**必须与内存实现一致**（已有测试覆盖）：
+实现 PG 版时，以下行为**必须与内存实现一致**（已有测试覆盖）：
 
-- [ ] `Create` 主键冲突 → 返回错误（`storage.ErrAlreadyExists`，见下方说明）
+- [ ] `Create` 主键冲突 → 返回 `storage.ErrAlreadyExists`（见下方说明）
 - [ ] `Update` 目标不存在 → 返回 `ErrNotFound`
 - [ ] `Delete` 目标不存在 → 返回 `ErrNotFound`（除级联删除外幂等）
-- [ ] `ListByRunTask` 返回**按插入顺序**（内存实现用 `seq` 切片维持插入序；
-      MySQL 版须用 `created_at` 升序 + 主键兜底，避免同毫秒插入时顺序不稳）
-- [ ] `Get` 返回的对象**修改后不影响存储**（内存实现靠深拷贝，MySQL 天然满足）
+- [ ] `ListByRunTask` 返回**按插入顺序**（内存实现用 `seq` 切片；
+      PG 版用 `created_at ASC, id ASC` 保证同毫秒时也稳定）
+- [ ] `Get` 返回的对象**修改后不影响存储**（内存实现靠深拷贝，PG 天然满足）
 - [ ] `RevokeResult` 返回被撤销的条数
 - [ ] `Commit` 在门控关闭时返回 `researchstate.ErrNotAccepting`
 - [ ] `SetConclusion` 会写 `commit_log`
-- [ ] 空 `time.Time{}` 读写往返后仍是零值
+- [ ] 空 `time.Time{}` 读写往返后仍是零值（PG 存 NULL）
 
-### ⚠️ 已知不一致（需在持久化前统一）
+### ⚠️ 已知不一致（需在阶段 0 修复）
 
 内存实现的 `Create` 冲突**没有使用哨兵错误**：
 
@@ -505,13 +573,11 @@ return fmt.Errorf("storage: assignment %q already exists", a.ID)   // ← 无法
 return fmt.Errorf("storage: work %q already exists", w.ID)
 ```
 
-而 `storage` 包里其实定义了 `ErrRunTaskExists` 却没有类似的 `ErrAlreadyExists`。
+而 `storage` 包里其实定义了 `ErrRunTaskExists` 却没有通用的 `ErrAlreadyExists`。
 
-**建议先统一为哨兵错误**：新增 `storage.ErrAlreadyExists`，
-三个 Store 的 `Create` 冲突都用它包装。否则 MySQL 版无法复用同一套
-`errors.Is` 判断，调用方只能比对字符串（违反错误手册"不依赖字符串"的约定）。
-
-这件事应在阶段 1 之前完成，改动很小但影响接口一致性。
+**阶段 0 必须先统一**：新增 `storage.ErrAlreadyExists`，
+三个 Store 的 `Create` 冲突都用它包装。否则 PG 版无法复用同一套
+`errors.Is` 判断，调用方只能比对字符串（违反错误手册的约定）。
 
 ---
 
@@ -519,10 +585,34 @@ return fmt.Errorf("storage: work %q already exists", w.ID)
 
 ```
 DRA_DB_ENABLED     = false          // 默认仍用内存，便于本地开发
-DRA_DB_DSN         = "user:pass@tcp(127.0.0.1:3306)/dra?parseTime=true&loc=UTC&charset=utf8mb4"
+DRA_DB_DSN         = "postgres://dra:dra@127.0.0.1:5432/dra?sslmode=disable"
 DRA_DB_MAX_OPEN    = 20
 DRA_DB_MAX_IDLE    = 10
 DRA_DB_CONN_MAX_LIFETIME = 1800     // 秒
 ```
 
-`parseTime=true` 必须开启，否则 `DATETIME` 无法扫描进 `time.Time`。
+`pgx/stdlib` 会自动处理 `TIMESTAMPTZ` ↔ `time.Time`，
+无需 MySQL 那样的 `parseTime=true`。
+
+---
+
+## 附录 A：从 MySQL 方案迁移的差异
+
+若将来需要同时支持两者，以下是方言差异对照：
+
+| 项 | MySQL | PostgreSQL |
+|---|---|---|
+| 布尔 | `TINYINT(1)` | `BOOLEAN` |
+| 时间 | `DATETIME(3)` | `TIMESTAMPTZ` |
+| 大文本 | `MEDIUMTEXT` | `TEXT` |
+| 二进制 | `LONGBLOB` | `BYTEA` |
+| 自增 | `AUTO_INCREMENT` | `GENERATED ALWAYS AS IDENTITY` |
+| JSON | `JSON` | `JSONB`（可索引） |
+| 字符串数组 | ❌ 需 JSON | `TEXT[]` |
+| 部分索引 | ❌ 不支持 | ✅ `WHERE` 子句 |
+| 插入返回 | 需再查 | `RETURNING` |
+| 占位符 | `?` | `$1, $2, ...` |
+| 定长字符 | `CHAR(n)` 补空格 | 同（**建议都改用 `TEXT`**） |
+
+**结论**：若想减少未来迁移成本，**统一使用 `TEXT` 而非 `CHAR`/`VARCHAR`**，
+仅用 `CHECK` 约束长度。这样 SQL 在两库间的差异会更小。
