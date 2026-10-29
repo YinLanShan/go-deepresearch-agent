@@ -523,7 +523,7 @@ postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable&application_name=dra
 |---|---|---|---|
 | **0** | 补 `storage.ErrAlreadyExists` / `ErrInvalidArgument` 哨兵错误（内存实现同步） | 无 | ✅ 已完成 |
 | **1** | 建表脚本 + Session/Task/RunTask 三个存储 | 阶段 0 | ✅ 已完成 |
-| **2** | Assignment / Work 存储（级联删除） | 阶段 1 | ⬜ 待做 |
+| **2** | Assignment / Work 存储（级联删除） | 阶段 1 | ✅ 已完成 |
 | **3** | ResearchState 标量部分 + Conclusion | 阶段 1 | ⬜ 待做 |
 | **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 | ⬜ 待做 |
 | **5** | 撤销与 Commit 的乐观锁 | 阶段 4 | ⬜ 待做 |
@@ -576,6 +576,46 @@ DRA_TEST_PG_DSN="postgres://postgres:pass@127.0.0.1:5432/dra_test?sslmode=disabl
 
 **注意**：测试用 `TRUNCATE ... RESTART IDENTITY CASCADE` 清库，
 只能指向专用测试库，不要指向开发库。
+
+### 阶段 2 已落地的内容
+
+| 文件 | 内容 |
+|---|---|
+| `internal/storage/postgres/assignment.go` | AssignmentStore + `scanAssignment` |
+| `internal/storage/postgres/work.go` | WorkStore + Constraint 编解码 + `nullTime` |
+| `internal/storage/postgres/assignment_work_test.go` | 16 个集成测试 |
+
+两个实现细节值得记录：
+
+**1. 零值时间必须写成 NULL**
+
+```go
+func nullTime(t time.Time) any {
+    if t.IsZero() { return nil }
+    return t
+}
+```
+
+否则 `time.Time{}` 会写成 `0001-01-01`，前端会显示异常时间，
+且无法区分"未开始"与"很久以前"。读取时 `sql.NullTime` 的零值
+恰好就是 `time.Time{}`，语义天然对齐。
+
+**2. WorkConstraint 用 JSONB，nil 编码为 SQL NULL**
+
+```go
+func marshalConstraint(c *domain.WorkConstraint) (any, error) {
+    if c == nil { return nil, nil }   // SQL NULL，而非字符串 "null"
+    ...
+}
+```
+
+若把 nil 编码成 `"null"`，读回来会得到非 nil 的空结构体，
+破坏"未设置约束"这一语义。
+
+**3. DeleteByRunTask 是幂等的**
+
+删 0 行也返回 nil。它与 `Delete` 不同：后者是业务删除，
+找不到应报 `ErrNotFound`；前者是级联清理，重复执行是正常情况。
 
 ---
 

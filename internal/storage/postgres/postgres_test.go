@@ -436,13 +436,16 @@ func TestPGRunTaskListOrdered(t *testing.T) {
 
 // ─── 辅助 ───────────────────────────────────────────────────────────────────
 
-// sessionID / taskID / runTaskID 生成 32 位十六进制 ID（满足 CHECK 约束）。
+// sessionID / taskID / runTaskID / assignmentID / workID 生成 32 位十六进制 ID
+// （满足 CHECK (length(id) = 32) 约束）。
 //
 // 用不同的首字符区分实体类型，避免跨表 ID 冲突；
 // 末尾 8 位是补零的序号，保证 i=0 与 i=1 不会生成相同字符串。
-func sessionID(i int) string { return hexID('1', i) }
-func taskID(i int) string    { return hexID('2', i) }
-func runTaskID(i int) string { return hexID('3', i) }
+func sessionID(i int) string    { return hexID('1', i) }
+func taskID(i int) string       { return hexID('2', i) }
+func runTaskID(i int) string    { return hexID('3', i) }
+func assignmentID(i int) string { return hexID('4', i) }
+func workID(i int) string       { return hexID('5', i) }
 
 func hexID(prefix byte, i int) string {
 	const width = 32
