@@ -8,16 +8,36 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/YinLanShan/go-deepresearch-agent.git/internal/domain"
 )
 
+// ErrInvalidArgument 表示调用方传入了非法参数（如空 ID）。
+//
+// 与 ErrNotFound 区分：前者是"你给的东西不合法"，后者是"查不到"。
+// 混用会让调用方无法判断该修正输入还是该重试。
+var ErrInvalidArgument = errors.New("storage: invalid argument")
+
 // ErrNotFound 表示目标对象不存在。
+//
+// 调用方应通过 errors.Is(err, storage.ErrNotFound) 判断，
+// 不要比对字符串（见 docs/ErrorHandbook.md 的约定）。
 var ErrNotFound = errors.New("storage: not found")
+
+// ErrAlreadyExists 表示主键冲突：同 ID 的对象已经存在。
+//
+// 所有 Store 的 Create 在目标已存在时都必须返回该错误，
+// 以便上层用 errors.Is 统一判断（而不是依赖错误文本）。
+// 具体是哪一类对象由错误信息携带，但错误链上始终是 ErrAlreadyExists。
+var ErrAlreadyExists = errors.New("storage: already exists")
 
 // ErrRunTaskExists 表示 Task 已关联 RunTask，
 // 违反"一个 Task 最多对应一个 RunTask"的唯一性约束。
-var ErrRunTaskExists = errors.New("storage: run task already exists for task")
+//
+// 它是 ErrAlreadyExists 的特例：既可用 ErrRunTaskExists 精确判断，
+// 也可用 ErrAlreadyExists 统一处理"已存在"这一类情况。
+var ErrRunTaskExists = fmt.Errorf("%w: run task already exists for task", ErrAlreadyExists)
 
 // SessionStore 定义 Session 的持久化能力。
 type SessionStore interface {

@@ -24,6 +24,25 @@ type Config struct {
 
 	// Execution 是 Scheduler / WorkPool 的执行资源与并发配置。
 	Execution ExecutionConfig
+
+	// Database 是持久化配置；默认禁用（用内存实现，便于本地开发）。
+	Database DatabaseConfig
+}
+
+// DatabaseConfig 描述 PostgreSQL 持久化配置。
+type DatabaseConfig struct {
+	// Enabled 为 true 时使用 PostgreSQL，否则使用内存实现。
+	Enabled bool
+	// DSN 形如 postgres://user:pass@host:5432/db?sslmode=disable
+	DSN string
+	// MaxOpen 是最大打开连接数。
+	MaxOpen int
+	// MaxIdle 是最大空闲连接数。
+	MaxIdle int
+	// ConnMaxLifetime 是连接最长存活时间。
+	ConnMaxLifetime time.Duration
+	// Migrate 为 true 时启动自动建表（幂等）。
+	Migrate bool
 }
 
 // ExecutionConfig 描述执行实体的并发能力。
@@ -126,6 +145,29 @@ func Load() Config {
 			Workers:        getenvInt("DRA_WORKPOOL_WORKERS", 2),
 			WorkTimeout:    getenvSeconds("DRA_WORK_TIMEOUT", 5*time.Minute),
 		},
+		Database: DatabaseConfig{
+			Enabled:         getenvBool("DRA_DB_ENABLED", false),
+			DSN:             getenv("DRA_DB_DSN", ""),
+			MaxOpen:         getenvInt("DRA_DB_MAX_OPEN", 20),
+			MaxIdle:         getenvInt("DRA_DB_MAX_IDLE", 10),
+			ConnMaxLifetime: getenvSeconds("DRA_DB_CONN_MAX_LIFETIME", 30*time.Minute),
+			Migrate:         getenvBool("DRA_DB_MIGRATE", true),
+		},
+	}
+}
+
+// getenvBool 读取布尔型环境变量；无法识别时返回默认值。
+func getenvBool(key string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
 	}
 }
 

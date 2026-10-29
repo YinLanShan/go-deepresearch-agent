@@ -267,6 +267,16 @@ Commit 时原文并入本轮 Finding，随后清空。用户中止（`stopped`�
 | `DRA_WORK_TIMEOUT` | 300 | 单个 Work（子 Agent 一次执行）的超时秒数 |
 | `DRA_TOOL_REQUIRE_APPROVAL` | `*` | 需审批的工具名；`-` 或 `none` 显式关闭审批 |
 | `DRA_DEBUG_ERRORS` | `false` | 为 `true` 时错误响应会附带内部细节（仅本地排查用） |
+| `DRA_DB_ENABLED` | `false` | 为 `true` 时使用 PostgreSQL，否则用内存实现 |
+| `DRA_DB_DSN` | 空 | PostgreSQL 连接串，如 `postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable` |
+| `DRA_DB_MAX_OPEN` | 20 | 最大打开连接数 |
+| `DRA_DB_MAX_IDLE` | 10 | 最大空闲连接数 |
+| `DRA_DB_CONN_MAX_LIFETIME` | 1800 | 连接最长存活秒数 |
+| `DRA_DB_MIGRATE` | `true` | 启动时自动建表（幂等） |
+
+**持久化**：默认用内存实现（重启即丢），便于本地开发。
+启用 PostgreSQL 见 [docs/DataModel.md](docs/DataModel.md)，
+建表脚本内嵌在二进制中，`DRA_DB_MIGRATE=true` 时启动自动执行。
 
 **两级并发控制**：两个参数限制的对象不同，需要配合设置。
 

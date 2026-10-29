@@ -517,21 +517,65 @@ postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable&application_name=dra
 
 ---
 
-## 6. 实现顺序建议
+## 6. 实现顺序与进度
 
-| 阶段 | 内容 | 依赖 |
-|---|---|---|
-| **0** | 补 `storage.ErrAlreadyExists` 哨兵错误（内存实现也改） | 无 |
-| **1** | 建表脚本 + Session/Task/RunTask 三个存储 | 阶段 0 |
-| **2** | Assignment / Work 存储（级联删除） | 阶段 1 |
-| **3** | ResearchState 标量部分 + Conclusion | 阶段 1 |
-| **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 |
-| **5** | 撤销与 Commit 的乐观锁 | 阶段 4 |
-| **6** | 双实现并行 + 一致性测试 | 全部 |
-| **7** | Checkpoint（可选，建议先不做） | —— |
+| 阶段 | 内容 | 依赖 | 状态 |
+|---|---|---|---|
+| **0** | 补 `storage.ErrAlreadyExists` / `ErrInvalidArgument` 哨兵错误（内存实现同步） | 无 | ✅ 已完成 |
+| **1** | 建表脚本 + Session/Task/RunTask 三个存储 | 阶段 0 | ✅ 已完成 |
+| **2** | Assignment / Work 存储（级联删除） | 阶段 1 | ⬜ 待做 |
+| **3** | ResearchState 标量部分 + Conclusion | 阶段 1 | ⬜ 待做 |
+| **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 | ⬜ 待做 |
+| **5** | 撤销与 Commit 的乐观锁 | 阶段 4 | ⬜ 待做 |
+| **6** | 双实现并行 + 一致性测试 | 全部 | ⬜ 待做 |
+| **7** | Checkpoint（可选，建议先不做） | —— | ⬜ 待做 |
 
 **每个阶段都应能独立跑通测试**：内存实现保持不变，
 PG 实现用同一批测试用例验证（通过 Store 接口抽象）。
+
+### 阶段 1 已落地的内容
+
+| 文件 | 内容 |
+|---|---|
+| `internal/storage/postgres/migrations/0001_init.sql` | 11 张表完整建表脚本（embed 进二进制） |
+| `internal/storage/postgres/postgres.go` | 连接池、`Migrate`（幂等执行脚本） |
+| `internal/storage/postgres/session.go` | SessionStore + 错误转换 |
+| `internal/storage/postgres/task.go` | TaskStore |
+| `internal/storage/postgres/runtask.go` | RunTaskStore |
+| `internal/storage/postgres/postgres_test.go` | 12 个集成测试（env 门控） |
+
+**错误转换**是持久化层的核心职责：
+
+```go
+func convertErr(err error, alreadyExistsMsg string) error {
+    if errors.Is(err, sql.ErrNoRows) { return storage.ErrNotFound }
+    if isUniqueViolation(err) { ... return storage.ErrAlreadyExists }
+    return err
+}
+```
+
+上层只认 `storage.ErrNotFound` / `ErrAlreadyExists`，无需知道 SQLSTATE 23505。
+
+**RunTask 的唯一冲突需要区分两种来源**：
+
+- 同 ID 重复 → `ErrAlreadyExists`
+- 同 Task 已有别的 RunTask → `ErrRunTaskExists`
+
+两者都返回 23505，因此插入冲突后用「该 ID 是否已存在」再判定一次。
+
+### 集成测试的运行方式
+
+```bash
+# 创建测试库
+psql -U postgres -c "CREATE DATABASE dra_test;"
+
+# 运行（未设置 DSN 时自动 skip）
+DRA_TEST_PG_DSN="postgres://postgres:pass@127.0.0.1:5432/dra_test?sslmode=disable" \
+  go test ./internal/storage/postgres/ -v
+```
+
+**注意**：测试用 `TRUNCATE ... RESTART IDENTITY CASCADE` 清库，
+只能指向专用测试库，不要指向开发库。
 
 ---
 

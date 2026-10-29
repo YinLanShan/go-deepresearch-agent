@@ -82,13 +82,16 @@ func NewWorkStore() *WorkStore {
 	return &WorkStore{m: make(map[string]*domain.Work)}
 }
 
-// Create 保存一个 Session。
+// Create 保存一个 Session；ID 重复时返回 storage.ErrAlreadyExists。
 func (s *SessionStore) Create(_ context.Context, sess *domain.Session) error {
 	if sess == nil || sess.ID == "" {
-		return storage.ErrNotFound
+		return storage.ErrInvalidArgument
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.m[sess.ID]; ok {
+		return fmt.Errorf("%w: session %q", storage.ErrAlreadyExists, sess.ID)
+	}
 	cp := *sess
 	s.m[sess.ID] = &cp
 	return nil
@@ -129,13 +132,18 @@ func (s *SessionStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-// Create 保存一个 Task。一个 Session 可对应多个 Task，不做唯一性约束。
+// Create 保存一个 Task；ID 重复时返回 storage.ErrAlreadyExists。
+//
+// 一个 Session 可对应多个 Task，因此这里不做 session 级唯一性约束。
 func (s *TaskStore) Create(_ context.Context, t *domain.Task) error {
 	if t == nil || t.ID == "" {
-		return storage.ErrNotFound
+		return storage.ErrInvalidArgument
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.m[t.ID]; ok {
+		return fmt.Errorf("%w: task %q", storage.ErrAlreadyExists, t.ID)
+	}
 	cp := *t
 	s.m[t.ID] = &cp
 	return nil
@@ -198,15 +206,22 @@ func (s *TaskStore) Delete(_ context.Context, id string) error {
 }
 
 // Create 保存一个 RunTask，并原子地保证"一个 Task 最多对应一个 RunTask"。
-// 当该 Task 已存在其他 RunTask 时返回 storage.ErrRunTaskExists。
+//
+// 错误语义：
+//   - 参数为空 → storage.ErrInvalidArgument；
+//   - ID 已存在（同 ID 重复创建）→ storage.ErrAlreadyExists；
+//   - 该 Task 已关联其他 RunTask → storage.ErrRunTaskExists。
 func (s *RunTaskStore) Create(_ context.Context, rt *domain.RunTask) error {
 	if rt == nil || rt.ID == "" || rt.TaskID == "" {
-		return storage.ErrNotFound
+		return storage.ErrInvalidArgument
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.m[rt.ID]; ok {
+		return fmt.Errorf("%w: run task %q", storage.ErrAlreadyExists, rt.ID)
+	}
 	if existingID, ok := s.byTask[rt.TaskID]; ok && existingID != rt.ID {
-		return storage.ErrRunTaskExists
+		return fmt.Errorf("%w: task %q", storage.ErrRunTaskExists, rt.TaskID)
 	}
 	cp := *rt
 	s.m[rt.ID] = &cp
@@ -281,12 +296,15 @@ func (s *RunTaskStore) Delete(_ context.Context, id string) error {
 
 // ─── AssignmentStore ────────────────────────────────────────────────────────
 
-// Create 保存一个 Assignment。
+// Create 保存一个 Assignment；ID 重复时返回 storage.ErrAlreadyExists。
 func (s *AssignmentStore) Create(_ context.Context, a *domain.Assignment) error {
+	if a == nil || a.ID == "" {
+		return storage.ErrInvalidArgument
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.m[a.ID]; ok {
-		return fmt.Errorf("storage: assignment %q already exists", a.ID)
+		return fmt.Errorf("%w: assignment %q", storage.ErrAlreadyExists, a.ID)
 	}
 	cp := *a
 	s.m[a.ID] = &cp
@@ -356,12 +374,15 @@ func (s *AssignmentStore) DeleteByRunTask(_ context.Context, runTaskID string) e
 
 // ─── WorkStore ──────────────────────────────────────────────────────────────
 
-// Create 保存一个 Work。
+// Create 保存一个 Work；ID 重复时返回 storage.ErrAlreadyExists。
 func (s *WorkStore) Create(_ context.Context, w *domain.Work) error {
+	if w == nil || w.ID == "" {
+		return storage.ErrInvalidArgument
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.m[w.ID]; ok {
-		return fmt.Errorf("storage: work %q already exists", w.ID)
+		return fmt.Errorf("%w: work %q", storage.ErrAlreadyExists, w.ID)
 	}
 	cp := cloneWork(w)
 	s.m[w.ID] = cp
