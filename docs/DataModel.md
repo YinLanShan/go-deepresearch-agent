@@ -526,8 +526,8 @@ postgres://user:pass@127.0.0.1:5432/dra?sslmode=disable&application_name=dra
 | **2** | Assignment / Work 存储（级联删除） | 阶段 1 | ✅ 已完成 |
 | **3** | ResearchState 标量部分 + Conclusion | 阶段 1 | ✅ 已完成（不含子表集合，未接入 Runtime） |
 | **4** | results / findings / commitlog / messages 四张子表 | 阶段 3 | ✅ 已完成 |
-| **5** | 撤销与 Commit 的乐观锁 | 阶段 4 | ⬜ 待做 |
-| **6** | 双实现并行 + 一致性测试 | 全部 | ⬜ 待做 |
+| **5** | 乐观锁 | 阶段 4 | ✅ 已完成（改用悲观锁，见下） |
+| **6** | 双实现并行 + 一致性测试 | 全部 | ✅ 已完成 |
 | **7** | Checkpoint（可选，建议先不做） | —— | ⬜ 待做 |
 
 **每个阶段都应能独立跑通测试**：内存实现保持不变，
@@ -725,6 +725,78 @@ RETURNING id, turn, content;
 | `AppendResult` | 锁 state → 插 Results → version++ → 写 CommitLog |
 
 `SELECT ... FOR UPDATE` 保证 `version` 自增与 `turn` 计算基于最新值。
+
+### 阶段 5：并发控制（最终采用悲观锁）
+
+原计划用乐观锁（`WHERE version = ?` + 重试循环），实现时改为 **`FOR UPDATE` 悲观锁**：
+
+| 方案 | 冲突时行为 | 适用场景 |
+|---|---|---|
+| 悲观锁 `FOR UPDATE` | 排队等待 | 写操作短、冲突少 ← **本项目** |
+| 乐观锁 `WHERE version=?` | 需重试循环 | 写操作长、冲突多 |
+
+**理由：**
+
+1. Commit 由 ResultAggregator 单 goroutine 串行执行，冲突本就极少；
+2. `FOR UPDATE` 语义简单，不需要重试循环与版本冲突处理；
+3. 事务很短（几条 INSERT），持锁时间可忽略。
+
+并发正确性由 `concurrency_test.go` 的 4 个测试锁定：
+
+| 测试 | 验证点 |
+|---|---|
+| `TestPGStateConcurrentCommitNoLostUpdate` | 8 并发提交 → 8 条 Result 全保留、Version 恰为 8 |
+| `TestPGStateConcurrentCommitAndRevoke` | 撤销与提交并发 → 目标消失、其余保留、版本正确 |
+| `TestPGStateConcurrentAppendResult` | 8 并发追加 → turn 覆盖 1..8 且不重复 |
+| `TestPGStateConcurrentAccumulateInterruptedContext` | 8 并发累积 → 每个片段恰好出现一次 |
+
+全部通过 `-race` 检测，无数据竞争。
+
+### 阶段 6：双实现契约测试
+
+新增 `internal/storage/storetest`，用**同一套断言**验证内存与 PG 实现：
+
+```go
+storetest.RunAll(t, factory, storetest.Capabilities{})
+```
+
+| 目录 | 内容 |
+|---|---|
+| `internal/storage/storetest/storetest.go` | 契约测试集（约 750 行） |
+| `internal/storage/memory/contract_test.go` | 内存实现接入 |
+| `internal/storage/postgres/contract_test.go` | PG 实现接入（env 门控） |
+
+**覆盖的 10 个子测试**：Session / Task / RunTask / Assignment / Work /
+StateScalar / StateCommit / StateRevoke / Cascade / StateAlreadyExists。
+
+每个子测试都断言同一批语义：
+
+- 往返完整（含零值时间、`Constraint` 的 nil 语义）；
+- 错误哨兵（`ErrNotFound` / `ErrAlreadyExists` / `ErrInvalidArgument`）；
+- **副本语义**：改动 `Get` 的返回值不得影响存储；
+- 列表过滤与排序；
+- `Update` 不存在的对象 → `ErrNotFound`（不得"复活"）；
+- `DeleteByRunTask` 幂等 vs 业务 `Delete` 报错。
+
+`Capabilities` 用于声明已知差异（当前全为 false，即两实现语义完全一致）。
+
+#### 契约测试发现的一个语义澄清
+
+`testCascade` 最初假设"删除 Session 会自动清空所有下游数据"，
+**内存实现不通过**。核查后确认这是设计而非缺陷：
+
+级联删除由 **API 层显式编排**：
+
+```
+Task 逐个 Delete → ResearchState.DeleteBySession →
+Assignment/Work.DeleteByRunTask → Session.Delete
+```
+
+PostgreSQL 的外键级联是额外的安全网（有专门的 PG-only 测试覆盖），
+内存实现没有也不需要它。
+
+因此契约测试改为验证**这组显式调用的组合效果**，
+并把 FK 级联作为 PG 的额外能力单独测试。
 
 ---
 
