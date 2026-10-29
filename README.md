@@ -16,13 +16,26 @@
 ```
 cmd/server/          服务入口
 internal/config/     环境变量配置
-internal/fault/      统一错误包装
-internal/domain/     Session / Task 领域对象
+internal/fault/      统一错误包装 + 错误上报
+internal/domain/     Session / Task / RunTask / Assignment / Work 领域对象
 internal/storage/    存储接口 + 内存实现
-internal/llm/        模型调用封装（openai / mock）
+internal/researchstate/  ResearchState 与提交门控
+internal/supervisor/ SupervisorLoop（Eino TurnLoop + 工具治理）
+internal/scheduler/  Assignment 调度
+internal/workpool/   Work 执行（子 Agent）
+internal/resultagg/  结果聚合与提交
+internal/tool/       工具注册、审批与安全中间件
+internal/llm/        模型调用封装（openai / mock）+ 重试
 internal/service/    Application Layer 业务编排
 internal/api/        API Layer（Hertz 路由 + SSE）
+docs/                架构、错误手册、数据模型
 ```
+
+**相关文档**：
+
+- [docs/Architecture.md](docs/Architecture.md) — 总体架构
+- [docs/ErrorHandbook.md](docs/ErrorHandbook.md) — 错误类型与处理清单
+- [docs/DataModel.md](docs/DataModel.md) — MySQL 持久化数据模型
 
 ## 运行
 
