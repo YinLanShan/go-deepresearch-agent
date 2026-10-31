@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支的新推送会取消上一次未完成的运行，节省额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 全项目统一的测试超时。internal/tool 约 31s，其余均 < 8s。
+  GO_TEST_TIMEOUT: 300s
+
+jobs:
+  # ─── 静态检查：格式、vet、模块整洁、前端语法 ───────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          # gofmt -l 列出未格式化的文件；有输出即失败。
+          unformatted=$(gofmt -l . | grep -v '^$' || true)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未通过 gofmt，请运行 gofmt -w ."
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: 全部文件格式正确"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go mod tidy 一致性
+        run: |
+          # -diff 不会修改文件，只报告差异；有输出说明 go.mod/go.sum 需要整理。
+          if ! go mod tidy -diff; then
+            echo "::error::go.mod / go.sum 与代码不一致，请本地运行 go mod tidy"
+            exit 1
+          fi
+          echo "go.mod: 已整理"
+
+      - name: 前端 JS 语法检查
+        run: |
+          # 前端没有构建步骤，<script> 里的代码直接由浏览器执行。
+          # 这个脚本用 node 的 vm.Script 编译（不执行）来检查语法。
+          node scripts/check-web-js.mjs
+
+  # ─── 构建与测试：带 PostgreSQL 服务 ─────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dra_test
+        ports:
+          - 5432:5432
+        # 等数据库真正可连接再开始，避免测试偶发失败。
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # 集成测试通过该变量开启；未设置时相关测试自动 skip。
+      DRA_TEST_PG_DSN: postgres://postgres:postgres@127.0.0.1:5432/dra_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 下载依赖
+        run: go mod download
+
+      - name: 构建
+        run: go build ./...
+
+      - name: 编译测试（不运行）
+        run: go test -run '^$' ./...
+
+      - name: 单元与集成测试
+        run: go test -count=1 -timeout ${{ env.GO_TEST_TIMEOUT }} ./...
+
+  # ─── 竞态检测：只覆盖并发敏感的包，控制耗时 ─────────────────────────────
+  race:
+    name: Race
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dra_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DRA_TEST_PG_DSN: postgres://postgres:postgres@127.0.0.1:5432/dra_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test -race（并发敏感包）
+        run: |
+          # 只挑与并发相关的包：存储、调度、执行池、聚合、监督循环。
+          # 全量 -race 会让 CI 耗时翻倍，收益却集中在这几个包。
+          go test -count=1 -race -timeout ${{ env.GO_TEST_TIMEOUT }} \
+            ./internal/storage/... \
+            ./internal/researchstate/... \
+            ./internal/scheduler/... \
+            ./internal/workpool/... \
+            ./internal/resultagg/... \
+            ./internal/supervisor/...

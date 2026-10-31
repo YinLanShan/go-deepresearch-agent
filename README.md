@@ -531,6 +531,50 @@ curl.exe -s -X POST http://127.0.0.1:8080/api/v1/sessions `
 
 ## 验证
 
+### 本地一键检查（推荐）
+
+```powershell
+# 完整检查：静态检查 + 测试 + 竞态检测
+.\scripts\ci.ps1 -Dsn "postgres://postgres:pass@127.0.0.1:5432/dra_test?sslmode=disable"
+
+# 快速检查：跳过竞态检测
+.\scripts\ci.ps1 -Dsn $env:DRA_TEST_PG_DSN -SkipRace
+
+# 不需要数据库：只跑单元测试（PG 集成测试自动 skip）
+.\scripts\ci.ps1
+```
+
+`scripts/ci.ps1` 与 CI 执行完全相同的检查，保证「本地通过 = CI 通过」。
+首次使用如遇执行策略限制：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\ci.ps1 -Dsn "..."
+```
+
+### 手动执行
+
 ```bash
 go build ./... && go vet ./... && go test ./...
 ```
+
+### CI
+
+`.github/workflows/ci.yml` 包含三个 job：
+
+| Job | 内容 | 说明 |
+|---|---|---|
+| **Lint** | `gofmt` / `go vet` / `go mod tidy -diff` / 前端 JS 语法 | 无数据库依赖，约 30 秒 |
+| **Test** | `go build` + `go test ./...` | 带 `postgres:18` service，含 66 个集成测试 |
+| **Race** | `go test -race`（仅并发敏感包） | storage / researchstate / scheduler / workpool / resultagg / supervisor |
+
+设计取舍：
+
+- **PG 用 service 而非 mock**：集成测试必须跑真实数据库，否则测不出
+  `FOR UPDATE`、`RETURNING`、唯一约束等真实行为。
+- **`-race` 只覆盖并发敏感包**：全量 `-race` 会让 CI 耗时翻倍，
+  而数据竞争只可能出现在这几个包。
+- **前端单独检查**：没有构建步骤，用 `scripts/check-web-js.mjs`
+  以 `vm.Script` 编译（不执行）来发现语法错误。
+- **集成测试默认 skip**：未设置 `DRA_TEST_PG_DSN` 时自动跳过，
+  所以本地无 PG 也能跑通全量单元测试。
+
