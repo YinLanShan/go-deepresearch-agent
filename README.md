@@ -36,6 +36,8 @@ docs/                架构、错误手册、数据模型
 - [docs/Architecture.md](docs/Architecture.md) — 总体架构
 - [docs/ErrorHandbook.md](docs/ErrorHandbook.md) — 错误类型与处理清单
 - [docs/DataModel.md](docs/DataModel.md) — PostgreSQL 持久化数据模型
+- [docs/ProjectStory.md](docs/ProjectStory.md) — 项目深度复盘（STAR 版）
+- [docs/Resume.md](docs/Resume.md) — 简历素材与面试准备
 
 ## 运行
 
